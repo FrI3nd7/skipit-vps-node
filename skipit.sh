@@ -217,6 +217,7 @@ SkipIt v${SKIPIT_VERSION} — панель управления VPS
   ${SKIPIT_CMD}              открыть меню
   ${SKIPIT_CMD} install      установить команду ${SKIPIT_CMD} (${SKIPIT_BIN})
   ${SKIPIT_CMD} uninstall    удалить команду
+  ${SKIPIT_CMD} update       обновить SkipIt с GitHub (--yes: без вопросов)
   ${SKIPIT_CMD} version      версия
 EOF
 }
@@ -5844,6 +5845,22 @@ speedtest_fetch() {
     [[ -x $SPEEDTEST_BIN ]]
 }
 
+# Условия Ookla принимает сам пользователь, один раз. Без согласия тест не запускается.
+SPEEDTEST_ACCEPT="${SKIPIT_ETC}/speedtest-license-accepted"
+speedtest_consent() {
+    [[ -f $SPEEDTEST_ACCEPT ]] && return 0
+    ui_yesno "Условия Speedtest" "Программа:  Speedtest CLI от Ookla
+Условия:    бесплатно для личного некоммерческого использования
+
+ℹ Лицензия: https://www.speedtest.net/about/eula
+ℹ Конфиденциальность: https://www.speedtest.net/about/privacy
+ℹ Во время теста Ookla получает IP сервера и результаты замера
+
+Принимаете условия Ookla?" no || return 1
+    mkdir -p "$SKIPIT_ETC" && date '+%F %T' > "$SPEEDTEST_ACCEPT"
+    log "speedtest: license accepted"
+}
+
 # байт/с -> целые Мбит/с
 st_mbps() { awk -v b="${1:-0}" 'BEGIN { printf "%d", b * 8 / 1000000 + 0.5 }'; }
 
@@ -5857,10 +5874,12 @@ sys_speedtest() {
 ℹ Используется официальный Speedtest CLI от Ookla, скачивается при первом запуске
 
 Запустить тест?" || return
+    speedtest_consent || return
     ensure_pkg jq jq || return
     ui_loading "Скачиваю Speedtest CLI…"
     speedtest_fetch || { ui_msg "Ошибка" "Не удалось скачать Speedtest CLI для архитектуры $(uname -m)."; return; }
     ui_loading "Проверяю скорость — около 30 секунд…"
+    # Флаги только передают CLI ответ, который пользователь уже дал в speedtest_consent
     out=$("$SPEEDTEST_BIN" --accept-license --accept-gdpr -f json -p no 2>&1)
     if ! jq -e '.download.bandwidth' >/dev/null 2>&1 <<< "$out"; then
         log "speedtest: FAIL $(tail -n 1 <<< "$out")"
@@ -6061,6 +6080,158 @@ region_check() {
     ui_readline _
 }
 
+# ---- Обновление SkipIt с GitHub ----
+SKIPIT_UPDATE_URL="https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh"
+SKIPIT_UPDATE_CONF="${SKIPIT_ETC}/update.conf"
+
+update_token() { sed -n 's/^SKIPIT_UPDATE_TOKEN=//p' "$SKIPIT_UPDATE_CONF" 2>/dev/null | head -n 1; }
+
+update_token_save() { # токен
+    mkdir -p "$SKIPIT_ETC"
+    ( umask 077; printf 'SKIPIT_UPDATE_TOKEN=%s\n' "$1" > "$SKIPIT_UPDATE_CONF" )
+    chmod 600 "$SKIPIT_UPDATE_CONF"
+    log "update: token saved"
+}
+
+# Скачать свежий skipit.sh в файл.
+# 0 - готово, 1 - нет связи, 2 - нет доступа (приватный репозиторий или неверный токен), 3 - это не SkipIt
+update_fetch() { # файл
+    local dst=$1 token code
+    local -a hdr=()
+    token=$(update_token)
+    [[ -n $token ]] && hdr=(-H "Authorization: Bearer $token")
+    code=$(curl -sSL --max-time 60 "${hdr[@]}" -o "$dst" -w '%{http_code}' "$SKIPIT_UPDATE_URL" 2>/dev/null) || code=000
+    case $code in
+        200) ;;
+        401|403|404) return 2 ;;
+        *) return 1 ;;
+    esac
+    head -n 1 "$dst" | grep -q '^#!.*bash' && grep -q '^SKIPIT_VERSION="' "$dst" && bash -n "$dst" 2>/dev/null || return 3
+}
+
+update_version_of() { sed -n 's/^SKIPIT_VERSION="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -n 1; }
+
+# 0, если версия $1 новее $2
+version_newer() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]; }
+
+# Бэкап текущей версии и замена. Новый файл кладём рядом и переименовываем:
+# уже запущенный SkipIt продолжает читать старый файл и не ломается на ходу. Печатает путь бэкапа.
+update_apply() { # файл
+    local bak="$SKIPIT_BACKUPS/skipit-v${SKIPIT_VERSION}.$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$SKIPIT_BACKUPS"
+    [[ -f $SKIPIT_BIN ]] && cp -a "$SKIPIT_BIN" "$bak"
+    install -m 0755 "$1" "$SKIPIT_BIN.new" && mv -f "$SKIPIT_BIN.new" "$SKIPIT_BIN" || { rm -f "$SKIPIT_BIN.new"; return 1; }
+    log "update: v$SKIPIT_VERSION -> v$(update_version_of "$SKIPIT_BIN")"
+    echo "$bak"
+}
+
+# Главное меню: SkipIt -> Обновить SkipIt
+menu_update() {
+    local tmp rc new tok bak
+    tmp=$(mktemp) || return
+    while :; do
+        ui_loading "Проверяю обновления…"
+        update_fetch "$tmp"; rc=$?
+        (( rc == 2 )) || break
+        tok=$(ui_pass "Доступ к репозиторию" "Репозиторий:   FrI3nd7/skipit-vps-node
+Ответ GitHub:  нет доступа
+
+ℹ Пока репозиторий приватный, нужен токен GitHub только на чтение
+ℹ Токен сохранится на этом сервере, прочитать его сможет только root
+
+Токен GitHub (начинается с github_pat_):") || { rm -f "$tmp"; return; }
+        tok=${tok//[[:space:]]/}
+        [[ -n $tok ]] || { rm -f "$tmp"; return; }
+        update_token_save "$tok"
+    done
+    case $rc in
+        1)  rm -f "$tmp"
+            ui_msg "Ошибка" "Не удалось скачать обновление: нет связи с GitHub.
+
+ℹ Проверьте интернет на сервере и попробуйте ещё раз"
+            return ;;
+        3)  rm -f "$tmp"
+            ui_msg "Ошибка" "Скачанный файл не похож на SkipIt или повреждён, обновление отменено.
+
+ℹ Установленная версия не тронута"
+            return ;;
+    esac
+    new=$(update_version_of "$tmp")
+    if [[ $new == "$SKIPIT_VERSION" ]]; then
+        rm -f "$tmp"
+        ui_msg "Обновление SkipIt" "Установлена:  $SKIPIT_VERSION
+Доступна:     $new
+
+ℹ У вас последняя версия"
+        return
+    fi
+    if version_newer "$new" "$SKIPIT_VERSION"; then
+        ui_yesno "Обновление SkipIt" "Установлена:  $SKIPIT_VERSION
+Доступна:     $new
+
+ℹ Настройки SkipIt и ноды не пропадут, старая версия сохранится в бэкап
+
+Обновить SkipIt?" || { rm -f "$tmp"; return; }
+    else
+        ui_yesno "Обновление SkipIt" "Установлена:    $SKIPIT_VERSION
+В репозитории:  $new
+
+! В репозитории версия старее установленной
+
+Всё равно установить $new?" no || { rm -f "$tmp"; return; }
+    fi
+    if ! bak=$(update_apply "$tmp"); then
+        rm -f "$tmp"
+        ui_msg "Ошибка" "Не удалось записать $SKIPIT_BIN, установленная версия не тронута."
+        return
+    fi
+    rm -f "$tmp"
+    ui_msg "SkipIt обновлён" "Версия:  $new
+Бэкап:   $bak
+
+ℹ SkipIt перезапустится с новой версией"
+    clear >"$TTY"
+    exec "$SKIPIT_BIN"
+}
+
+# skipit update [--yes] - текстом, без экранов меню. С --yes работает и без терминала (ssh host 'skipit update --yes')
+skipit_update_cli() {
+    local yes=0 tmp rc new bak tok a tty=0
+    [[ ${1:-} == --yes || ${1:-} == -y ]] && yes=1
+    { : >/dev/tty; } 2>/dev/null && tty=1
+    (( yes || tty )) || die "Нет терминала. Для обновления без вопросов: ${SKIPIT_CMD} update --yes"
+    tmp=$(mktemp) || exit 1
+    say "Проверяю обновления..."
+    update_fetch "$tmp"; rc=$?
+    if (( rc == 2 && ! yes && tty )); then
+        printf '\n  Нет доступа к репозиторию FrI3nd7/skipit-vps-node.\n  Токен GitHub только на чтение (ввод скрыт, пусто - отмена): ' >/dev/tty
+        read -r -s tok </dev/tty; echo >/dev/tty
+        tok=${tok//[[:space:]]/}
+        if [[ -n $tok ]]; then update_token_save "$tok"; update_fetch "$tmp"; rc=$?; fi
+    fi
+    case $rc in
+        0) ;;
+        2) rm -f "$tmp"; die "Нет доступа к репозиторию. Сохраните токен: ${SKIPIT_CMD} update (без --yes)" ;;
+        3) rm -f "$tmp"; die "Скачанный файл не похож на SkipIt, обновление отменено." ;;
+        *) rm -f "$tmp"; die "Не удалось скачать обновление: нет связи с GitHub." ;;
+    esac
+    new=$(update_version_of "$tmp")
+    if [[ $new == "$SKIPIT_VERSION" ]]; then
+        rm -f "$tmp"; say "Установлена последняя версия: v$new"; return 0
+    fi
+    if ! version_newer "$new" "$SKIPIT_VERSION"; then
+        rm -f "$tmp"; say "В репозитории v$new, это старее установленной v$SKIPIT_VERSION. Ничего не меняю."; return 0
+    fi
+    if (( ! yes )); then
+        printf '\n  Установлена:  v%s\n  Доступна:     v%s\n\n  Обновить? [Y/n] ' "$SKIPIT_VERSION" "$new" >/dev/tty
+        read -r a </dev/tty; a=${a,,}; a=${a//[[:space:]]/}
+        [[ -z $a || $a == y || $a == yes || $a == д || $a == да ]] || { rm -f "$tmp"; say "Отменено."; return 0; }
+    fi
+    bak=$(update_apply "$tmp") || { rm -f "$tmp"; die "Не удалось записать $SKIPIT_BIN, установленная версия не тронута."; }
+    rm -f "$tmp"
+    say "SkipIt обновлён: v$SKIPIT_VERSION -> v$new (бэкап: $bak)"
+}
+
 menu_about() {
     ui_dims
     { clear; ui_banner; echo; } >"$TTY"
@@ -6126,6 +6297,7 @@ main_menu() {
             speed   "Тест скорости канала" \
             clean   "Очистка диска" \
             ""      "SkipIt" \
+            update  "Обновить SkipIt" \
             about   "О программе")
         rc=$?
         UI_CANCEL="Назад"; UI_FOOTER=""; UI_BANNER=0
@@ -6142,6 +6314,7 @@ main_menu() {
             regions) region_check ;;
             speed)   sys_speedtest ;;
             clean)   sys_disk_clean ;;
+            update) menu_update ;;
             about)  menu_about ;;
         esac
     done
@@ -6180,7 +6353,7 @@ main() {
     case ${1:-} in
         version|-v|--version) echo "SkipIt v${SKIPIT_VERSION}"; exit 0 ;;
         help|-h|--help)       usage; exit 0 ;;
-        install|uninstall|menu|"") ;;
+        install|uninstall|update|menu|"") ;;
         *) usage; exit 1 ;;
     esac
     require_root "$@"
@@ -6196,6 +6369,9 @@ main() {
             exit 0 ;;
         uninstall)
             self_uninstall; exit 0 ;;
+        update)
+            bootstrap_deps
+            skipit_update_cli "${2:-}"; exit $? ;;
     esac
 
     bootstrap_deps
@@ -6222,3 +6398,4 @@ main() {
 }
 
 [[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
+
