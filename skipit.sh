@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.0.0a"
+SKIPIT_VERSION="1.0.1a"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -2919,9 +2919,12 @@ cf_zone_check() { # токен зона
 SITE_REPO="Mrvibecodic/node-templates"
 SITE_SHA="845187fbee8fff72f66d1570af436438e859e40d"
 SITE_CACHE="/var/cache/skipit/node-templates-${SITE_SHA:0:7}.tar.gz"
-# Manual32: генератор из личной копии пользователя - ссылка хранится только на сервере
-M32_CONF="${SKIPIT_ETC}/manual32.conf"
-M32_CACHE="/var/cache/skipit/manual32-selfsteal.sh"
+# Сайт-заглушка: шаблоны learning-zone/website-templates - ~170 обычных сайтов (HTML5/Bootstrap).
+# Репозиторий ~190 МБ, поэтому целиком не качаем: список файлов закреплённого коммита берём
+# один раз из GitHub API, а файлы выбранного шаблона - поштучно с raw.githubusercontent.com.
+WT_REPO="learning-zone/website-templates"
+WT_SHA="7bf31e9646a6b5f51c2e55b2557787310436989f"
+WT_LIST="/var/cache/skipit/website-templates-${WT_SHA:0:7}.list"
 
 # тег|название (из <title>)|язык|размер|что страница грузит с внешних сайтов
 SITE_LIST=(
@@ -2948,56 +2951,58 @@ site_tags() { local e; for e in "${SITE_LIST[@]}"; do echo "${e%%|*}"; done; }
 site_title() {
     local t rest type name
     [[ $1 == keep ]] && { echo "текущий сайт без изменений"; return; }
-    if [[ $1 == m32:* ]]; then
-        rest=${1#m32:}; type=${rest%%:*}; name=${rest#*:}
-        [[ $name == "$rest" ]] && name=""
-        echo "$(m32_type_ru "$type")${name:+ «$name»} — шаблон Manual32"
+    if [[ $1 == wt:* ]]; then
+        echo "$(wt_name "${1#wt:}") — шаблон website-templates"
         return
     fi
     t=$(site_field "$1" 2) && echo "$t — шаблон Mrvibecodic" || echo "$1"
 }
 
-m32_types() { printf '%s\n' blog cafe studio saas docs photo; }
-
-m32_type_ru() {
-    case $1 in
-        blog) echo "Блог" ;; cafe) echo "Кафе" ;; studio) echo "Студия" ;;
-        saas) echo "SaaS-сервис" ;; docs) echo "Документация" ;; photo) echo "Фотоблог" ;;
-        *) echo "$1" ;;
-    esac
-}
-
-# Ссылка на личную копию selfsteal.sh (спросит и сохранит, если ещё нет)
-m32_url() {
-    local url="" re='^https://manual32\.online/dl/selfsteal\.sh\?t=[A-Za-z0-9_-]+$'
-    [[ -f $M32_CONF ]] && url=$(sed -n 's/^M32_URL=//p' "$M32_CONF" | head -n 1)
-    if [[ ! $url =~ $re ]]; then
-        url=$(ui_input "Ссылка Manual32" "Шаблоны Manual32 генерируются скриптом из вашей личной копии.
-SkipIt сохранит ссылку только на этом сервере ($M32_CONF).
-Пример:  https://manual32.online/dl/selfsteal.sh?t=…
-
-Ссылка на selfsteal.sh:") || return 1
-        url=${url//[[:space:]]/}
-        [[ $url =~ $re ]] || { ui_msg "Ошибка" "Это не похоже на ссылку Manual32: «$url»"; return 1; }
-        mkdir -p "$SKIPIT_ETC" && ( umask 077; printf 'M32_URL=%s\n' "$url" > "$M32_CONF" )
+# Список файлов website-templates (закреплённый коммит) в кеш: строка = путь файла
+wt_fetch_list() {
+    [[ -s $WT_LIST ]] && return 0
+    mkdir -p "$(dirname "$WT_LIST")" || return 1
+    if curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 -o "$WT_LIST.json" \
+            "https://api.github.com/repos/$WT_REPO/git/trees/$WT_SHA?recursive=1" &&
+        grep -q '"truncated": *false' "$WT_LIST.json"; then
+        # top-level assets/ - превью для README, не шаблон
+        awk -F'"' '$2=="path"{p=$4} $2=="type"&&$4=="blob"&&p~/\//&&p!~/^assets\//{print p}' \
+            "$WT_LIST.json" > "$WT_LIST.part"
+        if grep -q '^[^/]*/index\.html$' "$WT_LIST.part"; then
+            mv "$WT_LIST.part" "$WT_LIST"; rm -f "$WT_LIST.json"
+            return 0
+        fi
     fi
-    printf '%s' "$url"
-}
-
-# Скачать генератор; при ошибке ссылки (HTTP 4xx) - забыть её, чтобы спросить заново
-m32_fetch() {
-    local url rc
-    url=$(m32_url) || return 1
-    mkdir -p "$(dirname "$M32_CACHE")" || return 1
-    curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 "$url" -o "$M32_CACHE.part"
-    rc=$?
-    if (( rc == 0 )) && [[ $(head -c 2 "$M32_CACHE.part") == '#!' ]] && grep -q 'MANUAL32' "$M32_CACHE.part"; then
-        mv "$M32_CACHE.part" "$M32_CACHE"
-        return 0
-    fi
-    rm -f "$M32_CACHE.part"
-    (( rc == 22 )) && rm -f "$M32_CONF"
+    rm -f "$WT_LIST.json" "$WT_LIST.part"
     return 1
+}
+
+wt_types() { sed -n 's#^\([^/]*\)/index\.html$#\1#p' "$WT_LIST" 2>/dev/null; }
+
+wt_name() { # каталог → читаемое название без «free-bootstrap-responsive-template»
+    local n
+    n=$(tr '-' '\n' <<< "$1" | grep -viE '^(free|bootstrap|html5?|responsive|template|templates|theme|web|website|websites|css3|[0-9.]+)$' | paste -sd' ')
+    echo "${n:-$1}"
+}
+
+# Скачать файлы шаблона в каталог (README и служебные файлы git не берём)
+wt_download() { # каталог-шаблона куда
+    local tpl=$1 dst=$2 cfg p rel rc
+    wt_fetch_list || return 1
+    wt_types | grep -qxF -- "$tpl" || return 1
+    cfg=$(mktemp) || return 1
+    while IFS= read -r p; do
+        [[ $p == "$tpl"/* ]] || continue
+        rel=${p#"$tpl"/}
+        case ${rel##*/} in [Rr][Ee][Aa][Dd][Mm][Ee]*|.git*) continue ;; esac
+        printf 'url = "https://raw.githubusercontent.com/%s/%s/%s"\noutput = "%s/%s"\n' \
+            "$WT_REPO" "$WT_SHA" "${p// /%20}" "$dst" "$rel" >> "$cfg"
+    done < "$WT_LIST"
+    curl -fsS -g --parallel --parallel-max 16 --create-dirs --retry 2 \
+        --connect-timeout 15 --max-time 600 -K "$cfg" 2>/dev/null
+    rc=$?
+    rm -f "$cfg"
+    (( rc == 0 )) && [[ -f $dst/index.html ]]
 }
 
 site_external() { # тег → «С внешних сайтов: …» или пусто
@@ -3006,42 +3011,33 @@ site_external() { # тег → «С внешних сайтов: …» или п
 }
 
 site_choose() { # [keep] [домен] → тег
-    local mode=${1:-} domain=${2:-$NODE_DOMAIN} t x name items tags=()
-    items=(random "Случайный шаблон от Mrvibecodic" m32random "Случайный шаблон от Manual32" pick "Выбрать шаблон")
+    local mode=${1:-} domain=${2:-$NODE_DOMAIN} t x items tags=()
+    items=(wtrandom "Случайный шаблон от website-templates" random "Случайный шаблон от Mrvibecodic" pick "Выбрать шаблон")
     [[ $mode == keep ]] && items+=("" "" keep "Оставить текущий сайт в $NODE_WEBROOT")
-    t=$(ui_choose "Сайт-заглушка" "Mrvibecodic:  github.com/$SITE_REPO
-Manual32:     manual32.online
+    t=$(ui_choose "Сайт-заглушка" "website-templates:  github.com/$WT_REPO
+Mrvibecodic:        github.com/$SITE_REPO
 
 ℹ Эту страницу увидит любой, кто откроет домен ноды в браузере." "${items[@]}") || return 1
     case $t in
         random)
             mapfile -t tags < <(site_tags)
             t=${tags[RANDOM % ${#tags[@]}]} ;;
-        m32random)
-            mapfile -t tags < <(m32_types)
-            t="m32:${tags[RANDOM % ${#tags[@]}]}" ;;
+        wtrandom)
+            ui_loading "Получаю список шаблонов website-templates…"
+            if ! wt_fetch_list; then
+                ui_msg "Ошибка" "Не удалось получить список шаблонов с GitHub (api.github.com).
+Проверьте доступ сервера к GitHub и попробуйте снова."
+                return 1
+            fi
+            mapfile -t tags < <(wt_types)
+            t="wt:${tags[RANDOM % ${#tags[@]}]}" ;;
         pick)
             items=("" "Mrvibecodic")
             while IFS= read -r x; do
                 items+=("$x" "$(site_field "$x" 2) · $(site_field "$x" 3) · $(site_field "$x" 4)")
             done < <(site_tags)
-            items+=("" "Manual32")
-            while IFS= read -r x; do
-                items+=("m32:$x" "$(m32_type_ru "$x")")
-            done < <(m32_types)
             t=$(ui_choose "Выбрать шаблон" "Для Mrvibecodic указаны название · язык · размер." "${items[@]}") || return 1 ;;
     esac
-    if [[ $t == m32:* ]]; then
-        m32_url >/dev/null || return 1
-        name=$(ui_input "Название сайта" "Шаблон:  $(m32_type_ru "${t#m32:}") от Manual32
-Пример:  Планер
-
-Название сайта (пусто — из домена):") || return 1
-        name=${name//[|:$'\t']/}
-        name=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<< "$name")
-        [[ -z $name ]] && name=${domain%%.*}
-        t="$t:$name"
-    fi
     printf '%s' "$t"
 }
 
@@ -3062,17 +3058,14 @@ site_fetch() {
 
 SITE_BAK=""
 site_install() { # тег [домен]
-    local tpl=$1 domain=${2:-$NODE_DOMAIN} tmp src rc rest type name
+    local tpl=$1 domain=${2:-$NODE_DOMAIN} tmp src rc
     SITE_BAK=""
     [[ $tpl == keep ]] && return 0
     tmp=$(mktemp -d)
-    if [[ $tpl == m32:* ]]; then
-        rest=${tpl#m32:}; type=${rest%%:*}; name=${rest#*:}
-        [[ $name == "$rest" ]] && name=${domain%%.*}
-        m32_fetch || { rm -rf "$tmp"; return 1; }
+    if [[ $tpl == wt:* ]]; then
         src="$tmp/site"
-        bash "$M32_CACHE" --domain="$domain" --type="$type" --name="$name" --dir="$src" >/dev/null 2>&1
-        [[ -f $src/index.html ]] || { rm -rf "$tmp"; return 1; }
+        wt_download "${tpl#wt:}" "$src" || { rm -rf "$tmp"; return 1; }
+        [[ -f $src/robots.txt ]] || printf 'User-agent: *\nDisallow: /\n' > "$src/robots.txt"
     else
         site_field "$tpl" 1 >/dev/null || { rm -rf "$tmp"; return 1; }
         site_fetch || { rm -rf "$tmp"; return 1; }
@@ -3698,6 +3691,11 @@ node_client_template_json() { # имя
     ],
     "queryStrategy": "UseIPv4"
   },
+  "policy": {
+    "levels": {
+      "0": { "handshake": 4, "connIdle": 60, "uplinkOnly": 1, "downlinkOnly": 1 }
+    }
+  },
   "routing": {
     "rules": [
       { "type": "field", "inboundTag": ["dns-in"], "balancerTag": "BEST" },
@@ -3904,16 +3902,13 @@ node_client_template_json() { # имя
     ]
   },
   "burstObservatory": {
+    "subjectSelector": ["proxy"],
     "pingConfig": {
-      "pingConfig": {
-        "timeout": "3s",
-        "interval": "30s",
-        "sampling": 3,
-        "destination": "http://www.gstatic.com/generate_204"
-      },
-      "connectivity": ""
-    },
-    "subjectSelector": ["proxy"]
+      "destination": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "sampling": 2,
+      "timeout": "3s"
+    }
   }
 }
 EOF
@@ -4306,11 +4301,10 @@ Email (можно оставить пустым):") || return
 
     if [[ -f $NODE_WEBROOT/index.html ]]; then tpl=$(site_choose keep "$domain") || return
     else tpl=$(site_choose "" "$domain") || return; fi
-    if [[ $tpl == m32:* ]]; then
-        if ! m32_fetch; then
-            ui_msg "Ошибка" "Не удалось скачать генератор Manual32.
-
-Проверьте ссылку и доступ сервера к manual32.online, затем запустите установку снова."
+    if [[ $tpl == wt:* ]]; then
+        if ! wt_fetch_list; then
+            ui_msg "Ошибка" "Не удалось получить список шаблонов website-templates (api.github.com).
+Проверьте доступ сервера к GitHub и запустите установку снова."
             return
         fi
     elif [[ $tpl != keep ]] && ! site_fetch; then
@@ -4788,8 +4782,8 @@ node_change_site() {
     if ! site_install "$tpl" "$NODE_DOMAIN"; then
         ui_msg "Ошибка" "Не удалось установить шаблон «$(site_title "$tpl")».
 
-Mrvibecodic:  проверьте доступ сервера к codeload.github.com
-Manual32:     проверьте ссылку и доступ к manual32.online"
+Mrvibecodic:        проверьте доступ сервера к codeload.github.com
+website-templates:  проверьте доступ к api.github.com и raw.githubusercontent.com"
         return
     fi
     NODE_TEMPLATE=$tpl; node_state_save
@@ -6160,21 +6154,21 @@ menu_update() {
 ℹ У вас последняя версия"
         return
     fi
-    if version_newer "$new" "$SKIPIT_VERSION"; then
-        ui_yesno "Обновление SkipIt" "Установлена:  $SKIPIT_VERSION
+    # Откат на старую версию через «Обновить» не делаем - только вперёд
+    if ! version_newer "$new" "$SKIPIT_VERSION"; then
+        rm -f "$tmp"
+        ui_msg "Обновление SkipIt" "Установлена:    $SKIPIT_VERSION
+В репозитории:  $new
+
+ℹ В репозитории версия старее установленной — обновлять нечего"
+        return
+    fi
+    ui_yesno "Обновление SkipIt" "Установлена:  $SKIPIT_VERSION
 Доступна:     $new
 
 ℹ Настройки SkipIt и ноды не пропадут, старая версия сохранится в бэкап
 
 Обновить SkipIt?" || { rm -f "$tmp"; return; }
-    else
-        ui_yesno "Обновление SkipIt" "Установлена:    $SKIPIT_VERSION
-В репозитории:  $new
-
-! В репозитории версия старее установленной
-
-Всё равно установить $new?" no || { rm -f "$tmp"; return; }
-    fi
     if ! bak=$(update_apply "$tmp"); then
         rm -f "$tmp"
         ui_msg "Ошибка" "Не удалось записать $SKIPIT_BIN, установленная версия не тронута."
@@ -6250,7 +6244,7 @@ fail2ban: ${F2B_JAIL}
 Веб-сервер:      nginx (${NODE_NGINX_IMAGE})
 Docker:          установщик get.docker.com
 Сертификаты:     Let's Encrypt, certbot и плагин Cloudflare
-Шаблоны сайтов:  Mrvibecodic (GitHub), Manual32 (manual32.online)
+Шаблоны сайтов:  Mrvibecodic (GitHub), learning-zone/website-templates (GitHub)
 Проверка IP:     ipregion — github.com/vernette/ipregion
 Тест скорости:   Speedtest CLI от Ookla
 Монитор:         btop
