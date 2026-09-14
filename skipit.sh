@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.0.1a"
+SKIPIT_VERSION="1.0.2a"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -29,9 +29,13 @@ NODE_NGINX="${NODE_DIR}/nginx.conf"
 NODE_STATE="${SKIPIT_ETC}/node.conf"
 F2B_STATE="${SKIPIT_ETC}/fail2ban.conf"
 NODE_WEBROOT="/var/www/html"
-NODE_SOCK="/dev/shm/nginx.sock"
+# Сокет «Xray → заглушка»: своя папка ноды, смонтированная в оба контейнера как /skipit
+NODE_SOCK_DIR="/skipit"                       # путь внутри контейнеров
+NODE_SOCK="${NODE_SOCK_DIR}/decoy.sock"       # target в REALITY и listen в nginx
+NODE_SOCK_HOST="${NODE_DIR}/run/decoy.sock"   # тот же сокет, если смотреть с хоста
 NODE_IMAGE="remnawave/node:latest"
-NODE_NGINX_IMAGE="nginx:1.30"
+NODE_NGINX_IMAGE="nginx:1.30-alpine"
+NODE_DECOY="remnawave-nginx"                  # контейнер nginx (имя из документации Remnawave)
 NODE_XHTTP_PORT=2096          # XHTTP REALITY - Xray
 NODE_WS_PORT=2098             # WS - Xray, только 127.0.0.1
 NODE_WS_PUBLIC=8443           # WS - публичный TLS-листенер nginx
@@ -41,8 +45,8 @@ ACME_CLOSE="/etc/letsencrypt/renewal-hooks/post/skipit-close80.sh"
 F2B_JAIL="/etc/fail2ban/jail.d/skipit.local"
 F2B_FILTER="/etc/fail2ban/filter.d/skipit-portscan.conf"
 F2B_LOG="/var/log/fail2ban.log"
-ACME_DEPLOY="/etc/letsencrypt/renewal-hooks/deploy/skipit-restart-node.sh"
-ACME_DEPLOY_OLD="/etc/letsencrypt/renewal-hooks/deploy/skipit-nginx-reload.sh"
+ACME_DEPLOY="/etc/letsencrypt/renewal-hooks/deploy/skipit-reload-nginx.sh"
+ACME_DEPLOY_OLD="/etc/letsencrypt/renewal-hooks/deploy/skipit-reload-decoy.sh"
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
@@ -2332,8 +2336,8 @@ TCP:             $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 }
 
 # Нода Remnawave
-# Схема: клиент -> 443 Xray (remnanode, REALITY, xver 1)
-#        -> unix:/dev/shm/nginx.sock (nginx, proxy_protocol) -> сайт-заглушка
+# Схема: клиент -> 443 Xray (remnanode, REALITY). Чужой трафик Xray отдаёт в
+#        unix-сокет $NODE_SOCK (PROXY v2) -> nginx ($NODE_DECOY) -> сайт-заглушка
 NODE_DOMAIN=""; NODE_PANEL_IP=""; NODE_PORT=2222; NODE_CERT_METHOD=""; NODE_CERT_NAME=""
 NODE_TEMPLATE=""; NODE_PRIV=""; NODE_PUB=""; NODE_SID=""
 NODE_LAYOUT="steal"; NODE_WS_PATH=""; NODE_XHTTP_PATH=""
@@ -2377,7 +2381,7 @@ node_keys_ensure() {
 
 # Путь WS, который реально стоит в nginx.conf ноды (пусто - файла или WS-блока нет)
 node_nginx_ws_path() {
-    sed -n 's/^[[:space:]]*location[[:space:]]\+\(\/ws-[^[:space:]]*\)[[:space:]]*{.*/\1/p' "$NODE_NGINX" 2>/dev/null | head -n 1
+    sed -n 's/^[[:space:]]*location[[:space:]]\+\(=[[:space:]]\+\)\{0,1\}\(\/ws-[^[:space:]]*\)[[:space:]]*{.*/\2/p' "$NODE_NGINX" 2>/dev/null | head -n 1
 }
 
 node_state_load() {
@@ -2846,22 +2850,24 @@ exit 0
 EOF
     cat > "$ACME_DEPLOY" <<'EOF'
 #!/bin/sh
-# SkipIt: после перевыпуска сертификата ноды перезапустить nginx и remnanode
+# SkipIt: сертификат ноды продлён - nginx-заглушка перечитывает его.
+# Xray (REALITY) сертификат не использует, поэтому remnanode не трогаем и VPN не рвётся.
 command -v docker >/dev/null 2>&1 || exit 0
-# certbot передаёт RENEWED_LINEAGE - перезапускаем, только если обновился сертификат ноды
+# certbot передаёт RENEWED_LINEAGE - действуем, только если обновился сертификат ноды
 if [ -n "$RENEWED_LINEAGE" ] && [ -f /etc/skipit/node.conf ]; then
     name=$(sed -n 's/^NODE_CERT_NAME=//p' /etc/skipit/node.conf)
     [ -z "$name" ] || [ "${RENEWED_LINEAGE##*/}" = "$name" ] || exit 0
 fi
-for c in remnawave-nginx remnanode; do
-    docker inspect "$c" >/dev/null 2>&1 || continue
-    if docker restart "$c" >/dev/null 2>&1; then r=ok; else r=FAIL; fi
-    echo "$(date '+%F %T')  cert renew: restart $c $r" >> /var/log/skipit.log
-done
+c=remnawave-nginx
+docker inspect "$c" >/dev/null 2>&1 || exit 0
+if docker exec "$c" nginx -s reload >/dev/null 2>&1; then r=reload
+elif docker restart "$c" >/dev/null 2>&1; then r=restart
+else r=FAIL; fi
+echo "$(date '+%F %T')  cert renew: $c $r" >> /var/log/skipit.log
 exit 0
 EOF
     chmod 755 "$ACME_OPEN" "$ACME_CLOSE" "$ACME_DEPLOY"
-    rm -f "$ACME_DEPLOY_OLD"
+    rm -f "$ACME_DEPLOY_OLD" "${ACME_DEPLOY%/*}/skipit-restart-node.sh" "${ACME_DEPLOY%/*}/skipit-nginx-reload.sh"
 }
 
 cert_issue_http() { # домен email
@@ -3096,103 +3102,99 @@ site_install() { # тег [домен]
 }
 
 # ---- Файлы ноды ----
+# nginx ноды: сайт-заглушка за Xray, в балансире ещё и TLS-вход для WS.
+# TLS - профиль «intermediate» из Mozilla SSL Configuration Generator (ssl-config.mozilla.org),
+# но без DHE: ssl_dhparam не задан, и nginx эти шифры всё равно не предложит.
+# Нет resolver/ssl_trusted_certificate: они нужны только для OCSP stapling,
+# а Let's Encrypt OCSP больше не выдаёт.
 node_nginx_conf() { # домен имя-сертификата схема
+    local cert="/etc/letsencrypt/live/$2"
 cat <<EOF
-# Файл записан SkipIt, схема: $(node_layout_ru "$3")
-server_names_hash_bucket_size 64;
+# SkipIt · нода $1 · $(node_layout_ru "$3")
+# Файл пересоздаётся SkipIt (Нода Remnawave → nginx.conf), ручные правки уйдут в бэкап.
 
+server_tokens off;
+
+# Запас под длинные и дополнительные домены: при стандартном размере корзины (обычно 64)
+# nginx не стартует с «could not build server_names_hash» на имени длиннее ~60 символов
+server_names_hash_bucket_size 128;
+
+# Connection для проксирования: upgrade для WebSocket, close для обычных запросов.
+# Общий для всех server - пригодится и панели на этом же сервере.
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
     ""      close;
 }
 
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ecdh_curve X25519:prime256v1:secp384r1;
-ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
-ssl_prefer_server_ciphers on;
-ssl_session_timeout 1d;
-ssl_session_cache shared:MozSSL:10m;
+ssl_certificate     $cert/fullchain.pem;
+ssl_certificate_key $cert/privkey.pem;
+ssl_protocols       TLSv1.2 TLSv1.3;
+ssl_ecdh_curve      X25519:prime256v1:secp384r1;
+ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+ssl_session_cache   shared:skipit_tls:10m;
+ssl_session_timeout 4h;
 ssl_session_tickets off;
 
-resolver 1.1.1.1 8.8.8.8 valid=300s;
-resolver_timeout 5s;
-
-EOF
-if [[ $3 == balancer ]]; then
-cat <<EOF
-# STEAL + XHTTP (оба REALITY self-steal): Xray держит 443 и ${NODE_XHTTP_PORT},
-#    сюда, в сокет, отдаёт только фолбэк на декой. Общий блок на оба.
-EOF
-else
-cat <<EOF
-# STEAL (REALITY self-steal): Xray держит 443,
-#    сюда, в сокет, отдаёт только фолбэк на декой.
-EOF
-fi
-cat <<EOF
+# ── Сайт-заглушка
+# Сюда Xray отдаёт всё, что не прошло REALITY: браузеры и сканеры, открывшие
+# https://$1. Адрес клиента приходит PROXY-заголовком (xver 2 в профиле).
 server {
-    server_name $1;
     listen unix:${NODE_SOCK} ssl proxy_protocol;
     http2 on;
-
-    ssl_certificate "/etc/nginx/ssl/$2/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$2/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$2/fullchain.pem";
+    server_name $1;
 
     root ${NODE_WEBROOT};
     index index.html;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+    access_log off;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
 }
 
-# Дефолт-блок на сокете: рубим всё, что не по SNI.
+# ── Любое другое имя в SNI: рукопожатие обрывается, сертификат не показывается
 server {
     listen unix:${NODE_SOCK} ssl proxy_protocol default_server;
-    server_name _;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
     ssl_reject_handshake on;
-    return 444;
 }
 EOF
 [[ $3 == balancer ]] || return 0
 cat <<EOF
 
-# WS: отдельный публичный TLS-листенер на ${NODE_WS_PUBLIC}. nginx снимает TLS и
-#    проксирует секретный путь на локальный plaintext WS-инбаунд Xray (127.0.0.1:${NODE_WS_PORT}).
-#    Клиент коннектится к nginx напрямую -> тут БЕЗ proxy_protocol.
+# ── WS балансира
+# Клиент подключается к nginx напрямую по TLS на ${NODE_WS_PUBLIC} (без Xray перед ним,
+# поэтому без proxy_protocol), nginx открывает WebSocket к Xray на 127.0.0.1:${NODE_WS_PORT}.
 server {
-    server_name $1;
     listen ${NODE_WS_PUBLIC} ssl;
 EOF
 # [::] только если в системе есть IPv6, иначе nginx не запустится
 [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:${NODE_WS_PUBLIC} ssl;"
 cat <<EOF
     http2 on;
-
-    ssl_certificate "/etc/nginx/ssl/$2/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$2/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$2/fullchain.pem";
+    server_name $1;
 
     root ${NODE_WEBROOT};
     index index.html;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+    access_log off;
 
-    # секретный путь = path в WS-инбаунде Xray, посимвольно
-    location ${NODE_WS_PATH} {
+    # Ровно path WS-инбаунда. Запрос без Upgrade: websocket получает обычный 404,
+    # как любая несуществующая страница сайта, - путь ничем себя не выдаёт.
+    location = ${NODE_WS_PATH} {
+        if (\$http_upgrade !~* ^websocket\$) {
+            return 404;
+        }
         proxy_pass http://127.0.0.1:${NODE_WS_PORT};
         proxy_http_version 1.1;
-
-        proxy_set_header Upgrade           \$http_upgrade;
-        proxy_set_header Connection        \$connection_upgrade;   # из map-блока выше
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
     }
 
-    # всё, что не секретный путь - декой
     location / {
         try_files \$uri \$uri/ =404;
     }
@@ -3200,49 +3202,49 @@ cat <<EOF
 EOF
 }
 
+# docker-compose ноды: remnanode (официальный образ Remnawave) и nginx-заглушка.
+# Общая у контейнеров только папка ./run с сокетом - не весь /dev/shm хоста.
 node_compose() {
 cat <<EOF
-# Файл записан SkipIt. SECRET_KEY и NODE_PORT - в .env рядом.
-x-common: &common
-  restart: always
-  ulimits:
-    nofile:
-      soft: 1048576
-      hard: 1048576
+# SkipIt · нода Remnawave. SECRET_KEY и NODE_PORT - в .env рядом.
+
+x-defaults: &defaults
+  restart: unless-stopped
+  network_mode: host
   logging:
     driver: json-file
     options:
-      max-size: 50m
+      max-size: 10m
       max-file: "3"
 
 services:
   remnanode:
-    <<: *common
+    <<: *defaults
     image: ${NODE_IMAGE}
     container_name: remnanode
     hostname: remnanode
-    network_mode: host
     cap_add:
       - NET_ADMIN
+    ulimits:
+      nofile: 262144
     env_file: .env
     volumes:
-      - /dev/shm:/dev/shm:rw
+      - ./run:${NODE_SOCK_DIR}
 
   remnawave-nginx:
-    <<: *common
+    <<: *defaults
     image: ${NODE_NGINX_IMAGE}
-    container_name: remnawave-nginx
-    hostname: remnawave-nginx
-    network_mode: host
-    command: sh -c 'rm -f ${NODE_SOCK} && exec nginx -g "daemon off;"'
+    container_name: ${NODE_DECOY}
+    hostname: ${NODE_DECOY}
+    # сокет от прошлого запуска (сбой, перезагрузка) не даст nginx занять адрес
+    entrypoint: ["/bin/sh", "-c", "rm -f ${NODE_SOCK}; exec nginx -g 'daemon off;'"]
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      # live -> /etc/nginx/ssl, archive -> /etc/nginx/archive: симлинки certbot
-      # (../../archive/...) разрешаются, nginx -s reload видит продлённый сертификат
-      - /etc/letsencrypt/live:/etc/nginx/ssl:ro
-      - /etc/letsencrypt/archive:/etc/nginx/archive:ro
+      - ./run:${NODE_SOCK_DIR}
       - ${NODE_WEBROOT}:${NODE_WEBROOT}:ro
-      - /dev/shm:/dev/shm:rw
+      # live/ - симлинки на ../../archive/: обе папки по родным путям, продление видно после reload
+      - /etc/letsencrypt/live:/etc/letsencrypt/live:ro
+      - /etc/letsencrypt/archive:/etc/letsencrypt/archive:ro
 EOF
 }
 
@@ -3343,9 +3345,9 @@ node_ensure_docker() {
 
 node_nginx_ok() { # → текст ошибки
     local out
-    [[ $(ctr_status remnawave-nginx) == running ]] || { echo "контейнер remnawave-nginx не работает"; return 1; }
-    out=$(docker exec remnawave-nginx nginx -t 2>&1) || { echo "$out"; return 1; }
-    [[ -S $NODE_SOCK ]] || { echo "нет сокета $NODE_SOCK"; return 1; }
+    [[ $(ctr_status "$NODE_DECOY") == running ]] || { echo "контейнер $NODE_DECOY не работает"; return 1; }
+    out=$(docker exec "$NODE_DECOY" nginx -t 2>&1) || { echo "$out"; return 1; }
+    [[ -S $NODE_SOCK_HOST ]] || { echo "нет сокета $NODE_SOCK_HOST"; return 1; }
 }
 
 # Полный конфиг профиля для панели (по рабочему конфигу): вставляется целиком.
@@ -3358,7 +3360,7 @@ node_tag() { # домен тип(steal|xhttp|ws)
 node_reality_json() { # домен → realitySettings (отступ 8)
 cat <<EOF
         "realitySettings": {
-          "dest": "$NODE_SOCK",
+          "target": "$NODE_SOCK",
           "show": false,
           "xver": 2,
           "shortIds": [$(sed 's/[^,]*/"&"/g; s/,/, /g' <<< "$NODE_SID")],
@@ -3522,11 +3524,6 @@ cat <<'EOF'
       {
         "ip": ["geoip:private"],
         "type": "field",
-        "outboundTag": "BLOCK"
-      },
-      {
-        "type": "field",
-        "domain": ["geosite:category-ads-all"],
         "outboundTag": "BLOCK"
       }
     ],
@@ -3929,7 +3926,7 @@ node_guide() { # домен порт схема [wizard]
     while :; do
         ui_head "Панель · шаг 1 из $total · Профиль"
         g_steps "Откройте панель Remnawave в браузере" \
-                "В меню слева, в группе «Управление», выберите «Профили» и нажмите «+» справа вверху" \
+                "В меню слева выберите «Профиль» и нажмите «+» справа вверху" \
                 "В поле «Название профиля» впишите ⟦$name⟧ и нажмите «Создать»" \
                 "Откройте профиль ⟦$name⟧, удалите весь текст конфига и вставьте вместо него этот:"
         g_gap
@@ -3952,25 +3949,26 @@ node_guide() { # домен порт схема [wizard]
         else
         g_steps "В меню слева нажмите «Ноды» → «Управление», затем «+» справа вверху"
         g_gap
-        g_line "Заполните поля:"
-        g_kv "Название" "$name"
-        g_kv "Адрес" "$domain"
-        g_kv "Порт" "$port"
-        g_kv "Профиль" "выберите $name (создан на шаге 1)"
+        g_line "Первый экран «Создать ноду» — заполните поля:"
+        g_kv "Внутреннее название" "$name"
+        g_kv "Домен или IP" "$domain"
+        g_kv "Node Port" "$port"
+        g_gap
+        g_steps "Нажмите «Далее»"
+        g_gap
+        g_line "Следующий экран — выберите:"
+        g_kv "Профиль" "$name (создан на шаге 1)"
         g_kv "Inbounds" "$inb"
         g_gap
+        g_steps "Сохраните ноду" \
+                "Откроется окно подключения. Если там «CONNECTING…», «Устанавливаем mTLS-соединение…» или «Подключиться не удалось» — не ждите, сразу нажмите «Закрыть»"
+        g_gap
         if [[ $mode == wizard ]]; then
-            g_steps "Сохраните ноду"
-            g_gap
-            g_note "SECRET_KEY ноды SkipIt попросит в конце, после шагов с хостами."
+            g_note "Ошибка подключения на этом шаге — это нормально: нода на сервере запустится после шагов с хостами. SECRET_KEY SkipIt попросит в конце."
+        elif [[ -n $(port_listeners 443) ]]; then
+            g_note "Нода уже подключена к панели."
         else
-            g_steps "Сохраните ноду"
-            g_gap
-            if [[ -n $(port_listeners 443) ]]; then
-                g_note "Нода уже подключена к панели."
-            else
-                g_note "SECRET_KEY уже записан — нода подключится, когда её создадут в панели."
-            fi
+            g_note "SECRET_KEY уже записан — панель переподключится к ноде сама. Проверить: SkipIt → Нода Remnawave → Диагностика."
         fi
         g_next || { rc=1; break; }
         fi
@@ -3984,7 +3982,7 @@ node_guide() { # домен порт схема [wizard]
                 g_gap
                 node_client_template_json "$name" | g_code
                 g_gap
-                g_steps "Не закрывая шаблон, откройте панель Remnawave в новой вкладке браузера, перейдите в «Управление» → «Хосты» → хост ⟦$(node_tag "$domain" steal)⟧ и скопируйте его UUID" \
+                g_steps "Не закрывая шаблон, откройте панель Remnawave в новой вкладке браузера, в меню слева выберите «Хосты», откройте хост ⟦$(node_tag "$domain" steal)⟧ и скопируйте его UUID" \
                         "В шаблоне, в блоке «values», сотрите текст-заглушку ⟦UUID хоста $(node_tag "$domain" steal)⟧ и вставьте скопированный UUID (кавычки оставьте)" \
                         "Так же скопируйте UUID хоста ⟦$(node_tag "$domain" xhttp)⟧ и вставьте его вместо заглушки ⟦UUID хоста $(node_tag "$domain" xhttp)⟧" \
                         "Сохраните шаблон"
@@ -3996,7 +3994,7 @@ node_guide() { # домен порт схема [wizard]
                 continue
             fi
             ui_head "Панель · шаг $((n + 2)) из $total · Хост $(node_tag "$domain" "${h,,}")"
-            g_steps "В меню слева, в группе «Управление», выберите «Хосты» и нажмите «+» справа вверху"
+            g_steps "В меню слева выберите «Хосты» и нажмите «+» справа вверху"
             g_gap
             g_line "Заполните поля:"
             g_kv "Видимость хоста" "включить"
@@ -4452,7 +4450,7 @@ node_profile_diff() {
     cfg=$(node_live_config) || return 2
     python3 -c '
 import json, sys
-ws, xh, sid, priv = sys.argv[1:5]
+ws, xh, sid, priv, sock = sys.argv[1:6]
 c = json.load(sys.stdin)
 c = c.get("response", c)
 bad = []
@@ -4464,10 +4462,11 @@ for i in c.get("inbounds", []):
     if r:
         if r.get("privateKey") != priv: add("ключ REALITY")
         if set(r.get("shortIds", [])) != set(sid.split(",")): add("shortId")
+        if r.get("target", r.get("dest")) != sock: add("сокет заглушки (target)")
     if s.get("network") == "xhttp" and (s.get("xhttpSettings") or {}).get("path") != xh: add("путь XHTTP")
     if s.get("network") == "ws" and (s.get("wsSettings") or {}).get("path") != ws: add("путь WS")
 print(", ".join(bad))
-' "$NODE_WS_PATH" "$NODE_XHTTP_PATH" "$NODE_SID" "$NODE_PRIV" <<< "$cfg" 2>/dev/null || return 2
+' "$NODE_WS_PATH" "$NODE_XHTTP_PATH" "$NODE_SID" "$NODE_PRIV" "$NODE_SOCK" <<< "$cfg" 2>/dev/null || return 2
 }
 
 diag_ok()   { DIAG+="  ✓ $*"$'\n'; DIAG_OK=$((DIAG_OK + 1)); }
@@ -4541,7 +4540,7 @@ node_diag() {
     fi
 
     diag_head "Контейнеры"
-    for v in remnanode remnawave-nginx; do
+    for v in remnanode "$NODE_DECOY"; do
         case $(ctr_status "$v") in
             running)
                 restarts=$(docker inspect -f '{{.RestartCount}}' "$v" 2>/dev/null)
@@ -4551,7 +4550,7 @@ node_diag() {
             *)  diag_bad "$v: $(ctr_state_ru "$v") — смотрите логи" ;;
         esac
     done
-    if v=$(node_nginx_ok); then diag_ok "nginx: конфигурация верна, сокет $NODE_SOCK есть"
+    if v=$(node_nginx_ok); then diag_ok "nginx: конфигурация верна, сокет $NODE_SOCK_HOST есть"
     else diag_bad "nginx: $v"; fi
 
     diag_head "Домен и сертификат"
@@ -4577,7 +4576,7 @@ node_diag() {
         diag_ok "Порт 443 слушается"
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$NODE_DOMAIN:443:127.0.0.1" "https://$NODE_DOMAIN/" 2>/dev/null)
         [[ $code == 200 ]] && diag_ok "https://$NODE_DOMAIN через Xray → nginx отдаёт сайт-заглушку" ||
-            diag_bad "https://$NODE_DOMAIN через 443 не отвечает (код ${code:-нет}) — проверьте dest и xver в профиле"
+            diag_bad "https://$NODE_DOMAIN через 443 не отвечает (код ${code:-нет}) — проверьте target ($NODE_SOCK) и xver в профиле"
     else
         diag_bad "Порт 443 не слушается — Xray не получил конфиг от панели.
       Проверьте: нода создана в панели ($SERVER_IP:$NODE_PORT), SECRET_KEY совпадает,
@@ -4658,13 +4657,13 @@ node_logs() {
     local c
     local hdr v r
     hdr="Контейнер"$'\t'"Состояние"$'\t'"Перезапусков"
-    for v in remnanode remnawave-nginx; do
+    for v in remnanode "$NODE_DECOY"; do
         r=$(docker inspect -f '{{.RestartCount}}' "$v" 2>/dev/null)
         hdr+=$'\n'"$v"$'\t'"$(ctr_state_ru "$v")"$'\t'"${r:-—}"
     done
     c=$(ui_choose "Логи" "$hdr" \
-        remnanode       "remnanode — Xray и связь с панелью" \
-        remnawave-nginx "nginx — сайт-заглушка и WS балансира") || return
+        remnanode     "remnanode — Xray и связь с панелью" \
+        "$NODE_DECOY" "nginx — сайт-заглушка и WS балансира") || return
     ui_head "Логи: $c"
     printf '  %sпоследние 200 строк, дальше новые в реальном времени%s\n  %s\n\n' \
         "$C_NOTE" "$C_RESET" "$(ui_keys "Ctrl+C — остановить просмотр")" >"$TTY"
@@ -4695,10 +4694,10 @@ node_update() {
 Проверить обновления?" || return
     clear; say "Скачиваю образы..."
     local before after
-    before=$(docker inspect -f '{{.Image}}' remnanode remnawave-nginx 2>/dev/null)
+    before=$(docker inspect -f '{{.Image}}' remnanode "$NODE_DECOY" 2>/dev/null)
     node_compose_run pull || { node_fail "Не удалось скачать образы."; return; }
     node_compose_run up -d --remove-orphans || { node_fail "docker compose up завершился с ошибкой."; return; }
-    after=$(docker inspect -f '{{.Image}}' remnanode remnawave-nginx 2>/dev/null)
+    after=$(docker inspect -f '{{.Image}}' remnanode "$NODE_DECOY" 2>/dev/null)
     docker image prune -f >/dev/null 2>&1
     echo
     if [[ $before == "$after" ]]; then say "Обновлений нет — контейнеры не тронуты."
@@ -4802,7 +4801,7 @@ node_cert() {
 Домены:      $(cert_domains "$NODE_CERT_NAME")
 Способ:      $(cert_method_ru "$NODE_CERT_NAME")
 Действует:   ещё $d дн.
-Продление:   $(cert_renew_scheduled && echo "автоматически (certbot), затем перезапуск nginx и remnanode" || echo "НЕ НАСТРОЕНО")"
+Продление:   $(cert_renew_scheduled && echo "автоматически (certbot), затем nginx перечитывает сертификат" || echo "НЕ НАСТРОЕНО")"
     c=$(ui_choose "Сертификат" "$info" \
         test  "Проверить автопродление (certbot renew --dry-run)" \
         renew "Перевыпустить сейчас") || return
@@ -4818,11 +4817,11 @@ Let's Encrypt ограничивает число выпусков (5 в нед�
         certbot renew --force-renewal --no-random-sleep-on-renew --cert-name "$NODE_CERT_NAME"; rc=$?
     fi
     "$ACME_CLOSE"
-    # Перезапуск nginx и remnanode делает хук $ACME_DEPLOY - certbot запускает его сам после перевыпуска
+    # nginx перечитывает сертификат в хуке $ACME_DEPLOY - certbot запускает его сам после перевыпуска
     log "node cert $c rc=$rc"
     echo
     if (( rc != 0 )); then printf '%s✗ certbot завершился с ошибкой (код %s)%s\n' "$C_ERR" "$rc" "$C_RESET"
-    elif [[ $c == renew ]]; then say "Готово. Сертификат перевыпущен, nginx и remnanode перезапущены."
+    elif [[ $c == renew ]]; then say "Готово. Сертификат перевыпущен, nginx его перечитал."
     else say "Готово."; fi
     pause
 }
@@ -4831,7 +4830,7 @@ node_nginx_menu() {
     local c bak err
     c=$(ui_choose "nginx.conf" "Файл:   $NODE_NGINX
 Схема:  $(node_layout_ru "$NODE_LAYOUT")
-nginx:  $(ctr_state_ru remnawave-nginx)" \
+nginx:  $(ctr_state_ru "$NODE_DECOY")" \
         view  "Просмотреть" \
         edit  "Редактировать (nano) — с проверкой nginx -t и откатом") || return
     case $c in
@@ -4842,20 +4841,20 @@ nginx:  $(ctr_state_ru remnawave-nginx)" \
             clear; nano "$NODE_NGINX"
             if cmp -s "$bak" "$NODE_NGINX"; then rm -f "$bak"; ui_msg "nginx.conf" "Файл не изменён."; return; fi ;;
     esac
-    if [[ $(ctr_status remnawave-nginx) != running ]]; then
+    if [[ $(ctr_status "$NODE_DECOY") != running ]]; then
         log "node nginx $c (backup: $bak)"
         ui_msg "Сохранено" "Файл сохранён, но контейнер nginx не работает — проверить нельзя.
 Бэкап: $bak"
         return
     fi
-    if ! err=$(docker exec remnawave-nginx nginx -t 2>&1); then
+    if ! err=$(docker exec "$NODE_DECOY" nginx -t 2>&1); then
         cat "$bak" > "$NODE_NGINX"
         ui_msg "Ошибка в nginx.conf" "Проверка nginx -t не пройдена — файл возвращён к прежней версии:
 
 $err"
         return
     fi
-    docker exec remnawave-nginx nginx -s reload >/dev/null 2>&1
+    docker exec "$NODE_DECOY" nginx -s reload >/dev/null 2>&1
     log "node nginx $c (backup: $bak)"
     ui_msg "Готово" "nginx.conf проверен и применён. Бэкап: $bak"
 }
@@ -4882,9 +4881,9 @@ $busy"
             return
         fi
     fi
-    ui_yesno "$( (( changed )) && echo "Смена схемы" || echo "Пересоздание файлов")" "Схема:          $(node_layout_ru "$layout")
-Пересоздастся:  контейнер nginx
-Если сбой:      файлы и контейнер вернутся к прежним
+    ui_yesno "$( (( changed )) && echo "Смена схемы" || echo "Пересоздание файлов")" "Схема:           $(node_layout_ru "$layout")
+Пересоздадутся:  контейнеры remnanode и $NODE_DECOY
+Если сбой:       файлы и контейнеры вернутся к прежним
 
 ! Клиенты VPN отключатся на 5–10 секунд
 
@@ -4894,16 +4893,17 @@ $busy"
     node_gen_paths
     node_compose > "$NODE_COMPOSE"
     node_nginx_conf "$NODE_DOMAIN" "$NODE_CERT_NAME" "$layout" > "$NODE_NGINX"
-    clear; say "Пересоздаю контейнер nginx..."
-    node_compose_run up -d --force-recreate remnawave-nginx
+    clear; say "Пересоздаю контейнеры ноды..."
+    # --remove-orphans: убрать контейнеры сервисов, которых в новом compose уже нет
+    node_compose_run up -d --force-recreate --remove-orphans
     sleep 4
     if ! err=$(node_nginx_ok); then
         [[ -n $bak_n ]] && cat "$bak_n" > "$NODE_NGINX"
         [[ -n $bak_c ]] && cat "$bak_c" > "$NODE_COMPOSE"
         say "Откатываю..."
-        node_compose_run up -d --force-recreate remnawave-nginx
+        node_compose_run up -d --force-recreate --remove-orphans
         log "node regen: FAIL layout=$layout, rolled back"
-        ui_msg "nginx не запустился" "Файлы и контейнер возвращены к прежним.
+        ui_msg "nginx не запустился" "Файлы и контейнеры возвращены к прежним.
 
 $err
 
@@ -4924,17 +4924,23 @@ $err
 Инструкция откроется на следующем экране."
         node_guide "$NODE_DOMAIN" "$NODE_PORT" "$layout"
     else
+        local pdiff=""
+        sleep 2; pdiff=$(node_profile_diff)
         ui_msg "Готово" "nginx.conf и docker-compose.yml пересозданы, nginx работает.
 Бэкапы:
   $bak_n
-  $bak_c"
+  $bak_c${pdiff:+
+
+! В профиле панели не совпадает: $pdiff
+  Обновите профиль — инструкция откроется на следующем экране.}"
+        [[ -n $pdiff ]] && node_guide "$NODE_DOMAIN" "$NODE_PORT" "$layout"
     fi
 }
 
 node_remove() {
     local del_cert=0 del_site=0 del_443=0 bak
     ui_yesno "Удаление ноды" "Будут удалены:
-  · контейнеры remnanode и remnawave-nginx
+  · контейнеры remnanode и $NODE_DECOY
   · папка $NODE_DIR (архив — в $SKIPIT_BACKUPS)
   · правило UFW «$NODE_PORT/tcp с $NODE_PANEL_IP»
 
@@ -4947,7 +4953,7 @@ node_remove() {
     [[ -f $NODE_COMPOSE ]] && node_compose_run down --remove-orphans
     bak="${SKIPIT_BACKUPS}/remnanode-$(date +%Y%m%d-%H%M%S).tar.gz"
     tar -czf "$bak" -C "$(dirname "$NODE_DIR")" "$(basename "$NODE_DIR")" 2>/dev/null && chmod 600 "$bak"
-    rm -rf "$NODE_DIR" "$NODE_SOCK"
+    rm -rf "$NODE_DIR"
     node_ufw_remove "$NODE_PANEL_IP" "$NODE_PORT"
     if (( del_443 )) && command -v ufw >/dev/null 2>&1; then
         ufwc --force delete allow 443/tcp >/dev/null 2>&1
@@ -4994,7 +5000,7 @@ IP панели:  $NODE_PANEL_IP
 
 Компонент${tab}Состояние
 remnanode${tab}$(ctr_state_ru remnanode)
-nginx${tab}$(ctr_state_ru remnawave-nginx)
+nginx${tab}$(ctr_state_ru "$NODE_DECOY")
 Сертификат${tab}$(node_cert_state)
 UFW${tab}$(if ! command -v ufw >/dev/null 2>&1; then echo "не установлен"; elif ufw_active; then echo "включён"; else echo "выключен"; fi)"
         c=$(ui_menu "Нода Remnawave" "$hdr" \
