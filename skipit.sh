@@ -6103,6 +6103,33 @@ update_version_of() { sed -n 's/^SKIPIT_VERSION="\(.*\)"$/\1/p' "$1" 2>/dev/null
 # 0, если версия $1 новее $2
 version_newer() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]; }
 
+# Последняя версия в репозитории - в кеше, чтобы главное меню не ходило в сеть
+SKIPIT_UPDATE_LATEST="/var/cache/skipit/skipit-latest-version"
+
+update_latest_save() { # версия
+    [[ $1 =~ ^[0-9A-Za-z.+-]+$ ]] || return 0
+    mkdir -p "${SKIPIT_UPDATE_LATEST%/*}" && printf '%s\n' "$1" > "$SKIPIT_UPDATE_LATEST"
+}
+
+# Версия из кеша, если она новее установленной (иначе пусто)
+update_available() {
+    local v; v=$(head -n 1 "$SKIPIT_UPDATE_LATEST" 2>/dev/null)
+    [[ $v =~ ^[0-9A-Za-z.+-]+$ ]] && version_newer "$v" "$SKIPIT_VERSION" && printf '%s' "$v"
+}
+
+# Фоновая проверка при запуске, не чаще раза в 6 часов. Lock-дескриптор 9 закрываем,
+# иначе фоновый процесс будет считаться «открытым SkipIt» (см. lock_holders)
+update_check_bg() {
+    [[ -n $(find "$SKIPIT_UPDATE_LATEST" -mmin -360 2>/dev/null) ]] && return 0
+    (
+        exec 9>&-
+        tmp=$(mktemp) || exit 0
+        update_fetch "$tmp" && update_latest_save "$(update_version_of "$tmp")"
+        rm -f "$tmp"
+    ) >/dev/null 2>&1 </dev/null &
+    disown 2>/dev/null
+}
+
 # Бэкап текущей версии и замена. Новый файл кладём рядом и переименовываем:
 # уже запущенный SkipIt продолжает читать старый файл и не ломается на ходу. Печатает путь бэкапа.
 update_apply() { # файл
@@ -6146,6 +6173,7 @@ menu_update() {
             return ;;
     esac
     new=$(update_version_of "$tmp")
+    update_latest_save "$new"
     if [[ $new == "$SKIPIT_VERSION" ]]; then
         rm -f "$tmp"
         ui_msg "Обновление SkipIt" "Установлена:  $SKIPIT_VERSION
@@ -6205,6 +6233,7 @@ skipit_update_cli() {
         *) rm -f "$tmp"; die "Не удалось скачать обновление: нет связи с GitHub." ;;
     esac
     new=$(update_version_of "$tmp")
+    update_latest_save "$new"
     if [[ $new == "$SKIPIT_VERSION" ]]; then
         rm -f "$tmp"; say "Установлена последняя версия: v$new"; return 0
     fi
@@ -6255,12 +6284,14 @@ Docker:          установщик get.docker.com
 }
 
 main_menu() {
-    local c rc ufw_st
+    local c rc ufw_st upd
     while :; do
         if ! command -v ufw >/dev/null 2>&1; then ufw_st="не установлен"
         elif ufw_active; then ufw_st="включён"; else ufw_st="выключен"; fi
+        upd=$(update_available)
         UI_CANCEL="Выход"; UI_BANNER=1
         UI_FOOTER=$'\n'"  ${C_HINT}запуск в любой момент: ${C_ACC}${SKIPIT_CMD}${C_RESET}"
+        [[ -n $upd ]] && UI_FOOTER+=$'\n'"  ${C_WARN}доступна новая версия SkipIt: v${upd}${C_RESET} ${C_HINT}— пункт «Обновить SkipIt»${C_RESET}"
         c=$(ui_menu "" "сервер     $(hostname) · $SERVER_IP
 система    $OS_NAME · $VIRT
 статус     SSH $(ssh_ports) · UFW $ufw_st · fail2ban $(f2b_state_ru) · TCP $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
@@ -6286,7 +6317,7 @@ main_menu() {
             speed   "Тест скорости канала" \
             clean   "Очистка диска" \
             ""      "SkipIt" \
-            update  "Обновить SkipIt" \
+            update  "Обновить SkipIt${upd:+ — доступна v$upd}" \
             about   "О программе")
         rc=$?
         UI_CANCEL="Назад"; UI_FOOTER=""; UI_BANNER=0
@@ -6375,6 +6406,7 @@ main() {
     trap 'tx_end; stty echo <"$TTY" 2>/dev/null' EXIT
     trap 'printf "\n\n  %sSkipIt%s закрыт: его открыли в другом окне.\n\n" "$C_BRAND" "$C_RESET" >"$TTY" 2>/dev/null; exit 143' TERM HUP
     trap ':' INT   # Ctrl+C отменяет текущее действие, а не закрывает панель
+    update_check_bg
 
     say "Собираю сведения о сервере..."
     server_info_init
