@@ -12,7 +12,7 @@
 
 [![OS Support](https://img.shields.io/badge/OS-Debian%20%7C%20Ubuntu-6f42c1?style=for-the-badge&logo=linux&logoColor=white)](#-системные-требования)
 [![Core Engine](https://img.shields.io/badge/Engine-Remnawave%20%2B%20Xray-007acc?style=for-the-badge&logo=docker&logoColor=white)](#-нода-remnawave-и-схемы-развертывания)
-[![Status](https://img.shields.io/badge/Status-In%20Development-ff9900?style=for-the-badge)](#-о-проекте)
+[![Status](https://img.shields.io/badge/Status-Alpha-ff9900?style=for-the-badge)](#-о-проекте)
 [![License](https://img.shields.io/badge/License-MIT-28a745?style=for-the-badge)](LICENSE)
 
 </div>
@@ -37,9 +37,6 @@
 * 🐳 **Никакого ручного ковыряния в Docker Compose** — скрипт сам развернёт связку с Nginx.
 * 🌐 **Интеграция с Cloudflare API** — автоматический выпуск и продление SSL-сертификатов.
 * 🚪 **Безопасная смена SSH-портов** — встроенный защитный алгоритм в фоне проверяет соединение, предотвращая случайную блокировку.
-
-> [!NOTE]
-> **Есть идеи или нашли баг?** Проект развивается, так что смело создавайте [Issue](https://github.com/FrI3nd7/skipit-vps-node/issues) или присылайте Pull Request — любая помощь приветствуется!
 
 ---
 
@@ -67,7 +64,7 @@
 | Компонент / Этап | Возможности и особенности |
 | :--- | :--- |
 | **SSL-сертификаты** | Поддержка простого режима **HTTP-01** (с временным открытием 80 порта) или **Cloudflare DNS** (wildcard-домены по API-токену) |
-| **Маскировка** | Выбор случайных тематических шаблонов-заглушек или загрузка шрифтов Google Fonts |
+| **Маскировка** | Выбор среди 171 шаблона сайтов (`website-templates` / `Mrvibecodic`) с точечной загрузкой нужного варианта до 3 МБ |
 | **Диагностика** | Комплексная проверка связи с панелью, статуса портов, контейнеров `remnanode` и `remnawave-nginx`, правил UFW и DNS-записей |
 | **Администрирование** | Безопасный редактор `nginx.conf` через `nano` с проверкой синтаксиса `nginx -t` и автооткатом при ошибках, смена ключей, перевыпуск сертификатов и безопасный перезапуск |
 
@@ -98,12 +95,13 @@
 ### 📊 4. Диагностика, Мониторинг и Утилиты
 - **Мониторинг (`btop`)**: Быстрый запуск системного монитора ресурсов.
 - **Тесты и проверка сети**: Замер скорости через **Speedtest CLI (Ookla)** и проверка геопозиции IP (`ipregion`) по базам и сервисам (YouTube, Netflix, ChatGPT, Cloudflare).
-- **Обслуживание**: Безопасное обновление пакетов системы и очистка диска (кэш apt, неиспользуемые Docker-образы, временные файлы SkipIt).
+- **Обслуживание**: Безопасное обновление пакетов системы, фоновая проверка обновлений скрипта и очистка диска (кэш apt, неиспользуемые Docker-образы, временные файлы SkipIt).
 
 ---
 
-## ⚡ Быстрый запуск
+## ⚡ Быстрый запуск и обновление
 
 Запустите команду в консоли вашего сервера от имени `root`:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh -o /tmp/skipit.sh && bash /tmp/skipit.sh install
+curl -fsSL [https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh](https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh) -o /tmp/skipit.sh && bash /tmp/skipit.sh
