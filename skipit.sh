@@ -3449,7 +3449,7 @@ $(node_sniffing_json)
           "path": "$NODE_XHTTP_PATH",
           "extra": {
             "xmux": {
-              "cMaxReuseTimes": 0,
+              "cMaxReuseTimes": "50-100",
               "maxConcurrency": "4-8",
               "maxConnections": 0,
               "hKeepAlivePeriod": 0,
@@ -3668,7 +3668,7 @@ node_xhttp_extra_json() {
     cat <<'EOF'
 {
   "xmux": {
-    "cMaxReuseTimes": 0,
+    "cMaxReuseTimes": "50-100",
     "maxConcurrency": "4-8",
     "maxConnections": 0,
     "hKeepAlivePeriod": 0,
@@ -3697,11 +3697,6 @@ node_client_template_json() { # имя
       "https://cloudflare-dns.com/dns-query"
     ],
     "queryStrategy": "UseIPv4"
-  },
-  "policy": {
-    "levels": {
-      "0": { "connIdle": 120, "handshake": 4, "uplinkOnly": 2, "downlinkOnly": 5 }
-    }
   },
   "routing": {
     "rules": [
