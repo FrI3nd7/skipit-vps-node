@@ -10,8 +10,8 @@
 
 <br>
 
-[![OS Support](https://img.shields.io/badge/OS-Debian%20%7C%20Ubuntu-6f42c1?style=for-the-badge&logo=linux&logoColor=white)](#-возможности)
-[![Core Engine](https://img.shields.io/badge/Engine-Remnawave%20%2B%20Xray-007acc?style=for-the-badge&logo=docker&logoColor=white)](#-возможности)
+[![OS Support](https://img.shields.io/badge/OS-Debian%20%7C%20Ubuntu-6f42c1?style=for-the-badge&logo=linux&logoColor=white)](#-системные-требования)
+[![Core Engine](https://img.shields.io/badge/Engine-Remnawave%20%2B%20Xray-007acc?style=for-the-badge&logo=docker&logoColor=white)](#-нода-remnawave-и-схемы-развертывания)
 [![Status](https://img.shields.io/badge/Status-In%20Development-ff9900?style=for-the-badge)](#-о-проекте)
 [![License](https://img.shields.io/badge/License-MIT-28a745?style=for-the-badge)](LICENSE)
 
@@ -40,6 +40,36 @@
 
 > [!NOTE]
 > **Есть идеи или нашли баг?** Проект развивается, так что смело создавайте [Issue](https://github.com/FrI3nd7/skipit-vps-node/issues) или присылайте Pull Request — любая помощь приветствуется!
+
+---
+
+## 🐳 Нода Remnawave и схемы развертывания
+
+Инструмент позволяет развернуть ноду Remnawave в один клик через интерактивный TUI-интерфейс, автоматически настраивая Docker, SSL-сертификаты и безопасный доступ.
+
+### 📋 Что понадобится для установки:
+| Параметр | Описание |
+| :--- | :--- |
+| **Домен** | Доменное имя с **A-записью** на IP этого сервера (в режиме *DNS only*, если используется Cloudflare) |
+| **IP панели** | Адрес вашего сервера с панелью Remnawave |
+| **SECRET_KEY** | Секретный ключ ноды (если ключа нет, скрипт сгенерирует REALITY-ключи и покажет инструкцию для создания ноды в панели) |
+
+### ⚙️ Схемы развертывания:
+| Схема | Порты | Как работает |
+| :--- | :--- | :--- |
+| **Шаблонная** | `443` | `selfsteal` TCP: Xray на 443, сайт-заглушка через Nginx |
+| **Балансир** | `443`, `2096`, `8443` | `selfsteal` TCP + XHTTP + WS через Nginx, с выбором лучшего протокола по пингу (BEST) |
+
+---
+
+### 🔄 Мастер настройки и управления нодой (TUI)
+
+| Компонент / Этап | Возможности и особенности |
+| :--- | :--- |
+| **SSL-сертификаты** | Поддержка простого режима **HTTP-01** (с временным открытием 80 порта) или **Cloudflare DNS** (wildcard-домены по API-токену) |
+| **Маскировка** | Выбор случайных тематических шаблонов-заглушек или загрузка шрифтов Google Fonts |
+| **Диагностика** | Комплексная проверка связи с панелью, статуса портов, контейнеров `remnanode` и `remnawave-nginx`, правил UFW и DNS-записей |
+| **Администрирование** | Безопасный редактор `nginx.conf` через `nano` с проверкой синтаксиса `nginx -t` и автооткатом при ошибках, смена ключей, перевыпуск сертификатов и безопасный перезапуск |
 
 ---
 
@@ -75,6 +105,5 @@
 ## ⚡ Быстрый запуск
 
 Запустите команду в консоли вашего сервера от имени `root`:
-
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh](https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh)) install
+curl -fsSL https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh -o /tmp/skipit.sh && bash /tmp/skipit.sh install
