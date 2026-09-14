@@ -38,6 +38,9 @@
 * 🌐 **Интеграция с Cloudflare API** — автоматический выпуск и продление SSL-сертификатов.
 * 🚪 **Безопасная смена SSH-портов** — встроенный защитный алгоритм в фоне проверяет соединение, предотвращая случайную блокировку.
 
+> [!NOTE]
+> **Есть идеи или нашли баг?** Проект развивается, так что смело создавайте [Issue](https://github.com/FrI3nd7/skipit-vps-node/issues) или присылайте Pull Request — любая помощь приветствуется!
+
 ---
 
 ## 🐳 Нода Remnawave и схемы развертывания
@@ -105,3 +108,6 @@
 
 ```bash
 curl -fsSL [https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh](https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh) -o /tmp/skipit.sh && bash /tmp/skipit.sh
+```
+
+🔄 **Обновление на рабочей ноде:** через пункт **«Обновить SkipIt»** в интерактивном меню `skipit` или выполнив команду `skipit update`.
