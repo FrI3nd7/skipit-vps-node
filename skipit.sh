@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.0.2a"
+SKIPIT_VERSION="1.0.3a"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -128,6 +128,125 @@ pkg_install() {
 }
 
 # Проверка при запуске: curl, sudo
+apt_upgrade_run() {
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -o DPkg::Lock::Timeout=180 &&
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get upgrade -y -o DPkg::Lock::Timeout=180 \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+}
+
+# 0, если grub-pc установлен, но не донастроен (упал postinst)
+grub_pc_broken() {
+    case $(dpkg-query -W -f='${db:Status-Status}' grub-pc 2>/dev/null) in
+        unpacked|half-configured) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---- Починка GRUB (BIOS, пакет grub-pc) ----
+# Ошибка «You must correct your GRUB install devices»: у VPS сменился диск, а в debconf
+# остался старый. В неинтерактивном режиме grub-pc не настраивается, apt падает с кодом 100.
+# Всё ниже работает без вопросов; подробный вывод dpkg - в $SKIPIT_LOG.
+
+# Постоянное имя диска для debconf: /dev/disk/by-id/..., если есть
+grub_dev_name() { # sda
+    local link
+    for link in /dev/disk/by-id/*; do
+        [[ -L $link && $link != *-part* ]] || continue
+        [[ $(readlink -f "$link") == "/dev/$1" ]] && { printf '%s\n' "$link"; return; }
+    done
+    printf '/dev/%s\n' "$1"
+}
+
+# Все физические диски, доступные на запись (без zram, loop и т. п.)
+grub_all_disks() {
+    lsblk -dnro NAME,TYPE,RO 2>/dev/null |
+        awk '$2=="disk" && $3=="0" && $1 !~ /^(zram|loop|ram|nbd|fd|sr)/ {print $1}'
+}
+
+# Диски, в первом секторе которых уже стоит GRUB, - с них сервер и загружается
+grub_mbr_disks() {
+    local d
+    for d in $(grub_all_disks); do
+        [[ -b /dev/$d ]] || continue
+        LC_ALL=C grep -aq GRUB < <(timeout 5 head -c 512 "/dev/$d" 2>/dev/null) && printf '%s\n' "$d"
+    done
+}
+
+# Физические диски под файловой системой /boot (через разделы, LVM, RAID)
+grub_boot_disks() {
+    local src
+    src=$(findmnt -no SOURCE -T /boot 2>/dev/null | head -n 1)
+    src=${src%%\[*}                                   # btrfs: /dev/sda1[/@]
+    [[ -b $src ]] || return 0
+    lsblk -nsro NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1}' | sort -u
+}
+
+# 0, если новый grub-pc той же версии GRUB, что уже стоит в загрузочном секторе
+# (отличается только ревизия Debian). Тогда пропустить запись в сектор безопасно:
+# старый загрузчик и старые модули в /boot/grub остаются согласованными.
+grub_same_upstream() {
+    local new old
+    new=$(dpkg-query -W -f='${Version}' grub-pc 2>/dev/null)
+    old=$(dpkg-query -W -f='${Config-Version}' grub-pc 2>/dev/null)
+    [[ -n $new && -n $old ]] || return 1
+    new=${new#*:}; new=${new%-*}
+    old=${old#*:}; old=${old%-*}
+    [[ $new == "$old" ]]
+}
+
+# Прописать диски (sda vdb ...) и донастроить пакеты. Без аргументов - не писать в сектор.
+grub_try() {
+    local list="" d
+    for d in "$@"; do list+="$(grub_dev_name "$d"), "; done
+    list=${list%, }
+    if [[ -n $list ]]; then
+        printf 'grub-pc grub-pc/install_devices multiselect %s\ngrub-pc grub-pc/install_devices_empty boolean false\n' "$list"
+    else
+        printf 'grub-pc grub-pc/install_devices multiselect\ngrub-pc grub-pc/install_devices_empty boolean true\n'
+    fi | debconf-set-selections >>"$SKIPIT_LOG" 2>&1 || return 1
+    log "grub fix: try install_devices='${list:-<none>}'"
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a dpkg --configure -a >>"$SKIPIT_LOG" 2>&1
+    grub_pc_broken && return 1
+    log "grub fix: ok (${list:-<none>})"
+    return 0
+}
+
+# Автоматическая починка. 0 - grub-pc настроен.
+grub_fix_devices() {
+    [[ $PM == apt ]] && grub_pc_broken || return 1
+    local set tried="|" d singles
+    say "Загрузчик GRUB не настроен (похоже, у сервера сменился диск). Исправляю автоматически..."
+
+    # UEFI: загрузочный сектор BIOS не используется, запись в него не нужна
+    if [[ -d /sys/firmware/efi ]]; then
+        grub_try && { say "Загрузчик GRUB настроен (UEFI)."; return 0; }
+    else
+        # 1) диски, где GRUB уже стоит; 2) диски под /boot; 3) единственный диск в системе
+        for set in "$(grub_mbr_disks)" "$(grub_boot_disks)" \
+                   "$( [[ $(grub_all_disks | wc -l) -eq 1 ]] && grub_all_disks )"; do
+            set=$(echo $set)
+            [[ -n $set && $tried != *"|$set|"* ]] || continue
+            tried+="$set|"
+            say "Пробую установить GRUB на: $set"
+            grub_try $set && { say "Загрузчик GRUB установлен на: $set"; return 0; }
+        done
+        # Несколько дисков (RAID) и один из них не принимает загрузчик - ставим по одному
+        singles=$( { grub_mbr_disks; grub_boot_disks; } | sort -u)
+        if [[ $(wc -w <<<"$singles") -gt 1 ]]; then
+            for d in $singles; do
+                grub_try "$d" && { say "Загрузчик GRUB установлен на: $d"; return 0; }
+            done
+        fi
+        # Запасной вариант: версия GRUB та же - оставляем прежний загрузчик в секторе
+        if grub_same_upstream; then
+            say "Установить не удалось — оставляю прежний загрузчик, он той же версии и загрузит сервер как раньше."
+            grub_try && { log "grub fix: skipped MBR install (same upstream)"; return 0; }
+        fi
+    fi
+    log "grub fix: failed"
+    return 1
+}
+
 # Обновить систему (apt update && apt upgrade). Ошибка не останавливает SkipIt.
 # first - первый запуск SkipIt на сервере (только меняет текст сообщения)
 sys_upgrade() {
@@ -136,9 +255,12 @@ sys_upgrade() {
     case $PM in
         apt)
             say "${pre}Обновляю пакеты системы..."
-            DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -o DPkg::Lock::Timeout=180 &&
-            DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get upgrade -y -o DPkg::Lock::Timeout=180 \
-                -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold || rc=$? ;;
+            apt_upgrade_run || rc=$?
+            if (( rc != 0 )) && grub_pc_broken && grub_fix_devices; then
+                say "Повторяю обновление пакетов..."
+                rc=0
+                apt_upgrade_run || rc=$?
+            fi ;;
         dnf|yum)
             say "${pre}Обновляю пакеты системы..."
             # Ядро не обновляем: новое ядро требует перезагрузки и может не загрузиться
@@ -151,6 +273,11 @@ sys_upgrade() {
     else
         log "first run: system upgrade rc=$rc"
         say "Не удалось обновить пакеты (код $rc) — продолжаю без обновления."
+        if [[ $PM == apt ]] && grub_pc_broken; then
+            say "Причина — загрузчик GRUB. Автоматически исправить без риска для загрузки сервера не удалось
+  (подробности: $SKIPIT_LOG). Не перезагружайте сервер. Исправить вручную — отметьте пробелом системный диск:
+    DEBIAN_FRONTEND=dialog dpkg --configure grub-pc"
+        fi
     fi
     [[ -f /var/run/reboot-required ]] && say "Обновилось ядро или системные библиотеки — после настройки перезагрузите сервер: reboot"
     return 0
@@ -6076,7 +6203,13 @@ region_check() {
 }
 
 # ---- Обновление SkipIt с GitHub ----
-SKIPIT_UPDATE_URL="https://raw.githubusercontent.com/FrI3nd7/skipit-vps-node/main/skipit.sh"
+# Обновление берётся из последнего опубликованного релиза (черновики пропускаются,
+# пре-релизы считаются), а не из ветки main. Если к релизу приложен skipit.sh -
+# берём его и сверяем sha256; если нет - берём skipit.sh из тега релиза и сверяем
+# git-хеш. Тег релиза должен совпадать с версией в файле.
+SKIPIT_REPO="FrI3nd7/skipit-vps-node"
+SKIPIT_ASSET="skipit.sh"
+SKIPIT_RELEASES_API="https://api.github.com/repos/${SKIPIT_REPO}/releases?per_page=20"
 SKIPIT_UPDATE_CONF="${SKIPIT_ETC}/update.conf"
 
 update_token() { sed -n 's/^SKIPIT_UPDATE_TOKEN=//p' "$SKIPIT_UPDATE_CONF" 2>/dev/null | head -n 1; }
@@ -6088,20 +6221,116 @@ update_token_save() { # токен
     log "update: token saved"
 }
 
-# Скачать свежий skipit.sh в файл.
-# 0 - готово, 1 - нет связи, 2 - нет доступа (приватный репозиторий или неверный токен), 3 - это не SkipIt
-update_fetch() { # файл
-    local dst=$1 token code
-    local -a hdr=()
+# Запрос к GitHub API в файл, печатает HTTP-код
+update_gh() { # url файл [Accept]
+    local token
+    local -a hdr=(-H "Accept: ${3:-application/vnd.github+json}" -H "X-GitHub-Api-Version: 2022-11-28")
     token=$(update_token)
-    [[ -n $token ]] && hdr=(-H "Authorization: Bearer $token")
-    code=$(curl -sSL --max-time 60 "${hdr[@]}" -o "$dst" -w '%{http_code}' "$SKIPIT_UPDATE_URL" 2>/dev/null) || code=000
-    case $code in
-        200) ;;
-        401|403|404) return 2 ;;
+    [[ -n $token ]] && hdr+=(-H "Authorization: Bearer $token")
+    curl -sSL --max-time 60 "${hdr[@]}" -o "$2" -w '%{http_code}' "$1" 2>/dev/null
+}
+
+# Разобрать HTTP-код ответа GitHub в код update_fetch (0 - всё хорошо)
+update_http_rc() { # код файл-ответа
+    case $1 in
+        200) return 0 ;;
+        401|404) return 2 ;;
+        403|429)
+            if grep -qi 'rate limit' "$2" 2>/dev/null; then
+                UPDATE_ERR="GitHub временно ограничил число запросов с этого сервера. Попробуйте через час."
+                return 4
+            fi
+            return 2 ;;
         *) return 1 ;;
     esac
+}
+
+# Вариант 1: skipit.sh приложен к релизу (Assets). Сверка sha256 с суммой от GitHub
+# и/или с приложенным skipit.sh.sha256.
+update_fetch_asset() { # файл тег id-файла digest id-суммы
+    local dst=$1 tag=$2 id=$3 digest=$4 sumid=$5 sumf code want="" want2="" got
+    [[ $digest == sha256:* ]] && want=${digest#sha256:}
+    if [[ $sumid =~ ^[0-9]+$ ]]; then
+        sumf=$(mktemp) || return 1
+        code=$(update_gh "https://api.github.com/repos/${SKIPIT_REPO}/releases/assets/$sumid" "$sumf" application/octet-stream) || code=000
+        update_http_rc "$code" "$sumf" || { local rc=$?; rm -f "$sumf"; return $rc; }
+        want2=$(awk 'NR==1{print $1}' "$sumf")
+        rm -f "$sumf"
+        [[ $want2 =~ ^[0-9A-Fa-f]{64}$ ]] || { UPDATE_ERR="Файл $SKIPIT_ASSET.sha256 в релизе $tag повреждён."; return 4; }
+    fi
+    [[ -n $want || -n $want2 ]] || { UPDATE_ERR="Для $SKIPIT_ASSET в релизе $tag нет контрольной суммы — приложите $SKIPIT_ASSET.sha256."; return 4; }
+    code=$(update_gh "https://api.github.com/repos/${SKIPIT_REPO}/releases/assets/$id" "$dst" application/octet-stream) || code=000
+    update_http_rc "$code" "$dst" || return
+    got=$(sha256sum "$dst" | awk '{print $1}')
+    if [[ -n $want && ${want,,} != "$got" ]] || [[ -n $want2 && ${want2,,} != "$got" ]]; then
+        : > "$dst"
+        log "update: sha256 mismatch for $tag"
+        UPDATE_ERR="Контрольная сумма $SKIPIT_ASSET из релиза $tag не совпала — файл повреждён или подменён."
+        return 4
+    fi
+}
+
+# Вариант 2: файла в Assets нет - берём skipit.sh из тега релиза (ровно тот код,
+# что в архиве «Source code»). Сверка с git-хешем файла, который отдаёт GitHub.
+update_fetch_tag() { # файл тег
+    local dst=$1 tag=$2 meta code line want size got
+    local url="https://api.github.com/repos/${SKIPIT_REPO}/contents/${SKIPIT_ASSET}?ref=${tag}"
+    meta=$(mktemp) || return 1
+    code=$(update_gh "$url" "$meta") || code=000
+    if [[ $code == 404 ]]; then
+        rm -f "$meta"; UPDATE_ERR="В релизе $tag нет файла $SKIPIT_ASSET."; return 4
+    fi
+    update_http_rc "$code" "$meta" || { local rc=$?; rm -f "$meta"; return $rc; }
+    line=$(jq -r 'select(type == "object" and .type == "file") | [.sha, .size] | map(tostring) | join("|")' "$meta" 2>/dev/null)
+    rm -f "$meta"
+    IFS='|' read -r want size <<< "$line"
+    [[ $want =~ ^[0-9a-f]{40}$ && $size =~ ^[0-9]+$ ]] || { UPDATE_ERR="GitHub не отдал сведения о $SKIPIT_ASSET в релизе $tag."; return 4; }
+    code=$(update_gh "$url" "$dst" application/vnd.github.raw+json) || code=000
+    update_http_rc "$code" "$dst" || return
+    # git-хеш файла: sha1 от «blob <размер>\0<содержимое>»
+    got=$( { printf 'blob %s\0' "$(stat -c %s "$dst")"; cat "$dst"; } | sha1sum | awk '{print $1}')
+    if [[ $got != "$want" ]]; then
+        : > "$dst"
+        log "update: git hash mismatch for $tag"
+        UPDATE_ERR="Контрольная сумма $SKIPIT_ASSET из релиза $tag не совпала — файл повреждён или подменён."
+        return 4
+    fi
+}
+
+# Скачать skipit.sh из последнего релиза в файл.
+# 0 - готово, 1 - нет связи, 2 - нет доступа (приватный репозиторий или неверный токен),
+# 3 - это не SkipIt, 4 - проблема с релизом (текст в UPDATE_ERR)
+UPDATE_ERR=""
+update_fetch() { # файл
+    local dst=$1 meta code line tag id digest sumid ver rc
+    UPDATE_ERR=""
+    command -v jq >/dev/null 2>&1 || { UPDATE_ERR="Не установлен пакет jq."; return 4; }
+    meta=$(mktemp) || return 1
+    code=$(update_gh "$SKIPIT_RELEASES_API" "$meta") || code=000
+    update_http_rc "$code" "$meta" || { rc=$?; rm -f "$meta"; return $rc; }
+    line=$(jq -r --arg a "$SKIPIT_ASSET" '
+        [.[] | select(.draft | not)][0] // empty
+        | [ .tag_name,
+            ((.assets[] | select(.name == $a) | .id) // ""),
+            ((.assets[] | select(.name == $a) | .digest) // ""),
+            ((.assets[] | select(.name == ($a + ".sha256")) | .id) // "") ]
+        | map(tostring) | join("|")' "$meta" 2>/dev/null)
+    rm -f "$meta"
+    [[ -n $line ]] || { UPDATE_ERR="В репозитории нет опубликованных релизов."; return 4; }
+    IFS='|' read -r tag id digest sumid <<< "$line"
+    [[ $tag =~ ^[A-Za-z0-9._+-]+$ ]] || { UPDATE_ERR="Некорректный тег релиза: $tag"; return 4; }
+    if [[ $id =~ ^[0-9]+$ ]]; then
+        update_fetch_asset "$dst" "$tag" "$id" "$digest" "$sumid" || return
+    else
+        update_fetch_tag "$dst" "$tag" || return
+    fi
     head -n 1 "$dst" | grep -q '^#!.*bash' && grep -q '^SKIPIT_VERSION="' "$dst" && bash -n "$dst" 2>/dev/null || return 3
+    ver=$(update_version_of "$dst")
+    if [[ ${tag#v} != "$ver" ]]; then
+        UPDATE_ERR="Тег релиза ($tag) не совпадает с версией в файле ($ver)."
+        return 4
+    fi
+    return 0
 }
 
 update_version_of() { sed -n 's/^SKIPIT_VERSION="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -n 1; }
@@ -6150,6 +6379,7 @@ update_apply() { # файл
 # Главное меню: SkipIt -> Обновить SkipIt
 menu_update() {
     local tmp rc new tok bak
+    ensure_pkg jq jq || return
     tmp=$(mktemp) || return
     while :; do
         ui_loading "Проверяю обновления…"
@@ -6158,7 +6388,7 @@ menu_update() {
         tok=$(ui_pass "Доступ к репозиторию" "Репозиторий:   FrI3nd7/skipit-vps-node
 Ответ GitHub:  нет доступа
 
-ℹ Пока репозиторий приватный, нужен токен GitHub только на чтение
+ℹ Пока репозиторий приватный, нужен токен GitHub только на чтение (Contents: Read)
 ℹ Токен сохранится на этом сервере, прочитать его сможет только root
 
 Токен GitHub (начинается с github_pat_):") || { rm -f "$tmp"; return; }
@@ -6174,6 +6404,11 @@ menu_update() {
             return ;;
         3)  rm -f "$tmp"
             ui_msg "Ошибка" "Скачанный файл не похож на SkipIt или повреждён, обновление отменено.
+
+ℹ Установленная версия не тронута"
+            return ;;
+        4)  rm -f "$tmp"
+            ui_msg "Ошибка" "Обновление отменено: $UPDATE_ERR
 
 ℹ Установленная версия не тронута"
             return ;;
@@ -6223,6 +6458,11 @@ skipit_update_cli() {
     [[ ${1:-} == --yes || ${1:-} == -y ]] && yes=1
     { : >/dev/tty; } 2>/dev/null && tty=1
     (( yes || tty )) || die "Нет терминала. Для обновления без вопросов: ${SKIPIT_CMD} update --yes"
+    if ! command -v jq >/dev/null 2>&1; then
+        say "Устанавливаю jq (нужен для проверки релизов)..."
+        pkg_install jq && command -v jq >/dev/null 2>&1 || die "Не удалось установить jq."
+        log "pkg install jq"
+    fi
     tmp=$(mktemp) || exit 1
     say "Проверяю обновления..."
     update_fetch "$tmp"; rc=$?
@@ -6236,6 +6476,7 @@ skipit_update_cli() {
         0) ;;
         2) rm -f "$tmp"; die "Нет доступа к репозиторию. Сохраните токен: ${SKIPIT_CMD} update (без --yes)" ;;
         3) rm -f "$tmp"; die "Скачанный файл не похож на SkipIt, обновление отменено." ;;
+        4) rm -f "$tmp"; die "Обновление отменено: $UPDATE_ERR" ;;
         *) rm -f "$tmp"; die "Не удалось скачать обновление: нет связи с GitHub." ;;
     esac
     new=$(update_version_of "$tmp")
