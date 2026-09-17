@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.1.0a"
+SKIPIT_VERSION="1.1.1a"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -51,8 +51,10 @@ ACME_DEPLOY_OLD="/etc/letsencrypt/renewal-hooks/deploy/skipit-reload-decoy.sh"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
 # ==== Общие утилиты ====
-say()  { printf '\n  %sSkipIt Tool%s %s›%s %b\n' "${C_BRAND:-$'\e[1;35m'}" $'\e[0m' "${C_ACC:-}" $'\e[0m' "$*"; }
-die()  { printf '\n  %sSkipIt Tool%s %s✗%s %b\n' "${C_BRAND:-$'\e[1;35m'}" $'\e[0m' "${C_ERR:-$'\e[1;31m'}" $'\e[0m' "$*" >&2; exit 1; }
+# Знак логотипа: шеврон и полоса. Обе однокелейные, ширину строк не ломают.
+SKIPIT_MARK="❯▌"
+say()  { printf '\n  %s%s SkipIt Tool%s %s›%s %b\n' "${C_BRAND:-$'\e[1;34m'}" "$SKIPIT_MARK" $'\e[0m' "${C_ACC:-}" $'\e[0m' "$*"; }
+die()  { printf '\n  %s%s SkipIt Tool%s %s✗%s %b\n' "${C_BRAND:-$'\e[1;34m'}" "$SKIPIT_MARK" $'\e[0m' "${C_ERR:-$'\e[1;31m'}" $'\e[0m' "$*" >&2; exit 1; }
 log()  { printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$SKIPIT_LOG" 2>/dev/null; }
 pause(){ echo; printf '  %s ' "$(ui_keys "Enter — вернуться в меню")"; ui_readline _ || echo; }
 
@@ -608,7 +610,7 @@ tx_end() { [[ -n $TX_DIR && -d $TX_DIR ]] && rm -rf "$TX_DIR"; TX_DIR=""; TX_FIL
 # Всё выводится в /dev/tty, в stdout - только результат выбора/ввода.
 C_RESET=$'\e[0m'
 if (( $(tput colors 2>/dev/null || echo 8) >= 256 )) || [[ ${COLORTERM:-} == *color* || ${TERM:-} == *256* ]]; then
-    C_BRAND=$'\e[1;38;5;169m' # SkipIt Tool
+    C_BRAND=$'\e[1;38;5;33m'  # SkipIt Tool - синий логотипа (#0087ff)
     C_ACC=$'\e[1;38;5;74m'    # номера, приглашение
     C_KEY=$'\e[38;5;74m'      # клавиши в подсказках
     C_TXT=$'\e[38;5;252m'     # основной текст
@@ -622,7 +624,7 @@ if (( $(tput colors 2>/dev/null || echo 8) >= 256 )) || [[ ${COLORTERM:-} == *co
     C_HINT=$'\e[38;5;246m'    # подсказки внизу экрана
     C_DIM=$'\e[38;5;60m'      # линии и разделители
 else
-    C_BRAND=$'\e[1;35m'; C_ACC=$'\e[1;36m'; C_KEY=$'\e[36m'; C_TXT=$'\e[97m'
+    C_BRAND=$'\e[1;34m'; C_ACC=$'\e[1;36m'; C_KEY=$'\e[36m'; C_TXT=$'\e[97m'
     C_OK=$'\e[1;32m'; C_ERR=$'\e[1;31m'; C_WARN=$'\e[1;33m'; C_LABEL=$'\e[37m'; C_NOTE=$'\e[96m'
     C_HINT=$'\e[37m'; C_DIM=$'\e[90m'; C_BADGE=$'\e[1;30;43m'; C_SECTION=$'\e[1;97;44m'
 fi
@@ -645,11 +647,13 @@ ui_rule() {
 }
 
 ui_banner() {
-    local plain="SkipIt Tool  ·  VPS Control Center  ·  v${SKIPIT_VERSION}" line
+    # Ширина рамки считается по этой же строке без цветов - знак логотипа
+    # обязан входить в неё, иначе рамка разъедется
+    local plain="${SKIPIT_MARK}  SkipIt Tool  ·  VPS Control Center  ·  v${SKIPIT_VERSION}" line
     line=$(printf '─%.0s' $(seq 1 $(( ${#plain} + 4 ))))
     printf '  %s╭%s╮%s\n' "$C_BRAND" "$line" "$C_RESET"
-    printf '  %s│%s  %sSkipIt Tool%s  %s·  VPS Control Center  ·  v%s%s  %s│%s\n' \
-        "$C_BRAND" "$C_RESET" "$C_BRAND" "$C_RESET" "$C_HINT" "$SKIPIT_VERSION" "$C_RESET" "$C_BRAND" "$C_RESET"
+    printf '  %s│%s  %s%s  SkipIt Tool%s  %s·  VPS Control Center  ·  v%s%s  %s│%s\n' \
+        "$C_BRAND" "$C_RESET" "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_HINT" "$SKIPIT_VERSION" "$C_RESET" "$C_BRAND" "$C_RESET"
     printf '  %s╰%s╯%s\n' "$C_BRAND" "$line" "$C_RESET"
 }
 
@@ -659,7 +663,7 @@ ui_head() {
     ui_dims
     {
         clear
-        printf '\n  %sSkipIt Tool%s %s›%s %s%s%s\n' "$C_BRAND" "$C_RESET" "$C_ACC" "$C_RESET" "$C_TXT" "$1" "$C_RESET"
+        printf '\n  %s%s SkipIt Tool%s %s›%s %s%s%s\n' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_ACC" "$C_RESET" "$C_TXT" "$1" "$C_RESET"
         ui_rule
         echo
         ui_ctx
@@ -888,7 +892,7 @@ _ui_list() { # заголовок текст тег описание ... → std
         if (( UI_BANNER )); then
             ui_banner
         else
-            printf '\n  %sSkipIt Tool%s %s›%s %s%s%s\n' "$C_BRAND" "$C_RESET" "$C_ACC" "$C_RESET" "$C_TXT" "$title" "$C_RESET"
+            printf '\n  %s%s SkipIt Tool%s %s›%s %s%s%s\n' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_ACC" "$C_RESET" "$C_TXT" "$title" "$C_RESET"
             ui_rule
             [[ -n $UI_CTX ]] && { echo; ui_ctx; }
         fi
@@ -2347,6 +2351,51 @@ sysctl_ct_max() {
 
 sysctl_ram_mb() { awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null; }
 
+# Подкачка - страховка от OOM-killer. Панель держит три процесса Node, рядом база;
+# на 2-4 ГБ всплеск трафика или бэкап базы упираются в потолок RAM, и без swap
+# ядро в такой момент просто убивает процесс. vm.swappiness=10 из раздела
+# «Ядро Linux» держит систему в RAM, пока она есть, и трогает swap лишь на пике.
+# Установку никогда не валим: swap - приятное дополнение, а не требование.
+SWAP_FILE="/swapfile"
+swap_active_mb() { awk 'NR>1 {s+=$3} END {print int(s/1024)+0}' /proc/swaps 2>/dev/null; }
+swap_target_mb() {
+    local ram; ram=$(sysctl_ram_mb); [[ $ram =~ ^[0-9]+$ ]] || ram=2048
+    (( ram <= 4096 )) && { echo 2048; return; }
+    echo 4096
+}
+swap_ensure() {
+    local have want free_mb fstype
+    have=$(swap_active_mb); [[ $have =~ ^[0-9]+$ ]] || have=0
+    (( have >= 512 )) && { n_say "Подкачка уже есть: ${have} МБ — не трогаю"; return 0; }
+    # На Btrfs и ZFS файл подкачки требует особой подготовки - туда не лезем
+    fstype=$(stat -f -c %T / 2>/dev/null)
+    case $fstype in
+        btrfs|zfs) n_say "Подкачка: файловая система $fstype — swap создайте вручную"; return 0 ;;
+    esac
+    [[ -e $SWAP_FILE ]] && { n_say "Подкачка: $SWAP_FILE уже существует, но выключен — не трогаю"; return 0; }
+    want=$(swap_target_mb)
+    free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')
+    if [[ $free_mb =~ ^[0-9]+$ ]] && (( free_mb < want + 2048 )); then
+        n_say "Подкачка: на диске свободно ${free_mb} МБ — мало, пропускаю"
+        return 0
+    fi
+    n_say "Создаю файл подкачки ${want} МБ…"
+    if ! fallocate -l "${want}M" "$SWAP_FILE" 2>/dev/null; then
+        dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$want" status=none 2>/dev/null || {
+            rm -f "$SWAP_FILE"; n_say "Подкачка: не удалось создать файл — пропускаю"; return 0; }
+    fi
+    chmod 600 "$SWAP_FILE"
+    if ! mkswap "$SWAP_FILE" >/dev/null 2>&1 || ! swapon "$SWAP_FILE" 2>/dev/null; then
+        swapoff "$SWAP_FILE" 2>/dev/null
+        rm -f "$SWAP_FILE"; n_say "Подкачка: не удалось включить — пропускаю"; return 0
+    fi
+    grep -q "^${SWAP_FILE}[[:space:]]" /etc/fstab 2>/dev/null ||
+        printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab
+    log "swap: created $SWAP_FILE ${want}M"
+    n_say "Подкачка включена: ${want} МБ ($SWAP_FILE), прописана в /etc/fstab"
+    return 0
+}
+
 # Основной сетевой интерфейс и его очередь
 sysctl_iface()  { ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}'; }
 qdisc_now()     { tc qdisc show dev "$1" root 2>/dev/null | awk '{print $2; exit}'; }
@@ -2687,8 +2736,11 @@ TCP:             $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 NODE_DOMAIN=""; NODE_PANEL_IP=""; NODE_PORT=2222; NODE_CERT_METHOD=""; NODE_CERT_NAME=""
 NODE_TEMPLATE=""; NODE_PRIV=""; NODE_PUB=""; NODE_SID=""
 NODE_LAYOUT="steal"; NODE_WS_PATH=""; NODE_XHTTP_PATH=""
+# Связка: nginx ноды обслуживает ещё и панель со страницей подписки. 443 при этом
+# держит Xray, а панель живёт за тем же unix-сокетом, что и сайт-заглушка.
+NODE_SHARED=0
 NODE_KEYS=(NODE_DOMAIN NODE_PANEL_IP NODE_PORT NODE_CERT_METHOD NODE_CERT_NAME NODE_TEMPLATE NODE_PRIV NODE_PUB NODE_SID
-           NODE_LAYOUT NODE_WS_PATH NODE_XHTTP_PATH)
+           NODE_LAYOUT NODE_WS_PATH NODE_XHTTP_PATH NODE_SHARED)
 
 # Схемы ноды: steal - шаблонная (selfsteal TCP); balancer - selfsteal TCP + XHTTP + WS через nginx (балансир)
 node_layout_ru() {
@@ -2850,6 +2902,9 @@ port_owner() { # порт
             elif sub_installed 2>/dev/null && [[ $(ctr_status "$SUB_NGINX_CTR") == running ]]; then
                 echo "nginx страницы подписки ($SUB_DOMAIN)"; return 2
             elif node_installed 2>/dev/null && [[ $(ctr_status "$NODE_DECOY") == running ]]; then
+                if (( ${NODE_SHARED:-0} )); then
+                    echo "nginx ноды ($NODE_DOMAIN) — он же фронт панели"; return 2
+                fi
                 echo "nginx-заглушка ноды ($NODE_DOMAIN)"; return 2
             fi
             echo "nginx" ;;
@@ -3259,6 +3314,35 @@ EOF
     rm -f "$ACME_DEPLOY_OLD" "${ACME_DEPLOY%/*}/skipit-restart-node.sh" "${ACME_DEPLOY%/*}/skipit-nginx-reload.sh"
 }
 
+# Настоящая причина отказа certbot. В версии 2.1 из Debian ошибка ACME по пути
+# наверх затирается «AttributeError: can't set attribute» из josepy, и на экране
+# остаётся бесполезный текст - а причина (лимит, DNS, недоступный 80) лежит в логе.
+cert_last_error() { # → текст ошибки ACME или пусто
+    local log=/var/log/letsencrypt/letsencrypt.log line
+    [[ -r $log ]] || return 1
+    line=$(grep -a 'acme\.messages\.Error:' "$log" 2>/dev/null | tail -n 1)
+    [[ -n $line ]] || return 1
+    printf '%s' "${line#*acme.messages.Error: }"
+}
+
+# Причина человеческим языком. Лимит Let's Encrypt выносим отдельно: это самая
+# частая причина, по которой «всё правильно, а сертификат не выпускается».
+cert_fail_reason() { # → многострочный текст или пусто
+    local err when
+    err=$(cert_last_error) || return 1
+    case $err in
+        *rateLimited*|*"too many certificates"*)
+            when=$(sed -n 's/.*retry after \([0-9-]* [0-9:]*\) UTC.*/\1/p' <<< "$err")
+            printf 'Лимит Let'"'"'s Encrypt: на этот набор доменов за последнюю неделю\nуже выпущено 5 сертификатов.'
+            [[ -n $when ]] && printf '\nПовторить можно после %s UTC.' "$when"
+            printf '\n\nЧто можно сделать:\n  · дождаться снятия лимита\n  · выпустить сертификат на ДРУГОЙ набор имён — счётчик у каждого набора свой\n  · выпустить через Cloudflare DNS на зону и *.зону'
+            ;;
+        *urn:ietf:params:acme:error:*)
+            printf '%s' "$err" ;;
+        *) printf '%s' "$err" ;;
+    esac
+}
+
 cert_issue_http() { # email домен... (все домены - в один сертификат, имя по первому)
     local rc em=(--register-unsafely-without-email) email=$1 d
     local -a args=()
@@ -3512,8 +3596,31 @@ site_install() { # тег [домен]
 # а Let's Encrypt OCSP больше не выдаёт.
 node_nginx_conf() { # домен имя-сертификата схема
     local cert="/etc/letsencrypt/live/$2"
+    # В связке за этим же nginx стоит панель: её блоки слушают тот же сокет,
+    # поэтому с proxy_protocol, а настоящий IP клиента лежит только в PROXY-заголовке.
+    local sh_maps="" sh_blocks=""
+    if (( ${NODE_SHARED:-0} )); then
+        local p_dom p_cert p_path p_cookie p_api s_dom="" s_cert=""
+        # состояние панели читаем в подоболочке: наружу её переменные не нужны
+        eval "$(
+            panel_state_load 2>/dev/null || exit 0
+            [[ -n $PANEL_DOMAIN && -n $PANEL_CERT_NAME ]] || exit 0
+            sub_state_load 2>/dev/null
+            printf 'p_dom=%q; p_cert=%q; p_path=%q; p_cookie=%q; p_api=%q\n' \
+                "$PANEL_DOMAIN" "$PANEL_CERT_NAME" "$PANEL_PATH" \
+                "$(panel_env_get SKIPIT_PANEL_COOKIE)" "$(panel_env_get SKIPIT_PANEL_API_KEY)"
+            [[ -n ${PANEL_SUB_CERT:-} && -n ${SUB_DOMAIN:-} ]] &&
+                printf 's_dom=%q; s_cert=%q\n' "$SUB_DOMAIN" "$PANEL_SUB_CERT"
+            true
+        )"
+        if [[ -n ${p_dom:-} ]]; then
+            sh_maps=$(panel_nginx_maps "$p_cookie" "$p_api")
+            sh_blocks=$(panel_server_blocks "    listen unix:${NODE_SOCK} ssl proxy_protocol;" \
+                        '$proxy_protocol_addr' "$p_dom" "$p_cert" "$p_path" "$p_cookie" "$s_dom" "$s_cert")
+        fi
+    fi
 cat <<EOF
-# SkipIt Tool · нода $1 · $(node_layout_ru "$3")
+# SkipIt Tool · нода $1 · $(node_layout_ru "$3")${sh_blocks:+ · панель на этом же сервере}
 # Файл пересоздаётся SkipIt Tool (Нода Remnawave → nginx.conf), ручные правки уйдут в бэкап.
 
 server_tokens off;
@@ -3528,7 +3635,9 @@ map \$http_upgrade \$connection_upgrade {
     default upgrade;
     ""      close;
 }
-
+${sh_maps:+
+$sh_maps
+}
 ssl_certificate     $cert/fullchain.pem;
 ssl_certificate_key $cert/privkey.pem;
 ssl_protocols       TLSv1.2 TLSv1.3;
@@ -3555,7 +3664,9 @@ server {
         try_files \$uri \$uri/ =404;
     }
 }
-
+${sh_blocks:+
+$sh_blocks
+}
 # ── Любое другое имя в SNI: рукопожатие обрывается, сертификат не показывается
 server {
     listen unix:${NODE_SOCK} ssl proxy_protocol default_server;
@@ -3620,6 +3731,18 @@ else
     cert_mounts="      - /etc/letsencrypt/live:/etc/letsencrypt/live:ro
       - /etc/letsencrypt/archive:/etc/letsencrypt/archive:ro"
 fi
+# В связке этот же nginx отдаёт панель и страницу подписки - их сертификат
+# (у панели со страницей он общий) тоже надо занести внутрь контейнера.
+# Сертификат ноды остаётся отдельным: класть домены панели в SAN заглушки нельзя.
+if (( ${NODE_SHARED:-0} )) && [[ -n ${NODE_CERT_NAME:-} ]]; then
+    local p_cert
+    p_cert=$( panel_state_load 2>/dev/null && printf '%s' "${PANEL_CERT_NAME:-}" )
+    if [[ -n $p_cert && $p_cert != "$NODE_CERT_NAME" ]]; then
+        cert_mounts+="
+      - /etc/letsencrypt/live/${p_cert}:/etc/letsencrypt/live/${p_cert}:ro
+      - /etc/letsencrypt/archive/${p_cert}:/etc/letsencrypt/archive/${p_cert}:ro"
+    fi
+fi
 cat <<EOF
 # SkipIt Tool · нода Remnawave. SECRET_KEY и NODE_PORT - в .env рядом.
 
@@ -3654,6 +3777,7 @@ services:
     image: ${NODE_NGINX_IMAGE}
     container_name: ${NODE_DECOY}
     hostname: ${NODE_DECOY}
+    mem_limit: 128m
     # сокет от прошлого запуска (сбой, перезагрузка) не даст nginx занять адрес
     entrypoint: ["/bin/sh", "-c", "rm -f ${NODE_SOCK}; exec nginx -g 'daemon off;'"]
     volumes:
@@ -3665,6 +3789,40 @@ EOF
 }
 
 node_compose_run() { ( cd "$NODE_DIR" && docker compose "$@" ); }
+
+# Связка не поднялась - вернуть панели её собственный nginx на 443, иначе она
+# останется вообще без фронта. Ноду при этом гасим: 443 ей уже не достанется.
+# Xray занимает 443 не при старте контейнера, а когда панель отдаст ему конфиг.
+# Поэтому после переключения ждём порт, а не считаем связку удавшейся сразу.
+node_wait_443() { # секунд
+    local i=0 n=${1:-90}
+    while (( i < n )); do
+        [[ -n $(port_listeners 443) ]] && return 0
+        sleep 3; i=$((i + 3))
+        ui_loading "Жду, пока Xray займёт 443… ${i} с из ${n}"
+    done
+    return 1
+}
+
+node_bundle_rollback() {
+    n_say "Возвращаю панели её nginx…"
+    node_compose_run down >/dev/null 2>&1
+    NODE_SHARED=0
+    node_state_save 2>/dev/null
+    PANEL_NGINX_MODE=own
+    panel_state_save 2>/dev/null
+    panel_compose > "$PANEL_COMPOSE"
+    panel_nginx_write
+    panel_compose_run up -d --remove-orphans >/dev/null 2>&1
+    sleep 3
+    local rerr
+    if rerr=$(panel_nginx_ok); then
+        n_say "Панель снова на своём nginx: $(panel_url)"
+    else
+        n_say "ВНИМАНИЕ: nginx панели не поднялся — $rerr"
+        n_say "Поднимите вручную: cd $PANEL_DIR && docker compose up -d"
+    fi
+}
 
 # UFW для ноды: установить, если нет; SSH разрешается до любых других действий
 node_ufw_ensure() {
@@ -4100,6 +4258,24 @@ g_flush() {
 }
 # Блок для копирования (stdin): между линиями, без рамки по бокам - чтобы копировался чисто
 g_code() { g_flush; { ui_rule; printf '%s' "$C_TXT"; sed 's/^/    /'; printf '%s' "$C_RESET"; ui_rule; } >"$TTY"; }
+# Тот же блок, но для пар «подпись → значение»: подпись приглушена, значение -
+# цветом значений, как в таблицах выше. В одноцветном g_code «логин:» сливался
+# с самим логином, и строку приходилось разбирать глазами.
+g_code_kv() { # подпись значение [подпись значение ...]
+    g_flush
+    local -a p=("$@")
+    local i kw=0
+    for ((i = 0; i < ${#p[@]}; i += 2)); do (( ${#p[i]} > kw )) && kw=${#p[i]}; done
+    {
+        ui_rule
+        for ((i = 0; i < ${#p[@]}; i += 2)); do
+            printf '    %s%s%s  %s%s%s\n' \
+                "$C_LABEL" "$(pad "${p[i]}:" $(( kw + 1 )))" "$C_RESET" \
+                "$C_OK" "${p[i+1]}" "$C_RESET"
+        done
+        ui_rule
+    } >"$TTY"
+}
 # Доп. параметры XHTTP для хоста: клиентская часть extra из inbound профиля
 node_xhttp_extra_json() {
     cat <<'EOF'
@@ -4472,6 +4648,9 @@ node_guide() { # домен порт схема [wizard]
                     g_kv "Путь" "$NODE_XHTTP_PATH"
                     g_kv "SNI" "$domain"
                     g_kv "Отпечаток" "firefox"
+                    # XHTTP ходит поверх HTTP/2, и без ALPN клиент договаривается
+                    # на http/1.1 - инбаунд тогда не отвечает
+                    g_kv "ALPN" "h2,http/1.1"
                     g_kv "Доп. параметры XHTTP" "вставьте целиком JSON ниже"
                     g_gap
                     node_xhttp_extra_json | g_code ;;
@@ -4572,14 +4751,46 @@ UFW:         порты схемы для всех, порт ноды тольк
 Начать?" || return
     ipv6_check_wizard || return
 
+    # Панель на этом же сервере - ставим связку: 443 забирает Xray, а панель со
+    # страницей подписки уезжают за его unix-сокет, туда же, где сайт-заглушка.
+    # Схема только шаблонная: балансиру нужны ещё два публичных порта.
+    local bundle=0
+    if panel_installed 2>/dev/null; then
+        ui_yesno "Панель на этом сервере" "── Сейчас
+Панель:       $PANEL_DOMAIN$( sub_installed 2>/dev/null && printf '\nПодписка:     %s' "$SUB_DOMAIN" )
+Порт 443:     держит nginx панели
+
+── Станет
+Порт 443:     держит Xray ноды
+Заглушка:     на unix-сокете Xray
+Панель:       там же, выбор по имени домена
+Схема ноды:   только шаблонная
+
+ℹ Снаружи адреса не меняются: свой nginx панели больше не нужен,
+  его работу берёт на себя nginx ноды.
+
+ℹ Сертификат ноды будет отдельным от сертификата панели: иначе домен
+  панели попал бы в сертификат заглушки и связь стала бы видна снаружи.
+
+ℹ Пока переключаемся, панель недоступна несколько секунд.
+
+Поставить ноду в связке с панелью?" || return
+        bundle=1
+        ui_ctx_add "Режим" "связка с панелью $PANEL_DOMAIN"
+    fi
+
     local layout
-    layout=$(ui_choose "Схема ноды" "Схема"$'\t'"Порты"$'\t'"Как работает
+    if (( bundle )); then
+        layout=steal
+    else
+        layout=$(ui_choose "Схема ноды" "Схема"$'\t'"Порты"$'\t'"Как работает
 Шаблонная"$'\t'"443"$'\t'"selfsteal TCP: Xray на 443, сайт-заглушка через nginx
 Балансир"$'\t'"443, $NODE_XHTTP_PORT, $NODE_WS_PUBLIC"$'\t'"selfsteal TCP + XHTTP + WS через nginx, балансир по пингу
 
 Какую схему установить?" \
-        steal    "Шаблонная" \
-        balancer "Балансир") || return
+            steal    "Шаблонная" \
+            balancer "Балансир") || return
+    fi
     ui_ctx_add "Схема" "$(node_layout_ru "$layout")"
 
     while :; do
@@ -4609,6 +4820,19 @@ REALITY через прокси Cloudflare не работает, сертифи
     esac
     ui_ctx_add "Домен" "$domain"
 
+    if (( bundle )); then
+        # Панель рядом, но в своей bridge-сети: до ноды она идёт с адреса этой
+        # подсети, а не с 127.0.0.1. Открываем порт ноды ровно для неё.
+        panel_ip=$(panel_docker_subnet) || panel_ip=""
+        if [[ -z $panel_ip ]]; then
+            ui_msg "Не вижу сеть панели" "Не удалось определить подсеть docker-сети remnawave-network.
+
+Без неё правило фаервола получится неверным, и панель не достучится до ноды.
+Проверьте, что панель запущена: Компоненты Remnawave → Панель."
+            return
+        fi
+        ui_ctx_add "Сеть панели" "$panel_ip (панель на этом же сервере)"
+    else
     while :; do
         panel_ip=$(ui_input "IP панели" "Порт ноды в UFW будет открыт только для него.
 
@@ -4619,12 +4843,15 @@ IP-адрес сервера с панелью Remnawave:" "$NODE_PANEL_IP") || 
     done
     if [[ $panel_ip == "$SERVER_IP" ]]; then
         ui_yesno "Внимание" "IP панели совпадает с IP этого сервера.
-Панель и нода на одном сервере в SkipIt Tool 1.0 не поддерживаются: схемы конфликтуют за порт 443.
+
+Если панель стоит здесь же — сначала поставьте её (Компоненты Remnawave → Панель),
+и установка ноды сама предложит связку: 443 заберёт Xray, панель уедет за его сокет.
 
 Продолжить всё равно?" no || return
     fi
 
     ui_ctx_add "IP панели" "$panel_ip"
+    fi
 
     while :; do
         port=$(ui_input "Порт ноды" "Этот же порт укажите в панели (NODE_PORT).
@@ -4648,7 +4875,55 @@ $busy"; continue; }
     ui_ctx_add "Порт ноды" "$port"
 
     node_keys_ensure || { ui_msg "Ошибка" "Не удалось сгенерировать ключи REALITY (нужен openssl 1.1.1+)."; return; }
+
+    # В связке ноду в панели заводит сам мастер - на шаге установки, после
+    # подтверждения. Здесь только помечаем это в сводке: писать что-то в панель
+    # до того, как человек согласился, неправильно - отменит, а мусор останется.
+    local mk_node=0
+    if (( bundle )) && ! panel_has_node; then
+        mk_node=1
+        ui_ctx_add "Нода в панели" "заведу сам"
+    fi
+
+    # Панель живёт в контейнере: 127.0.0.1 для неё - это она сама, а не хост.
+    # С таким адресом она никогда не достучится до ноды, конфига не отдаст, и
+    # Xray не займёт 443. Ловим это до того, как трогать nginx панели.
+    if (( bundle )) && (( ! mk_node )); then
+        local addrs
+        addrs=$(panel_node_addrs 2>/dev/null)
+        if [[ -n $addrs ]] && ! grep -qv -e '^127\.' -e '^localhost$' -e '^::1$' <<< "$addrs"; then
+            ui_msg "Неверный адрес ноды в панели" "── Сейчас в панели
+Адрес ноды:   $(head -n1 <<< "$addrs")
+
+Панель работает в контейнере, и 127.0.0.1 для неё — она сама, а не этот сервер.
+С таким адресом она не достучится до ноды и не отдаст ей конфиг, а без конфига
+Xray не займёт 443.
+
+── Что поправить
+В панели:     «Ноды» → откройте ноду → «Домен или IP» → $domain
+
+ℹ Порт оставьте прежним: $port
+
+Поправьте адрес и запустите установку снова."
+            return
+        fi
+    fi
+
+    # В связке ключ достаём сами: /api/keygen локальной панели отдаёт тот самый
+    # SECRET_KEY. Не вышло - спросим руками, как обычно.
+    if (( bundle )); then
+        secret=$(panel_node_secret) || secret=""
+        if [[ -n $secret ]] && valid_secret "$secret"; then
+            ui_ctx_add "SECRET_KEY" "$(cf_mask "$secret") — забран из панели"
+        else
+            secret=""
+            ui_msg "SECRET_KEY" "Не удалось забрать ключ из панели автоматически.
+Спрошу его обычным способом — он лежит в панели: «Ноды» → «Управление»."
+        fi
+    fi
+
     local have
+    if [[ -z ${secret:-} ]]; then
     have=$(ui_choose "Нода в панели" "SECRET_KEY выдаёт панель, когда вы создаёте в ней ноду.
 Для ноды нужен профиль с ключами REALITY — SkipIt Tool их уже сгенерировал." \
         guide "Показать, что создать в панели (3 шага)" \
@@ -4666,6 +4941,7 @@ SECRET_KEY из панели (можно вставить строку «SECRET_
     done
 
     ui_ctx_add "SECRET_KEY" "$(cf_mask "$secret")"
+    fi
 
     # Уже есть подходящий сертификат - предложить его
     for d in /etc/letsencrypt/live/*/; do
@@ -4770,6 +5046,8 @@ Email (можно оставить пустым):") || return
 
     local p
     for p in 443 $([[ $layout == balancer ]] && echo "$NODE_XHTTP_PORT $NODE_WS_PORT $NODE_WS_PUBLIC"); do
+        # В связке 443 сейчас держит nginx панели - он уедет сам, это не конфликт
+        (( bundle )) && [[ $p == 443 ]] && continue
         busy=$(port_foreign "$p")
         [[ -n $busy ]] && warn+="
 ВНИМАНИЕ: порт $p занят другим процессом — схема не запустится:
@@ -4816,10 +5094,14 @@ $warn" || return
             ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$token" > "$CF_CREDS" )
             chmod 600 "$CF_CREDS"
             cert_name=$base
-            cert_issue_cf "$email" "$base" || { node_fail "Certbot не смог выпустить сертификат (подробности выше)."; return; }
+            cert_issue_cf "$email" "$base" || { node_fail "Certbot не смог выпустить сертификат.
+
+$(cert_fail_reason || echo "Подробности выше и в /var/log/letsencrypt/letsencrypt.log")"; return; }
         else
             cert_name=$domain
-            cert_issue_http "$email" "$domain" || { node_fail "Certbot не смог выпустить сертификат (подробности выше). Проверьте A-запись и доступность 80 порта."; return; }
+            cert_issue_http "$email" "$domain" || { node_fail "Certbot не смог выпустить сертификат.
+
+$(cert_fail_reason || echo "Проверьте A-запись и доступность 80 порта, подробности в /var/log/letsencrypt/letsencrypt.log")"; return; }
         fi
     else
         cert_write_hooks
@@ -4843,6 +5125,9 @@ $warn" || return
     for f in "$NODE_COMPOSE" "$NODE_ENV" "$NODE_NGINX"; do [[ -f $f ]] && backup_file "$f" >/dev/null; done
     NODE_DOMAIN=$domain; NODE_PANEL_IP=$panel_ip; NODE_PORT=$port
     NODE_CERT_METHOD=$method; NODE_CERT_NAME=$cert_name; NODE_TEMPLATE=$tpl; NODE_LAYOUT=$layout
+    # До node_compose и node_nginx_conf: оба смотрят на этот признак и в связке
+    # добавляют сертификаты панели и её server-блоки
+    NODE_SHARED=$bundle
     if [[ -z $NODE_PRIV || -z $NODE_SID ]]; then
         reality_keys || { node_fail "Не удалось сгенерировать ключи REALITY (нужен openssl 1.1.1+)."; return; }
     fi
@@ -4876,13 +5161,59 @@ $warn" || return
 
     node_step "6/6  Запуск контейнеров"
     node_compose_run pull || { node_fail "Не удалось скачать образы. Проверьте доступ сервера к Docker Hub."; return; }
-    node_compose_run up -d --force-recreate --remove-orphans || { node_fail "docker compose up завершился с ошибкой."; return; }
+
+    # Ноду в панели заводим ДО того, как трогать 443: без неё панель не отдаст
+    # Xray конфиг, Xray не поднимется, и порт останется ничьим.
+    if (( bundle )) && (( mk_node )); then
+        n_say "Завожу профиль и ноду в панели…"
+        local node_uuid
+        if node_uuid=$(panel_create_node "$domain" "$port" "$layout"); then
+            n_say "Профиль и нода созданы, ключи REALITY уже внутри профиля"
+            log "panel node created: $node_uuid ($domain:$port)"
+        else
+            node_fail "Не удалось завести ноду в панели: $PANEL_NODE_ERR
+
+Панель не тронута и работает как раньше. Заведите ноду вручную
+(Нода Remnawave → мастер покажет, что создать) и запустите установку снова."
+            return
+        fi
+    fi
+
+    # Связка: 443 должен освободиться ДО старта Xray, иначе он не займёт порт.
+    # Панель остаётся жить, уходит только её nginx - его работу забирает nginx ноды.
+    if (( bundle )); then
+        n_say "Панель переезжает за сокет Xray, её nginx останавливается…"
+        backup_file "$PANEL_COMPOSE" >/dev/null
+        PANEL_NGINX_MODE=socket
+        panel_state_save
+        panel_compose > "$PANEL_COMPOSE"
+        panel_compose_run up -d --remove-orphans >/dev/null 2>&1
+    fi
+
+    node_compose_run up -d --force-recreate --remove-orphans || {
+        (( bundle )) && node_bundle_rollback
+        node_fail "docker compose up завершился с ошибкой."; return; }
     sleep 4
     local err
     if ! err=$(node_nginx_ok); then
+        (( bundle )) && node_bundle_rollback
         node_fail "nginx не запустился: $err"; return
     fi
-    log "node install: ok"
+    # Связка: 443 сейчас не держит никто, кроме будущего Xray. Пока он не занял
+    # порт, панель недоступна - поэтому ждём и при неудаче возвращаем всё назад.
+    if (( bundle )); then
+        if ! node_wait_443 90; then
+            node_bundle_rollback
+            node_fail "Xray так и не занял 443 за 90 секунд.
+
+Скорее всего панель не отдала ноде конфиг: проверьте, что нода в панели создана,
+её адрес 127.0.0.1, порт $port, и SECRET_KEY совпадает.
+Панель возвращена на свой nginx и снова работает."
+            return
+        fi
+        n_say "Xray занял 443 — панель снова отвечает через nginx ноды"
+    fi
+    log "node install: ok$( (( bundle )) && echo " (связка с панелью)" )"
 
     node_done_screen "$domain"
 }
@@ -5426,7 +5757,7 @@ $err
 }
 
 node_remove() {
-    local del_cert=0 del_site=0 del_443=0 bak
+    local del_cert=0 del_site=0 del_443=0 del_bal=0 bak
     ui_yesno "Удаление ноды" "── Будет удалено
 Контейнеры:  remnanode и $NODE_DECOY
 Папка:       $NODE_DIR — перед удалением уйдёт в архив
@@ -5434,21 +5765,49 @@ node_remove() {
 
 ── Останется
 Бэкапы:      $SKIPIT_BACKUPS — архивы и копии конфигов
-
+$( (( ${NODE_SHARED:-0} )) && printf '\n── Связка с панелью\nПанель:      вернётся на свой nginx и снова займёт 443 сама\nПерерыв:     панель недоступна несколько секунд, пока nginx поднимается\n' )
 Удалить ноду $NODE_DOMAIN?" no || return
     ask_del_cert "$NODE_CERT_NAME" node && del_cert=1
     ui_yesno "Сайт-заглушка" "Удалить файлы сайта из $NODE_WEBROOT?" no && del_site=1
-    ui_yesno "Порты" "Закрыть в UFW публичные порты ноды: $(node_public_ports "$NODE_LAYOUT" | sed 's/ /, /g')/tcp?" no && del_443=1
+    # 443 закрываем только через ask_close_443: он один знает, нужен ли порт ещё
+    # кому-то (панели, странице подписки). Закрыть его вслепую - значит оставить
+    # оставшееся без входа с улицы: nginx слушает, а снаружи таймаут.
+    ask_close_443 node && del_443=1
+    # Порты балансира ничей больше не занимает - про них спрашиваем отдельно
+    if [[ $NODE_LAYOUT == balancer ]]; then
+        ui_yesno "Порты балансира" "Закрыть в UFW порты $NODE_XHTTP_PORT, $NODE_WS_PUBLIC/tcp?
+
+Их слушала только нода." no && del_bal=1
+    fi
 
     clear; say "Удаляю ноду $NODE_DOMAIN..."
+    # В связке фронтом панели был nginx ноды. Сначала возвращаем панели её
+    # собственный nginx, иначе после сноса она останется без входа с улицы.
+    local was_shared=${NODE_SHARED:-0}
     [[ -f $NODE_COMPOSE ]] && node_compose_run down --remove-orphans
+    if (( was_shared )) && panel_installed 2>/dev/null; then
+        say "Возвращаю панели её nginx на 443..."
+        NODE_SHARED=0
+        PANEL_NGINX_MODE=own
+        panel_state_save
+        backup_file "$PANEL_COMPOSE" >/dev/null
+        panel_compose > "$PANEL_COMPOSE"
+        panel_nginx_write
+        panel_compose_run up -d --remove-orphans >/dev/null 2>&1
+        local perr
+        if perr=$(panel_nginx_ok); then
+            say "Панель снова отдаётся своим nginx: $(panel_url)"
+        else
+            say "Внимание: nginx панели не поднялся — $perr"
+        fi
+    fi
     bak="${SKIPIT_BACKUPS}/remnanode-$(date +%Y%m%d-%H%M%S).tar.gz"
     tar -czf "$bak" -C "$(dirname "$NODE_DIR")" "$(basename "$NODE_DIR")" 2>/dev/null && chmod 600 "$bak"
     rm -rf "$NODE_DIR"
     node_ufw_remove "$NODE_PANEL_IP" "$NODE_PORT"
-    if (( del_443 )) && command -v ufw >/dev/null 2>&1; then
-        ufwc --force delete allow 443/tcp >/dev/null 2>&1
-        [[ $NODE_LAYOUT == balancer ]] && node_ufw_close_balancer
+    if command -v ufw >/dev/null 2>&1; then
+        (( del_443 )) && ufwc --force delete allow 443/tcp >/dev/null 2>&1
+        (( del_bal )) && node_ufw_close_balancer
     fi
     if (( del_cert )); then
         certbot delete --non-interactive --cert-name "$NODE_CERT_NAME"
@@ -5542,9 +5901,44 @@ PANEL_METRICS_PORT=3001
 PANEL_BACKUP_KEEP=14
 PANEL_BACKUP_CRON="/etc/cron.d/skipit-panel-backup"
 
+# Потолки памяти. В образах панели и страницы подписки зашито
+# NODE_OPTIONS=--max-old-space-size=16384: V8 считает, что у него 16 ГБ, и не
+# видит смысла собирать мусор всерьёз. На сервере с 2-4 ГБ это значит, что
+# раньше сборки мусора приедет OOM-killer ядра и снесёт процесс, а то и базу
+# рядом. Считаем потолки от объёма RAM и отдаём их через env_file: значения из
+# него перекрывают ENV образа.
+panel_node_heap_mb() {
+    local ram; ram=$(sysctl_ram_mb); [[ $ram =~ ^[0-9]+$ ]] || ram=2048
+    if   (( ram <= 2048 )); then echo 256
+    elif (( ram <= 4096 )); then echo 384
+    elif (( ram <= 8192 )); then echo 768
+    else echo 1024; fi
+}
+sub_node_heap_mb() {
+    local ram; ram=$(sysctl_ram_mb); [[ $ram =~ ^[0-9]+$ ]] || ram=2048
+    if   (( ram <= 2048 )); then echo 192
+    elif (( ram <= 4096 )); then echo 256
+    else echo 512; fi
+}
+# Панель держит три процесса Node (api, jobs, scheduler) - потолок кучи на каждый
+# плюс запас на код, буферы и нативную память
+panel_mem_limit_mb() { echo $(( $(panel_node_heap_mb) * 3 + 384 )); }
+sub_mem_limit_mb()   { echo $(( $(sub_node_heap_mb) + 256 )); }
+# База: четверть RAM, но не меньше 512 МБ и не больше 2 ГБ. Внутрь лимита входит
+# и shm_size, поэтому ниже 512 опускаться нельзя
+panel_db_mem_limit_mb() {
+    local ram v; ram=$(sysctl_ram_mb); [[ $ram =~ ^[0-9]+$ ]] || ram=2048
+    v=$(( ram / 4 )); (( v < 512 )) && v=512; (( v > 2048 )) && v=2048; echo "$v"
+}
+
 PANEL_DOMAIN=""; PANEL_CERT_METHOD=""; PANEL_CERT_NAME=""; PANEL_PATH=""; PANEL_SUB_DOMAIN=""
 PANEL_SUB_CERT=""
-PANEL_KEYS=(PANEL_DOMAIN PANEL_CERT_METHOD PANEL_CERT_NAME PANEL_PATH PANEL_SUB_DOMAIN PANEL_SUB_CERT)
+# own - свой контейнер nginx на 443 (обычная установка);
+# socket - блоки панели уехали в nginx ноды на unix-сокет, 443 держит Xray.
+# Значение по умолчанию own, поэтому состояние от прошлых версий читается как есть.
+PANEL_NGINX_MODE="own"
+PANEL_KEYS=(PANEL_DOMAIN PANEL_CERT_METHOD PANEL_CERT_NAME PANEL_PATH PANEL_SUB_DOMAIN PANEL_SUB_CERT
+            PANEL_NGINX_MODE)
 
 panel_state_load() {
     local k v
@@ -5565,6 +5959,42 @@ panel_state_save() {
 panel_installed() { panel_state_load && [[ -f $PANEL_COMPOSE ]]; }
 panel_env_get() { sed -n "s/^$1=//p" "$PANEL_ENV" 2>/dev/null | head -n 1; }
 panel_compose_run() { ( cd "$PANEL_DIR" && docker compose "$@" ); }
+
+# В связке фронт панели - это nginx ноды: и контейнер, и файл конфига другие.
+# Всё, что перезагружает или проверяет nginx панели, ходит через эти две функции.
+panel_bundled()   { [[ ${PANEL_NGINX_MODE:-own} == socket ]]; }
+
+# Подсеть bridge-сети панели. В связке нода слушает свой порт на хосте, а панель
+# живёт в контейнере: 127.0.0.1 для неё - это она сама, и до ноды пакет уходит
+# с адреса вида 172.18.0.5. Правило UFW должно пускать именно эту подсеть, иначе
+# панель молча упрётся в таймаут и не отдаст ноде конфиг - а без конфига Xray
+# не поднимет 443.
+panel_docker_subnet() {
+    local net
+    net=$(docker network inspect remnawave-network \
+        --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)
+    [[ $net == */* ]] || return 1
+    printf '%s' "$net"
+}
+panel_nginx_ctr() { panel_bundled && echo "$NODE_DECOY" || echo "$PANEL_NGINX_CTR"; }
+panel_nginx_file(){ panel_bundled && echo "$NODE_NGINX"  || echo "$PANEL_NGINX"; }
+
+# Перегенерировать конфиг nginx панели там, где он сейчас живёт. В связке это
+# конфиг ноды целиком: её сайт-заглушка и блоки панели лежат в одном файле,
+# и собрать его можно только генератором ноды.
+panel_nginx_write() {
+    local cookie api_key
+    cookie=$(panel_env_get SKIPIT_PANEL_COOKIE); api_key=$(panel_env_get SKIPIT_PANEL_API_KEY)
+    if panel_bundled; then
+        node_state_load 2>/dev/null || return 1
+        node_nginx_conf "$NODE_DOMAIN" "$NODE_CERT_NAME" "$NODE_LAYOUT" > "$NODE_NGINX"
+    else
+        panel_nginx_conf "$PANEL_DOMAIN" "$PANEL_CERT_NAME" "$PANEL_PATH" "$cookie" "$api_key" \
+            ${PANEL_SUB_CERT:+"$PANEL_SUB_DOMAIN" "$PANEL_SUB_CERT"} > "$PANEL_NGINX"
+    fi
+}
+
+panel_nginx_reload() { docker exec "$(panel_nginx_ctr)" nginx -s reload >/dev/null 2>&1; }
 
 # Секрет для .env: 32 байта энтропии в base64url
 panel_gen_secret() { head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '='; }
@@ -5592,6 +6022,10 @@ panel_write_env() { # домен sub_public_domain
 APP_PORT=${PANEL_APP_PORT}
 METRICS_PORT=${PANEL_METRICS_PORT}
 API_INSTANCES=1
+
+# Потолок кучи V8 на процесс, считается от RAM сервера. Перекрывает зашитые
+# в образ 16 ГБ - иначе V8 не поджимается и сервер уходит в OOM.
+NODE_OPTIONS=--max-old-space-size=$(panel_node_heap_mb)
 
 DATABASE_URL="postgresql://postgres:${pg_pass}@remnawave-db:5432/postgres"
 POSTGRES_USER=postgres
@@ -5625,7 +6059,7 @@ EOF
 }
 
 panel_compose() {
-local cert_mounts sub_service=""
+local cert_mounts sub_service="" ngx_service=""
 if [[ -n ${PANEL_CERT_NAME:-} ]]; then
     cert_mounts="      - /etc/letsencrypt/live/${PANEL_CERT_NAME}:/etc/letsencrypt/live/${PANEL_CERT_NAME}:ro
       - /etc/letsencrypt/archive/${PANEL_CERT_NAME}:/etc/letsencrypt/archive/${PANEL_CERT_NAME}:ro"
@@ -5648,6 +6082,7 @@ if [[ -n ${PANEL_SUB_CERT:-} ]]; then
     image: ${SUB_IMAGE}
     container_name: ${SUB_CTR}
     hostname: ${SUB_CTR}
+    mem_limit: $(sub_mem_limit_mb)m
     env_file: sub.env
     networks: [remnawave-network]
     ports:
@@ -5655,6 +6090,22 @@ if [[ -n ${PANEL_SUB_CERT:-} ]]; then
     depends_on:
       remnawave:
         condition: service_healthy
+"
+fi
+# В связке фронт панели - nginx ноды: он уже держит unix-сокет за Xray на 443.
+# Второй nginx тут не нужен и всё равно не смог бы занять 443.
+if ! panel_bundled; then
+    ngx_service="  # nginx в host-сети: так на 443 действуют правила UFW
+  ${PANEL_NGINX_CTR}:
+    <<: *common
+    image: ${NODE_NGINX_IMAGE}
+    container_name: ${PANEL_NGINX_CTR}
+    hostname: ${PANEL_NGINX_CTR}
+    mem_limit: 128m
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+${cert_mounts}
 "
 fi
 cat <<EOF
@@ -5678,6 +6129,7 @@ services:
     image: ${PANEL_BACKEND_IMAGE}
     container_name: remnawave
     hostname: remnawave
+    mem_limit: $(panel_mem_limit_mb)m
     env_file: .env
     networks: [remnawave-network]
     ulimits:
@@ -5704,6 +6156,7 @@ services:
     image: ${PANEL_DB_IMAGE}
     container_name: remnawave-db
     hostname: remnawave-db
+    mem_limit: $(panel_db_mem_limit_mb)m
     shm_size: 512mb
     env_file: .env
     networks: [remnawave-network]
@@ -5725,6 +6178,7 @@ services:
     image: ${PANEL_REDIS_IMAGE}
     container_name: remnawave-redis
     hostname: remnawave-redis
+    mem_limit: 256m
     networks: [remnawave-network]
     volumes:
       - valkey-socket:/var/run/valkey
@@ -5744,17 +6198,7 @@ services:
       retries: 3
 
 ${sub_service}
-  # nginx в host-сети: так на 443 действуют правила UFW
-  ${PANEL_NGINX_CTR}:
-    <<: *common
-    image: ${NODE_NGINX_IMAGE}
-    container_name: ${PANEL_NGINX_CTR}
-    hostname: ${PANEL_NGINX_CTR}
-    network_mode: host
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-${cert_mounts}
-
+${ngx_service}
 networks:
   remnawave-network:
     name: remnawave-network
@@ -5770,30 +6214,21 @@ EOF
 
 # nginx панели: 443 напрямую (Xray на этом сервере нет).
 # TLS - профиль «intermediate» Mozilla, как и у ноды.
-panel_nginx_conf() { # домен серт путь cookie api-ключ [домен-подписки серт-подписки]
-    local cert="/etc/letsencrypt/live/$2"
+# Cookie-гейт панели: три map. Нужны и своему nginx панели, и nginx ноды, когда
+# панель стоит за ним. Вынесены отдельно и существуют в одном экземпляре:
+# гейт закрывает /api/auth/login от перебора, двум копиям расходиться нельзя.
+panel_nginx_maps() { # cookie api-ключ
 cat <<EOF
-# SkipIt Tool · панель $1${6:+ + страница подписки $6}
-# Файл пересоздаётся SkipIt Tool (Панель → nginx.conf), ручные правки уйдут в бэкап.
-
-server_tokens off;
-server_names_hash_bucket_size 128;
-
-map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    ""      close;
-}
-
 # Вход в панель разрешён только с cookie, которую ставит секретный путь ниже
 map \$http_cookie \$skipit_panel_ok {
     default 0;
-    "~*(^|;[[:space:]]*)skipit_panel=$4(;|\$)" 1;
+    "~*(^|;[[:space:]]*)skipit_panel=$1(;|\$)" 1;
 }
 
 # Страница подписки на ДРУГОМ сервере ходит в /api/ по заголовку X-Api-Key
 map \$http_x_api_key \$skipit_api_key_ok {
     default 0;
-    "$5" 1;
+    "$2" 1;
 }
 
 # В /api/ пускаем, если есть cookie ИЛИ верный X-Api-Key
@@ -5801,21 +6236,33 @@ map "\$skipit_panel_ok\$skipit_api_key_ok" \$skipit_api_ok {
     default 0;
     "~1" 1;
 }
+EOF
+}
 
-ssl_protocols       TLSv1.2 TLSv1.3;
-ssl_ecdh_curve      X25519:prime256v1:secp384r1;
-ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
-ssl_prefer_server_ciphers off;
-ssl_session_cache   shared:skipit_tls:10m;
-ssl_session_timeout 4h;
-ssl_session_tickets off;
+# Строки listen для своего nginx панели: 443 напрямую, [::] только при IPv6
+panel_listen_own() { # [суффикс]
+    printf '    listen 443 ssl%s;\n' "${1:+ $1}"
+    [[ -f /proc/net/if_inet6 ]] && printf '    listen [::]:443 ssl%s;\n' "${1:+ $1}"
+    return 0
+}
 
+# server-блоки панели и (если задана) страницы подписки. Общие для обоих
+# генераторов: свой nginx панели слушает 443, nginx ноды - unix-сокет за Xray.
+#   $1  строка listen целиком (может быть многострочной)
+#   $2  откуда брать адрес клиента: \$remote_addr или \$proxy_protocol_addr.
+#       За Xray соединение приходит по сокету, и настоящий IP лежит только
+#       в PROXY-заголовке - \$remote_addr там пустой.
+panel_server_blocks() { # listen realip домен серт путь cookie [домен-подписки серт-подписки]
+    local listen=$1 realip=$2 cert="/etc/letsencrypt/live/$4" xff
+    # X-Forwarded-For: за Xray цепочку строить не из чего, берём адрес из PROXY
+    if [[ $realip == '$proxy_protocol_addr' ]]; then xff='$proxy_protocol_addr'
+    else xff='$proxy_add_x_forwarded_for'; fi
+cat <<EOF
 # ── Панель
 server {
-    listen 443 ssl;
-$( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
+$listen
     http2 on;
-    server_name $1;
+    server_name $3;
 
     # сертификат внутри server: у панели и страницы подписки они разные
     ssl_certificate     $cert/fullchain.pem;
@@ -5825,8 +6272,8 @@ $( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
     access_log off;
 
     # Секретный вход: ставит cookie на 30 дней и уводит на корень панели
-    location = $3 {
-        add_header Set-Cookie "skipit_panel=$4; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000" always;
+    location = $5 {
+        add_header Set-Cookie "skipit_panel=$6; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000" always;
         return 302 https://\$host/;
     }
 
@@ -5836,8 +6283,8 @@ $( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
         proxy_pass http://127.0.0.1:${PANEL_APP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $realip;
+        proxy_set_header X-Forwarded-For $xff;
         proxy_set_header X-Forwarded-Proto https;
     }
 
@@ -5850,8 +6297,8 @@ $( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
         proxy_pass http://127.0.0.1:${PANEL_APP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $realip;
+        proxy_set_header X-Forwarded-For $xff;
         proxy_set_header X-Forwarded-Proto https;
         proxy_read_timeout 5m;
     }
@@ -5866,25 +6313,24 @@ $( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $realip;
+        proxy_set_header X-Forwarded-For $xff;
         proxy_set_header X-Forwarded-Proto https;
         proxy_read_timeout 1h;
         proxy_send_timeout 1h;
     }
 }
 EOF
-# ── Страница подписки на этом же сервере: свой домен, свой сертификат, без гейта
-if [[ -n ${6:-} ]]; then
-    local scert="/etc/letsencrypt/live/$7"
+    # ── Страница подписки на этом же сервере: свой домен, свой сертификат, без гейта
+    [[ -n ${7:-} ]] || return 0
+    local scert="/etc/letsencrypt/live/$8"
 cat <<EOF
 
 # ── Страница подписки
 server {
-    listen 443 ssl;
-$( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
+$listen
     http2 on;
-    server_name $6;
+    server_name $7;
 
     ssl_certificate     $scert/fullchain.pem;
     ssl_certificate_key $scert/privkey.pem;
@@ -5895,20 +6341,43 @@ $( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl;" )
         proxy_pass http://127.0.0.1:${SUB_APP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $realip;
+        proxy_set_header X-Forwarded-For $xff;
         proxy_set_header X-Forwarded-Proto https;
         proxy_read_timeout 1m;
     }
 }
 EOF
-fi
+}
+
+panel_nginx_conf() { # домен серт путь cookie api-ключ [домен-подписки серт-подписки]
 cat <<EOF
+# SkipIt Tool · панель $1${6:+ + страница подписки $6}
+# Файл пересоздаётся SkipIt Tool (Панель → nginx.conf), ручные правки уйдут в бэкап.
+
+server_tokens off;
+server_names_hash_bucket_size 128;
+
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ""      close;
+}
+
+$(panel_nginx_maps "$4" "$5")
+
+ssl_protocols       TLSv1.2 TLSv1.3;
+ssl_ecdh_curve      X25519:prime256v1:secp384r1;
+ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+ssl_session_cache   shared:skipit_tls:10m;
+ssl_session_timeout 4h;
+ssl_session_tickets off;
+
+$(panel_server_blocks "$(panel_listen_own)" '$remote_addr' "$1" "$2" "$3" "$4" "${6:-}" "${7:-}")
 
 # Любое другое имя в SNI: рукопожатие обрывается, сертификат не показывается
 server {
-    listen 443 ssl default_server;
-$( [[ -f /proc/net/if_inet6 ]] && echo "    listen [::]:443 ssl default_server;" )
+$(panel_listen_own default_server)
     ssl_reject_handshake on;
 }
 EOF
@@ -5916,8 +6385,9 @@ EOF
 
 panel_nginx_ok() { # → текст ошибки
     local out
-    [[ $(ctr_status "$PANEL_NGINX_CTR") == running ]] || { echo "контейнер $PANEL_NGINX_CTR не работает"; return 1; }
-    out=$(docker exec "$PANEL_NGINX_CTR" nginx -t 2>&1) || { echo "$out"; return 1; }
+    local c; c=$(panel_nginx_ctr)
+    [[ $(ctr_status "$c") == running ]] || { echo "контейнер $c не работает"; return 1; }
+    out=$(docker exec "$c" nginx -t 2>&1) || { echo "$out"; return 1; }
 }
 
 # Панель отвечает на /health в контейнере метрик
@@ -5971,6 +6441,112 @@ panel_api() { printf 'http://127.0.0.1:%s/api' "$PANEL_APP_PORT"; }
 # без этих заголовков обращение напрямую в 127.0.0.1:3000 обрывается без ответа.
 # Нужны оба - и схема, и X-Forwarded-For; Host не обязателен.
 PANEL_PROXY_HDR=(-H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1")
+# Завести в панели профиль конфигурации и ноду под него - без похода в браузер.
+# В связке все данные у нас уже есть: профиль Xray генерирует node_profile_json,
+# адрес и порт известны, токен выпущен при установке панели. Гонять человека в UI
+# ради этого незачем.
+# Печатает uuid созданной ноды; текст проблемы - в PANEL_NODE_ERR.
+PANEL_NODE_ERR=""
+panel_create_node() { # домен порт схема
+    local domain=$1 port=$2 layout=$3
+    local name=${domain%%.*} tok body out prof inb
+    PANEL_NODE_ERR=""
+
+    tok=$(panel_api_token) || { PANEL_NODE_ERR="у SkipIt Tool нет API-токена панели"; return 1; }
+    command -v jq >/dev/null 2>&1 || ensure_pkg jq jq >/dev/null 2>&1
+    command -v jq >/dev/null 2>&1 || { PANEL_NODE_ERR="не установлен пакет jq"; return 1; }
+    # Имя ноды в панели - минимум 3 символа, иначе панель отклонит запрос
+    (( ${#name} >= 3 )) || name="node-$name"
+
+    # 1. Профиль: {"name": ..., "config": <тот же JSON, что показывает подсказка>}
+    body=$(printf '{"name":%s,"config":%s}' \
+        "$(jq -Rn --arg v "$name" '$v')" "$(node_profile_json "$domain" "$layout")")
+    out=$(panel_api_post "/config-profiles" "$body") || {
+        PANEL_NODE_ERR="панель не приняла профиль: $PANEL_API_ERR"; return 1; }
+    prof=$(jq -r '.response.uuid // empty' <<< "$out")
+    [[ -n $prof ]] || { PANEL_NODE_ERR="панель не вернула uuid профиля"; return 1; }
+
+    # 2. Инбаунды профиля: в связке он один - steal-<имя>
+    inb=$(jq -r '[.response.inbounds[]?.uuid] | map(select(. != null)) | @json' <<< "$out")
+    [[ -n $inb && $inb != "[]" ]] || {
+        PANEL_NODE_ERR="в созданном профиле нет инбаундов"; return 1; }
+
+    # 3. Нода под этот профиль. Адрес - домен ноды: панель живёт в контейнере,
+    #    и петлевой адрес привёл бы её саму к себе, а не к ноде на хосте.
+    body=$(printf '{"name":%s,"address":%s,"port":%s,"configProfile":{"activeConfigProfileUuid":%s,"activeInbounds":%s}}' \
+        "$(jq -Rn --arg v "$name" '$v')" "$(jq -Rn --arg v "$domain" '$v')" "$port" \
+        "$(jq -Rn --arg v "$prof" '$v')" "$inb")
+    out=$(panel_api_post "/nodes" "$body") || {
+        PANEL_NODE_ERR="панель не приняла ноду: $PANEL_API_ERR"; return 1; }
+    jq -r '.response.uuid // empty' <<< "$out"
+}
+
+# POST в API панели. Тело - вторым аргументом, ошибка - в PANEL_API_ERR.
+PANEL_API_ERR=""
+panel_api_post() { # путь тело
+    local tok code out tmp
+    PANEL_API_ERR=""
+    tok=$(panel_api_token) || { PANEL_API_ERR="нет токена"; return 1; }
+    tmp=$(mktemp) || return 1
+    code=$(printf '%s' "$2" | curl -sS -o "$tmp" -w '%{http_code}' --max-time 25 \
+        "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
+        -H "Content-Type: application/json" --data-binary @- \
+        "$(panel_api)$1" 2>/dev/null) || code=000
+    out=$(cat "$tmp"); rm -f "$tmp"
+    case $code in
+        200|201) printf '%s' "$out"; return 0 ;;
+        000) PANEL_API_ERR="панель не ответила" ;;
+        *)   PANEL_API_ERR="код $code$(jq -r 'if .errors then " — " + ([.errors[].message] | join("; ")) elif .message then " — " + (.message|tostring) else "" end' <<< "$out" 2>/dev/null)" ;;
+    esac
+    return 1
+}
+
+
+# Заведена ли в панели хоть одна нода. Критично для связки: remnanode держит
+# Xray выключенным, пока панель не отдаст ему конфиг. Нет ноды в панели - нет
+# конфига, Xray не займёт 443, и связка оставит сервер вообще без фронта.
+panel_has_node() {
+    local tok out
+    tok=$(panel_api_token) || return 1
+    out=$(curl -sS --max-time 15 "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
+        "$(panel_api)/nodes" 2>/dev/null) || return 1
+    grep -q '"uuid"' <<< "$out"
+}
+
+# Токен API панели. Свежий из установки, иначе тот, что выпущен для страницы
+# подписки. Состояние страницы подгружаем сами: без него SUB_ENV смотрит на путь
+# отдельной установки, и в связке токена там не окажется.
+panel_api_token() {
+    local t=${PANEL_API_TOKEN:-}
+    if [[ -z $t ]]; then
+        sub_state_load 2>/dev/null
+        t=$(sub_env_get REMNAWAVE_API_TOKEN 2>/dev/null)
+    fi
+    [[ -n $t ]] || return 1
+    printf '%s' "$t"
+}
+
+# Адреса нод, заведённых в панели - по одному в строке.
+panel_node_addrs() {
+    local tok out
+    tok=$(panel_api_token) || return 1
+    out=$(curl -sS --max-time 15 "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
+        "$(panel_api)/nodes" 2>/dev/null) || return 1
+    grep -o '"address"[[:space:]]*:[[:space:]]*"[^"]*"' <<< "$out" | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# SECRET_KEY для ноды из панели на этом же сервере. /api/keygen отдаёт ключ,
+# общий для всей панели (а не отдельный на каждую ноду) - именно его ждёт
+# node_write_env. Токен берём тот, что уже выпущен для страницы подписки.
+panel_node_secret() { # → SECRET_KEY или пусто
+    local tok out
+    tok=$(panel_api_token) || return 1
+    out=$(curl -sS --max-time 15 "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
+        "$(panel_api)/keygen" 2>/dev/null) || return 1
+    out=$(sed -n 's/.*"secretKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$out" | head -n 1)
+    [[ -n $out ]] || return 1
+    printf '%s' "$out"
+}
 panel_proxy_hdr_cfg() { printf 'header = "X-Forwarded-Proto: https"\nheader = "X-Forwarded-For: 127.0.0.1"\n'; }
 
 # Открыт ли ещё выпуск первого админа: 0 - да, 1 - нет связи, 2 - админ уже есть
@@ -6281,11 +6857,15 @@ cert_issue() { # [домен...]
         for d in "${zones[@]}"; do zl+="$d, *.$d, "; done
         n_say "Выпускаю сертификат для ${zl%, } (проверка через DNS, до минуты)..."
         cert_issue_cf "$CERT_EMAIL" "${zones[@]}" ||
-            { node_fail "Certbot не смог выпустить сертификат (подробности выше)."; return 1; }
+            { node_fail "Certbot не смог выпустить сертификат.
+
+$(cert_fail_reason || echo "Подробности выше и в /var/log/letsencrypt/letsencrypt.log")"; return 1; }
     else
         n_say "Выпускаю сертификат для $list (проверка по 80 порту)..."
         cert_issue_http "$CERT_EMAIL" "${doms[@]}" ||
-            { node_fail "Certbot не смог выпустить сертификат. Проверьте A-записи и доступность 80 порта."; return 1; }
+            { node_fail "Certbot не смог выпустить сертификат.
+
+$(cert_fail_reason || echo "Проверьте A-записи и доступность 80 порта, подробности в /var/log/letsencrypt/letsencrypt.log")"; return 1; }
     fi
     cert_ensure_renew
     for d in "${doms[@]}"; do
@@ -6300,29 +6880,33 @@ cert_issue() { # [домен...]
 # всегда на одном. Поэтому перед удалением сертификата и закрытием порта смотрим,
 # не нужны ли они кому-то ещё - иначе удаление одного компонента ломает соседа.
 # Состояния читаются в подоболочке: *_state_load перетирает глобальные переменные.
-cert_other_users() { # имя-сертификата свой-компонент(node|panel|sub) → «нода (dom), панель (dom)»
-    local name=$1 skip=${2:-} out
+# Свой-компонент - это те, что уезжают прямо сейчас: их считать «остающимися»
+# нельзя. В связке панель уносит с собой страницу подписки, поэтому сюда
+# передают сразу оба: "panel sub". Иначе мы обещаем сохранить сертификат ради
+# страницы, которую сами же и удаляем.
+cert_other_users() { # имя-сертификата свои-компоненты(node|panel|sub, через пробел) → «нода (dom), панель (dom)»
+    local name=$1 skip=" ${2:-} " out
     [[ -n $name ]] || return 0
     out=$(
-        [[ $skip != node ]] && node_state_load 2>/dev/null && [[ $NODE_CERT_NAME == "$name" ]] &&
+        [[ $skip != *" node "* ]] && node_state_load 2>/dev/null && [[ $NODE_CERT_NAME == "$name" ]] &&
             printf 'нода (%s), ' "$NODE_DOMAIN"
-        [[ $skip != panel ]] && panel_state_load 2>/dev/null && [[ -f $PANEL_COMPOSE ]] &&
+        [[ $skip != *" panel "* ]] && panel_state_load 2>/dev/null && [[ -f $PANEL_COMPOSE ]] &&
             [[ $PANEL_CERT_NAME == "$name" ]] && printf 'панель (%s), ' "$PANEL_DOMAIN"
-        [[ $skip != sub ]] && sub_state_load 2>/dev/null && [[ -f $SUB_COMPOSE ]] &&
+        [[ $skip != *" sub "* ]] && sub_state_load 2>/dev/null && [[ -f $SUB_COMPOSE ]] &&
             [[ $SUB_CERT_NAME == "$name" ]] && printf 'страница подписки (%s), ' "$SUB_DOMAIN"
         true
     )
     echo "${out%, }"
 }
 
-port443_other_users() { # свой-компонент(node|panel|sub) → «нода, панель»
-    local skip=${1:-} out
+port443_other_users() { # свои-компоненты(node|panel|sub, через пробел) → «нода, панель»
+    local skip=" ${1:-} " out
     out=$(
-        [[ $skip != node ]] && node_state_load 2>/dev/null && [[ -f $NODE_COMPOSE ]] &&
+        [[ $skip != *" node "* ]] && node_state_load 2>/dev/null && [[ -f $NODE_COMPOSE ]] &&
             printf 'нода, '
-        [[ $skip != panel ]] && panel_state_load 2>/dev/null && [[ -f $PANEL_COMPOSE ]] &&
+        [[ $skip != *" panel "* ]] && panel_state_load 2>/dev/null && [[ -f $PANEL_COMPOSE ]] &&
             printf 'панель, '
-        [[ $skip != sub ]] && sub_state_load 2>/dev/null && [[ -f $SUB_COMPOSE ]] &&
+        [[ $skip != *" sub "* ]] && sub_state_load 2>/dev/null && [[ -f $SUB_COMPOSE ]] &&
             printf 'страница подписки, '
         true
     )
@@ -6457,7 +7041,7 @@ API-токены: живут отдельно от админа — страни
     g_gap
     g_line "Новый администратор панели:"
     g_gap
-    printf 'логин:  %s\nпароль: %s\n' "$PANEL_ADMIN_USER" "$PANEL_ADMIN_PASS" | g_code
+    g_code_kv "логин" "$PANEL_ADMIN_USER" "пароль" "$PANEL_ADMIN_PASS"
     g_gap
     g_note "Сохраните пароль — второй раз он показан не будет, в лог не пишется."
     g_note "Вход: $(panel_url)"
@@ -6598,6 +7182,43 @@ ${safety:+
 # ---- Установка панели ----
 panel_install() { UI_CTX=""; _panel_install "$@"; local rc=$?; UI_CTX=""; return $rc; }
 
+# Всё на один сервер. Отдельной копии логики не пишем: ставим панель со
+# страницей подписки обычным мастером, а следом мастер ноды сам видит панель
+# и предлагает связку - забрать 443 и увести панель за свой unix-сокет.
+bundle_all_install() {
+    ui_yesno "Панель, страница подписки и нода — на один сервер" "── Что понадобится
+Три домена:   панель, страница подписки, домен ноды (он же SNI для REALITY)
+A-записи:     все три на IP этого сервера ($SERVER_IP)
+
+ℹ Домены панели и подписки в Cloudflare — можно с прокси (оранжевое облако).
+ℹ Домен ноды — только «DNS only» (серое): через прокси REALITY не работает.
+
+── Как это будет работать
+Порт 443:     держит Xray ноды
+Не REALITY:   уходит в nginx по unix-сокету, дальше выбор по имени домена
+              домен ноды → сайт-заглушка
+              домен панели → панель
+              домен подписки → страница подписки
+Сертификаты:  два выпуска — отдельно нода, отдельно панель со страницей.
+              Общий выдал бы связь между заглушкой и панелью.
+
+── Порядок
+1. Панель и страница подписки (свой nginx на 443)
+2. Нода — заберёт 443 и уведёт панель за свой сокет
+
+Начать?" || return
+
+    panel_install with_sub
+    if ! panel_installed 2>/dev/null; then
+        return
+    fi
+    ui_msg "Панель готова" "Панель $PANEL_DOMAIN установлена.
+
+Теперь поставим ноду. Она заберёт порт 443, а панель со страницей подписки
+переедут за её unix-сокет — снаружи для них ничего не изменится."
+    node_install
+}
+
 _panel_install() {
     local domain sub_domain path cookie api_key busy reinstall=0
     local with_sub=0 sub_dom="" sub_cert=""
@@ -6679,14 +7300,36 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
         fi
     fi
 
+    local bundle=0
     if (( ! reinstall )); then
         busy=$(port_owner 443)
         case $? in
             1) ;;
-            *) ui_msg "Порт 443 занят" "Панели нужен порт 443, а его занял: $busy
+            2) if node_installed 2>/dev/null; then
+                   # 443 держит Xray нашей ноды - панели свой nginx не нужен,
+                   # она въедет в nginx ноды на тот же unix-сокет
+                   ui_yesno "Нода на этом сервере" "── Сейчас
+Нода:         $NODE_DOMAIN
+Порт 443:     держит Xray ноды
 
-ℹ Если это нода SkipIt Tool — панель и нода на одном сервере ставятся другим
-  способом, он появится в следующей версии SkipIt Tool."
+── Станет
+Панель:       на том же unix-сокете, своего nginx не будет
+Выбор:        по имени домена — ноде заглушка, панели панель
+Порт 443:     остаётся за Xray, как и был
+
+ℹ Сертификат панели выпустим отдельный, сертификат ноды не трогаем:
+  общий выдал бы связь между заглушкой и панелью.
+
+ℹ Нода перезагрузит свой nginx — клиенты этого не заметят.
+
+Поставить панель в связке с нодой?" || return
+                   bundle=1
+                   ui_ctx_add "Режим" "связка с нодой $NODE_DOMAIN"
+               else
+                   ui_msg "Порт 443 занят" "Панели нужен порт 443, а его занял: $busy"
+                   return
+               fi ;;
+            *) ui_msg "Порт 443 занят" "Панели нужен порт 443, а его занял: $busy"
                return ;;
         esac
     fi
@@ -6736,8 +7379,9 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
     ui_head "Установка панели · $domain"
     log "panel install: domain=$domain cert=$PANEL_CERT_METHOD"
 
-    node_step "1/5  Docker"
+    node_step "1/5  Docker и подкачка"
     node_ensure_docker || { node_fail "Не удалось установить или запустить Docker."; return; }
+    swap_ensure
 
     node_step "2/5  SSL-сертификат"
     # Один выпуск на все домены, о которых спрашивал cert_ask
@@ -6757,7 +7401,7 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
         # Страница подписки живёт в compose панели: своё окружение в sub.env рядом
         SUB_DIR=$PANEL_DIR; SUB_ENV="${PANEL_DIR}/sub.env"
         SUB_COMPOSE=$PANEL_COMPOSE; SUB_NGINX=$PANEL_NGINX
-        SUB_NGINX_CTR=$PANEL_NGINX_CTR
+        SUB_NGINX_CTR=$(panel_nginx_ctr)
         SUB_DOMAIN=$sub_dom; SUB_CERT_NAME=$sub_cert; SUB_CERT_METHOD=$PANEL_CERT_METHOD
         SUB_PANEL_URL="http://remnawave:${PANEL_APP_PORT}"; SUB_PREFIX=""; SUB_BUNDLED=1
         # токен появится после регистрации админа, пока пусто
@@ -6767,9 +7411,12 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
     else
         panel_nginx_conf "$domain" "$PANEL_CERT_NAME" "$path" "$cookie" "$api_key" > "$PANEL_NGINX"
     fi
+    # В связке фронтом будет nginx ноды: свой nginx в compose не появится,
+    # а собственный nginx.conf панели остаётся лежать как есть - он не читается
+    (( bundle )) && PANEL_NGINX_MODE=socket
     panel_compose > "$PANEL_COMPOSE"
     panel_state_save
-    n_say "$PANEL_COMPOSE, $PANEL_ENV, $PANEL_NGINX"
+    n_say "$PANEL_COMPOSE, $PANEL_ENV$( panel_bundled || printf ', %s' "$PANEL_NGINX" )"
 
     node_step "4/5  UFW"
     if ! node_ufw_ensure; then
@@ -6787,6 +7434,20 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
         node_fail "Панель не запустилась за 3 минуты. Смотрите логи: Панель → Логи → remnawave"
         return
     fi
+    # Связка: блоки панели уезжают в конфиг ноды, её nginx пересоздаётся с
+    # сертификатом панели внутри. Проверяем конфиг до применения.
+    if (( bundle )); then
+        n_say "Переношу панель в nginx ноды…"
+        node_state_load 2>/dev/null
+        backup_file "$NODE_NGINX" >/dev/null; backup_file "$NODE_COMPOSE" >/dev/null
+        NODE_SHARED=1
+        node_state_save
+        node_compose > "$NODE_COMPOSE"
+        panel_nginx_write
+        node_compose_run up -d --remove-orphans >/dev/null 2>&1
+        sleep 3
+    fi
+
     local err
     if ! err=$(panel_nginx_ok); then node_fail "nginx не запустился: $err"; return; fi
 
@@ -6830,7 +7491,7 @@ panel_sub_done_screen() {
         g_gap
         g_line "Администратор панели создан, войдите этими данными:"
         g_gap
-        printf 'логин:  %s\nпароль: %s\n' "$PANEL_ADMIN_USER" "$PANEL_ADMIN_PASS" | g_code
+        g_code_kv "логин" "$PANEL_ADMIN_USER" "пароль" "$PANEL_ADMIN_PASS"
         g_gap
         g_note "Сохраните пароль — больше он показан не будет, в лог не пишется."
         g_note "Сменить его можно в самой панели после входа."
@@ -6927,7 +7588,8 @@ panel_update() {
 
     # В связке в этом же compose лежит страница подписки: без явного списка сервисов
     # обновилась бы и она, хотя обещали обновить только панель
-    local -a svc=(remnawave "$PANEL_NGINX_CTR")
+    local -a svc=(remnawave)
+    panel_bundled || svc+=("$PANEL_NGINX_CTR")
     say "Скачиваю образы..."
     if ! panel_compose_run pull "${svc[@]}"; then
         ui_msg "Ошибка" "Не удалось скачать образы. Панель не тронута.
@@ -7001,7 +7663,7 @@ $logs
 panel_logs() {
     local c hdr v r
     hdr="Контейнер"$'\t'"Состояние"$'\t'"Перезапусков"
-    for v in remnawave remnawave-db remnawave-redis "$PANEL_NGINX_CTR"; do
+    for v in remnawave remnawave-db remnawave-redis "$(panel_nginx_ctr)"; do
         r=$(docker inspect -f '{{.RestartCount}}' "$v" 2>/dev/null)
         hdr+=$'\n'"$v"$'\t'"$(ctr_state_ru "$v")"$'\t'"${r:-—}"
     done
@@ -7009,7 +7671,7 @@ panel_logs() {
         remnawave         "remnawave — панель, миграции БД" \
         remnawave-db      "PostgreSQL" \
         remnawave-redis   "Valkey" \
-        "$PANEL_NGINX_CTR" "nginx — вход с улицы") || return
+        "$(panel_nginx_ctr)" "nginx — вход с улицы$(panel_bundled && echo " (общий с нодой)")") || return
     ui_head "Логи: $c"
     printf '  %sпоследние 200 строк, дальше новые в реальном времени%s\n  %s\n\n' \
         "$C_NOTE" "$C_RESET" "$(ui_keys "Ctrl+C — остановить просмотр")" >"$TTY"
@@ -7073,23 +7735,29 @@ panel_change_path() {
     new=$(panel_gen_path)
     cookie=$(panel_gen_cookie)
     api_key=$(panel_env_get SKIPIT_PANEL_API_KEY)
-    bak=$(backup_file "$PANEL_NGINX")
-    # в связке передаём и домен страницы подписки, иначе её server-блок пропал бы
-    panel_nginx_conf "$PANEL_DOMAIN" "$PANEL_CERT_NAME" "$new" "$cookie" "$api_key" \
-        ${PANEL_SUB_CERT:+"$PANEL_SUB_DOMAIN" "$PANEL_SUB_CERT"} > "$PANEL_NGINX"
+    local ngx old_path=$PANEL_PATH old_cookie
+    ngx=$(panel_nginx_file)
+    old_cookie=$(panel_env_get SKIPIT_PANEL_COOKIE)
+    bak=$(backup_file "$ngx")
+    # Новый путь и cookie нужны генератору ДО записи: в связке конфиг собирает
+    # нода и берёт их из состояния панели и её .env, а не из аргументов.
+    # Поэтому старые значения запоминаем заранее - откатывать будет чем.
+    PANEL_PATH=$new
+    sed -i "s|^SKIPIT_PANEL_COOKIE=.*|SKIPIT_PANEL_COOKIE=${cookie}|" "$PANEL_ENV"
+    panel_nginx_write
     # Проверяем конфиг до применения: иначе при ошибке мы бы отрапортовали новый
     # адрес, а панель осталась бы на старом - или вообще без nginx
-    if ! err=$(docker exec "$PANEL_NGINX_CTR" nginx -t 2>&1); then
-        [[ -n $bak ]] && cat "$bak" > "$PANEL_NGINX"
+    if ! err=$(docker exec "$(panel_nginx_ctr)" nginx -t 2>&1); then
+        PANEL_PATH=$old_path
+        sed -i "s|^SKIPIT_PANEL_COOKIE=.*|SKIPIT_PANEL_COOKIE=${old_cookie}|" "$PANEL_ENV"
+        [[ -n $bak ]] && cat "$bak" > "$ngx"
         ui_msg "Адрес не изменён" "nginx не принял новый конфиг, всё возвращено как было:
 
 $err"
         return
     fi
-    sed -i "s|^SKIPIT_PANEL_COOKIE=.*|SKIPIT_PANEL_COOKIE=${cookie}|" "$PANEL_ENV"
-    PANEL_PATH=$new
     panel_state_save
-    docker exec "$PANEL_NGINX_CTR" nginx -s reload >/dev/null 2>&1
+    panel_nginx_reload
     log "panel path changed"
 
     UI_CTX=""
@@ -7111,7 +7779,8 @@ panel_diag() {
     DIAG=""; DIAG_OK=0; DIAG_WARN=0; DIAG_BAD=0; DIAG_PROBLEMS=""; DIAG_FIX_UFW=0
 
     diag_head "Контейнеры"
-    for v in remnawave remnawave-db remnawave-redis "$PANEL_NGINX_CTR"; do
+    panel_bundled && diag_ok "Связка: 443 держит Xray ноды, панель отдаётся через её nginx ($NODE_DECOY)"
+    for v in remnawave remnawave-db remnawave-redis "$(panel_nginx_ctr)"; do
         case $(ctr_status "$v") in
             running) diag_ok "$v работает" ;;
             "")      diag_bad "$v не создан — перезапустите панель" ;;
@@ -7220,8 +7889,12 @@ panel_remove() {
 Точно удалить панель и её базу данных?" no || return
     fi
 
-    ask_del_cert "$PANEL_CERT_NAME" panel && del_cert=1
-    ask_close_443 panel && del_443=1
+    # В связке страница подписки уходит вместе с панелью - значит она не в числе
+    # тех, ради кого стоит беречь сертификат и правило на 443
+    local goes=panel
+    (( with_sub )) && goes="panel sub"
+    ask_del_cert "$PANEL_CERT_NAME" "$goes" && del_cert=1
+    ask_close_443 "$goes" && del_443=1
 
     clear; say "Делаю дамп базы данных..."
     if bak=$(panel_backup_make); then
@@ -7249,11 +7922,27 @@ panel_remove() {
         docker volume rm valkey-socket >/dev/null 2>&1
         rm -f "$PANEL_COMPOSE" "$PANEL_NGINX"
     fi
+    # В связке блоки панели лежали в конфиге ноды - их надо убрать, иначе nginx
+    # ноды не стартует: сертификат панели мы могли только что удалить.
+    # Делаем до стирания состояния: генератору нужны NODE_*, а признак - PANEL_NGINX_MODE.
+    if panel_bundled && node_installed 2>/dev/null; then
+        say "Убираю блоки панели из nginx ноды..."
+        backup_file "$NODE_NGINX" >/dev/null; backup_file "$NODE_COMPOSE" >/dev/null
+        NODE_SHARED=0
+        node_state_save
+        PANEL_NGINX_MODE=own
+        node_compose > "$NODE_COMPOSE"
+        node_nginx_conf "$NODE_DOMAIN" "$NODE_CERT_NAME" "$NODE_LAYOUT" > "$NODE_NGINX"
+        node_compose_run up -d --remove-orphans >/dev/null 2>&1
+        local nerr
+        nerr=$(node_nginx_ok) || say "Внимание: nginx ноды ругается — $nerr"
+    fi
     rm -f "$PANEL_STATE" "$PANEL_BACKUP_CRON"
     # Состояние страницы подписки без панели нерабочее: её файлы лежали в $PANEL_DIR.
     # Без этого меню продолжало бы считать страницу установленной.
     (( with_sub )) && { rm -f "$SUB_STATE"; SUB_DOMAIN=""; SUB_CERT_NAME=""; SUB_BUNDLED=0; }
-    if (( del_443 )) && command -v ufw >/dev/null 2>&1; then
+    # 443 в связке держит Xray ноды - закрывать его вместе с панелью нельзя
+    if (( del_443 )) && ! node_installed 2>/dev/null && command -v ufw >/dev/null 2>&1; then
         ufwc --force delete allow 443/tcp >/dev/null 2>&1
     fi
     if (( del_cert )) && command -v certbot >/dev/null 2>&1; then
@@ -7290,7 +7979,7 @@ menu_panel() {
 remnawave${tab}$(ctr_state_ru remnawave)
 PostgreSQL${tab}$(ctr_state_ru remnawave-db)
 Valkey${tab}$(ctr_state_ru remnawave-redis)
-nginx${tab}$(ctr_state_ru "$PANEL_NGINX_CTR")
+nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · общий с нодой")
 Сертификат${tab}$(cert_days_left "$PANEL_CERT_NAME" >/dev/null 2>&1 && echo "действует · $(cert_days_left "$PANEL_CERT_NAME") дн." || echo НЕТ)
 Бэкап${tab}$(panel_backup_list | head -n 1 | xargs -r -I{} date -r {} '+%d.%m.%Y %H:%M' || echo НЕТ)"
         c=$(ui_menu "Панель Remnawave" "$hdr" \
@@ -7395,7 +8084,7 @@ sub_state_load() {
         SUB_ENV="${PANEL_DIR}/sub.env"
         SUB_COMPOSE=$PANEL_COMPOSE
         SUB_NGINX=$PANEL_NGINX
-        SUB_NGINX_CTR=$PANEL_NGINX_CTR
+        SUB_NGINX_CTR=$(panel_nginx_ctr)
     else
         SUB_NGINX_CTR=$SUB_NGINX_CTR_OWN
     fi
@@ -7427,6 +8116,9 @@ APP_PORT=${SUB_APP_PORT}
 REMNAWAVE_PANEL_URL=${1}
 REMNAWAVE_API_TOKEN=${2}
 CUSTOM_SUB_PREFIX=${3}
+
+# Потолок кучи V8, считается от RAM сервера. Перекрывает зашитые в образ 16 ГБ.
+NODE_OPTIONS=--max-old-space-size=$(sub_node_heap_mb)
 
 # Один реверс-прокси перед страницей - nginx SkipIt Tool
 TRUST_PROXY=1
@@ -7539,7 +8231,15 @@ sub_nginx_ok() { # → текст ошибки
     out=$(docker exec "$SUB_NGINX_CTR" nginx -t 2>&1) || { echo "$out"; return 1; }
 }
 
-sub_healthy() { curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:${SUB_APP_PORT}/" 2>/dev/null; }
+# Живость страницы: /internal/health и только ИЗНУТРИ контейнера.
+# Корень / сабпейдж рвёт без ответа (индексного маршрута нет, это защита от сканеров),
+# а /internal/health отвечает только на обращения внутри docker-сети. С хоста оба
+# варианта дают «нет ответа», и проверка ругалась на живую страницу.
+sub_healthy() {
+    [[ $(ctr_status "$SUB_CTR") == running ]] || return 1
+    docker exec "$SUB_CTR" curl -fsS -o /dev/null --max-time 5 \
+        "http://127.0.0.1:${SUB_APP_PORT}/internal/health" >/dev/null 2>&1
+}
 
 sub_wait_healthy() { # секунд
     local i=0 n=${1:-60}
@@ -7562,8 +8262,18 @@ sub_api_check() { # panel_url api_token skipit_key
     [[ -n $3 ]] && hdr+=$(printf '\nheader = "X-Api-Key: %s"\n' "$3")
     # Панель по http (локальная, из compose) без этих заголовков рвёт соединение
     [[ ${1,,} == http://* ]] && hdr+=$'\n'"$(panel_proxy_hdr_cfg)"
-    code=$(printf '%s\n' "$hdr" | curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -K - \
-        "${1%/}/api/system/stats" 2>/dev/null) || code=000
+    # В связке с панелью адрес - имя из docker-сети (http://remnawave:3000). С хоста
+    # оно не резолвится, curl молча падает в 000, и проверка обвиняла живую панель.
+    # Такой запрос шлём изнутри контейнера страницы - оттуда имя видно.
+    local url=${1%/} host run=()
+    host=${url#*://}; host=${host%%[:/]*}
+    if ! getent hosts "$host" >/dev/null 2>&1; then
+        if   [[ $(ctr_status "$SUB_CTR") == running ]]; then run=(docker exec -i "$SUB_CTR")
+        elif [[ $(ctr_status remnawave) == running ]]; then run=(docker exec -i remnawave)
+        fi
+    fi
+    code=$(printf '%s\n' "$hdr" | "${run[@]}" curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -K - \
+        "$url/api/system/stats" 2>/dev/null) || code=000
     case $code in
         200) return 0 ;;
         000) SUB_API_ERR="Сервер панели не отвечает по адресу ${1}. Проверьте адрес, DNS и что панель работает."; return 1 ;;
@@ -7732,8 +8442,9 @@ n — ввести заново.
     ui_head "Установка страницы подписки · $domain"
     log "subpage install: domain=$domain panel=$panel_url cert=$SUB_CERT_METHOD"
 
-    node_step "1/5  Docker"
+    node_step "1/5  Docker и подкачка"
     node_ensure_docker || { node_fail "Не удалось установить или запустить Docker."; return; }
+    swap_ensure
 
     node_step "2/5  SSL-сертификат"
     cert_issue "$domain" || return
@@ -7924,8 +8635,19 @@ sub_diag() {
 
     diag_head "Снаружи"
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$SUB_DOMAIN:443:127.0.0.1" "$(sub_url)/" 2>/dev/null)
-    [[ $code == 200 || $code == 404 ]] && diag_ok "https://$SUB_DOMAIN отвечает через nginx (код $code)" ||
-        diag_bad "https://$SUB_DOMAIN ответил кодом ${code:-нет}"
+    # Страница открывается только по ссылке с UUID, на всё остальное рвёт соединение,
+    # и nginx показывает это как 502. На корне 502 - норма, а не поломка; живость
+    # страницы уже проверена выше через /internal/health.
+    case $code in
+        200|404) diag_ok "https://$SUB_DOMAIN отвечает через nginx (код $code)" ;;
+        502)     if sub_healthy; then
+                     diag_ok "https://$SUB_DOMAIN: nginx и TLS работают (502 на корне - так и задумано, страница открывается только по ссылке с UUID)"
+                 else
+                     diag_bad "https://$SUB_DOMAIN ответил 502, и сама страница не отвечает — смотрите логи"
+                 fi ;;
+        "")      diag_bad "https://$SUB_DOMAIN не ответил — проверьте nginx и сертификат" ;;
+        *)       diag_bad "https://$SUB_DOMAIN ответил кодом $code" ;;
+    esac
     if ! command -v ufw >/dev/null 2>&1; then diag_warn "UFW не установлен"
     elif ! ufw_active; then diag_warn "UFW выключен — порты не ограничены"
     elif ufw_rules | grep -Eq '^allow 443(/tcp)?( |$)'; then diag_ok "UFW: 443/tcp открыт"
@@ -8151,6 +8873,8 @@ menu_remnawave() {
         if (( s )); then on+=(subpage "Страница подписки"); else off+=(subpage "Страница подписки"); fi
         # Связка ставится одним мастером: два домена, один nginx, токен выпускается сам
         (( p || s )) || off+=(bundle "Панель + Страница подписки — вместе")
+        # Всё на одном сервере: 443 забирает Xray ноды, панель уходит за его сокет
+        (( p || s || n )) || off+=(bundle_all "Панель + Страница подписки + Нода — на один сервер")
         items=()
         (( ${#on[@]}  )) && items+=("" "Установлено"    "${on[@]}")
         (( ${#off[@]} )) && items+=("" "Не установлено" "${off[@]}")
@@ -8159,7 +8883,8 @@ menu_remnawave() {
         # Неустановленный компонент открываем сразу мастером: экран с одним пунктом
         # «Установить» повторял бы первый экран самого мастера
         case $c in
-            bundle)  panel_install with_sub ;;
+            bundle)     panel_install with_sub ;;
+            bundle_all) bundle_all_install ;;
             panel)   if (( p )); then menu_panel;   else panel_install; fi ;;
             node)    if (( n )); then menu_node;    else node_install;  fi ;;
             subpage) if (( s )); then menu_subpage; else sub_install;   fi ;;
@@ -9650,6 +10375,169 @@ skipit_update_cli() {
     say "SkipIt Tool обновлён: v$SKIPIT_VERSION -> v$new (бэкап: $bak)"
 }
 
+# ---- Удаление самого SkipIt Tool ----
+# Два режима: убрать только инструмент или вместе с тем, что он ставил.
+# SSH и его правило UFW не трогаем ни в одном из режимов - остаться без доступа
+# к серверу хуже любого мусора в системе.
+menu_self_remove() {
+    local c hdr tab=$'\t' p n s
+    panel_installed 2>/dev/null && p=1 || p=0
+    node_installed  2>/dev/null && n=1 || n=0
+    sub_installed   2>/dev/null && s=1 || s=0
+
+    hdr="Компонент${tab}Состояние"
+    hdr+=$'\n'"Панель${tab}$( (( p )) && echo "$PANEL_DOMAIN" || echo "нет" )"
+    hdr+=$'\n'"Нода${tab}$( (( n )) && echo "$NODE_DOMAIN" || echo "нет" )"
+    hdr+=$'\n'"Страница подписки${tab}$( (( s )) && echo "$SUB_DOMAIN" || echo "нет" )"
+
+    c=$(ui_choose "Удаление SkipIt Tool" "$hdr
+
+Что убрать с сервера?" \
+        tool "Только SkipIt Tool — панель, нода и страница останутся работать" \
+        all  "SkipIt Tool и всё, что он ставил") || return
+    case $c in
+        tool) self_remove_tool ;;
+        all)  self_remove_all ;;
+    esac
+}
+
+# Уходит только инструмент: контейнеры, папки компонентов, сертификаты и правила
+# фаервола остаются как есть и продолжают работать сами по себе.
+self_remove_tool() {
+    ui_yesno "Только SkipIt Tool" "── Будет удалено
+Команда:      $SKIPIT_BIN
+Настройки:    $SKIPIT_ETC — записи о том, что и где установлено
+Автобэкап:    ежедневная задача cron
+
+── Останется работать
+Компоненты:   панель, нода и страница подписки — контейнеры и их папки
+Сеть:         сертификаты, правила UFW, настройки SSH и ядра
+Бэкапы:       $SKIPIT_BACKUPS
+
+ℹ Управлять компонентами дальше придётся руками: docker compose в их папках.
+ℹ Поставить SkipIt Tool заново можно в любой момент — он подхватит
+  установленное по файлам в /opt.
+
+Удалить SkipIt Tool?" no || return
+
+    clear; say "Удаляю SkipIt Tool..."
+    rm -f "$PANEL_BACKUP_CRON"
+    rm -rf "$SKIPIT_ETC"
+    rm -f "$SKIPIT_UPDATE_LATEST"
+    log "self remove: только инструмент"
+    rm -f "$SKIPIT_BIN"
+    echo
+    say "SkipIt Tool удалён — компоненты работают дальше."
+    say "Бэкапы остались: $SKIPIT_BACKUPS"
+    pause
+    clear
+    exit 0
+}
+
+# Уходит всё, что ставил SkipIt Tool. Настройки SSH, ядра и fail2ban не трогаем:
+# это общесистемная настройка сервера, её откат - отдельное осознанное действие,
+# а снос вслепую может оставить сервер без доступа.
+self_remove_all() {
+    local p n s del_cert=0 bak
+    panel_installed 2>/dev/null && p=1 || p=0
+    node_installed  2>/dev/null && n=1 || n=0
+    sub_installed   2>/dev/null && s=1 || s=0
+
+    ui_yesno "Удалить всё" "── Будет удалено
+$( (( p )) && printf 'Панель:       %s вместе с базой\n' "$PANEL_DOMAIN" )$( (( n )) && printf 'Нода:         %s, Xray и сайт-заглушка\n' "$NODE_DOMAIN" )$( (( s )) && printf 'Подписка:     %s\n' "$SUB_DOMAIN" )Папки:        $PANEL_DIR$( (( n )) && printf ', %s' "$NODE_DIR" )
+Фаервол:      правила SkipIt Tool, кроме SSH
+Команда:      $SKIPIT_BIN и настройки $SKIPIT_ETC
+
+── Останется
+Доступ:       SSH и его правило UFW — их не трогаем
+Система:      настройки ядра, fail2ban и sshd остаются как есть
+Бэкапы:       $SKIPIT_BACKUPS
+Сертификаты:  спрошу отдельно
+
+! База панели уйдёт вместе с томом: пользователи, ноды и секреты.
+  Вернуть их можно будет только из бэкапа.
+
+Удалить всё?" no || return
+
+    if (( p )); then
+        ui_yesno "Ещё раз про базу" "Это снесёт базу панели $PANEL_DOMAIN целиком.
+После запуска отменить будет нельзя.
+
+Перед удалением сделаю дамп в $SKIPIT_BACKUPS — он останется на диске.
+
+Продолжить?" no || return
+    fi
+
+    ui_yesno "Сертификаты" "Удалить сертификаты Let's Encrypt этих доменов?
+
+Если домены ещё понадобятся — оставьте: перевыпуск ограничен лимитами
+Let's Encrypt (5 повторов в неделю на один набор имён)." no && del_cert=1
+
+    clear; say "Удаляю всё, что ставил SkipIt Tool..."
+
+    # Дамп базы напоследок: он переживёт удаление и останется в бэкапах
+    if (( p )); then
+        bak="${SKIPIT_BACKUPS}/panel-db-before-remove-$(date +%Y%m%d-%H%M%S).sql.gz"
+        mkdir -p "$SKIPIT_BACKUPS"
+        if panel_dump_db "$bak" 2>/dev/null; then
+            say "Дамп базы: $bak"
+        else
+            say "Дамп базы сделать не удалось — база уже не отвечает."
+            bak=""
+        fi
+    fi
+
+    # Нода: контейнеры, папка, её правила фаервола
+    if (( n )); then
+        say "Нода $NODE_DOMAIN..."
+        [[ -f $NODE_COMPOSE ]] && node_compose_run down --remove-orphans >/dev/null 2>&1
+        node_ufw_remove "$NODE_PANEL_IP" "$NODE_PORT"
+        node_ufw_close_balancer
+        rm -rf "$NODE_DIR"
+        (( del_cert )) && [[ -n $NODE_CERT_NAME ]] &&
+            certbot delete --non-interactive --cert-name "$NODE_CERT_NAME" >/dev/null 2>&1
+        find "$NODE_WEBROOT" -mindepth 1 -delete 2>/dev/null
+    fi
+
+    # Панель со страницей подписки: контейнеры, тома, папка
+    if (( p )); then
+        say "Панель $PANEL_DOMAIN..."
+        [[ -f $PANEL_COMPOSE ]] && panel_compose_run down -v --remove-orphans >/dev/null 2>&1
+        docker volume rm remnawave-db-data valkey-socket >/dev/null 2>&1
+        rm -rf "$PANEL_DIR"
+        (( del_cert )) && [[ -n $PANEL_CERT_NAME ]] &&
+            certbot delete --non-interactive --cert-name "$PANEL_CERT_NAME" >/dev/null 2>&1
+    fi
+    # Страница подписки своей папкой - только когда стоит отдельно от панели
+    if (( s )) && [[ ${SUB_BUNDLED:-0} != 1 && -n ${SUB_DIR:-} && -d $SUB_DIR ]]; then
+        say "Страница подписки $SUB_DOMAIN..."
+        [[ -f $SUB_COMPOSE ]] && sub_compose_run down --remove-orphans >/dev/null 2>&1
+        rm -rf "$SUB_DIR"
+    fi
+
+    docker network rm remnawave-network >/dev/null 2>&1
+
+    # Фаервол: снимаем 443, SSH не трогаем ни при каких условиях
+    if command -v ufw >/dev/null 2>&1; then
+        ufwc --force delete allow 443/tcp >/dev/null 2>&1
+    fi
+
+    rm -f "$PANEL_BACKUP_CRON"
+    rm -rf "$SKIPIT_ETC"
+    rm -f "$SKIPIT_UPDATE_LATEST"
+    log "self remove: всё (панель=$p нода=$n подписка=$s серты=$del_cert)"
+    rm -f "$SKIPIT_BIN"
+
+    echo
+    say "Удалено. SSH и правило UFW на порт SSH оставлены нетронутыми."
+    [[ -n ${bak:-} ]] && say "Дамп базы на диске: $bak"
+    say "Бэкапы и архивы: $SKIPIT_BACKUPS"
+    say "Настройки ядра, sshd и fail2ban остались — если они больше не нужны, уберите их вручную."
+    pause
+    clear
+    exit 0
+}
+
 menu_about() {
     ui_dims
     { clear; ui_banner; echo; } >"$TTY"
@@ -9727,6 +10615,7 @@ fail2ban:   $(f2b_state_ru)
             clean   "Очистка диска" \
             ""      "SkipIt Tool" \
             update  "Обновить SkipIt Tool${upd:+ — доступна v$upd}" \
+            selfrm  "Удаление SkipIt Tool" \
             about   "О программе")
         rc=$?
         UI_CANCEL="Назад"; UI_FOOTER=""; UI_BANNER=0
@@ -9747,6 +10636,7 @@ fail2ban:   $(f2b_state_ru)
             clean)   sys_disk_clean ;;
             update) menu_update ;;
             about)  menu_about ;;
+            selfrm) menu_self_remove ;;
         esac
     done
 }
