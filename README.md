@@ -12,12 +12,16 @@
 
 <br>
 
-[![OS Support](https://img.shields.io/badge/OS-Debian%20%7C%20Ubuntu-6f42c1?style=for-the-badge&logo=linux&logoColor=white)](#-системные-требования)
-[![Core Engine](https://img.shields.io/badge/Engine-Remnawave%20%2B%20Xray-007acc?style=for-the-badge&logo=docker&logoColor=white)](#-компоненты-remnawave)
-[![Status](https://img.shields.io/badge/Status-Alpha-ff9900?style=for-the-badge)](#-о-проекте)
-[![License](https://img.shields.io/badge/License-MIT-28a745?style=for-the-badge)](LICENSE)
+[![version](https://img.shields.io/github/v/release/FrI3nd7/skipit-vps-node?include_prereleases&sort=semver&style=for-the-badge&label=version&labelColor=010409&color=0087FF&logo=github&logoColor=white)](https://github.com/FrI3nd7/skipit-vps-node/releases/latest)
+[![status](https://img.shields.io/badge/alpha-D29922?style=for-the-badge&label=status&labelColor=010409&logo=rocket&logoColor=white)](#-о-проекте)
+[![license](https://img.shields.io/github/license/FrI3nd7/skipit-vps-node?style=for-the-badge&label=license&labelColor=010409&color=3FB950&logo=opensourceinitiative&logoColor=white)](LICENSE)
+
+[![os](https://img.shields.io/badge/Debian%2012%20%C2%B7%20Ubuntu%2024.04-161B22?style=for-the-badge&label=os&labelColor=010409&logo=debian&logoColor=D70A53)](#-системные-требования)
+[![engine](https://img.shields.io/badge/Remnawave%20%2B%20Xray-161B22?style=for-the-badge&label=engine&labelColor=010409&logo=docker&logoColor=2496ED)](#-компоненты-remnawave)
+[![tls](https://img.shields.io/badge/Let's%20Encrypt%20%C2%B7%20Cloudflare-161B22?style=for-the-badge&label=tls&labelColor=010409&logo=letsencrypt&logoColor=F5A623)](#-как-три-компонента-делят-один-порт)
 
 </div>
+
 
 ---
 
