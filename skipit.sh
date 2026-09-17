@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.1.1a"
+SKIPIT_VERSION="1.1.2a"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -612,7 +612,7 @@ C_RESET=$'\e[0m'
 if (( $(tput colors 2>/dev/null || echo 8) >= 256 )) || [[ ${COLORTERM:-} == *color* || ${TERM:-} == *256* ]]; then
     C_BRAND=$'\e[1;38;5;33m'  # SkipIt Tool - синий логотипа (#0087ff)
     C_ACC=$'\e[1;38;5;74m'    # номера, приглашение
-    C_KEY=$'\e[38;5;74m'      # клавиши в подсказках
+    C_KEY=$'\e[1;38;5;79m'    # клавиши в подсказках - мятный, в тон значениям
     C_TXT=$'\e[38;5;252m'     # основной текст
     C_OK=$'\e[1;38;5;72m'     # значения
     C_ERR=$'\e[1;38;5;167m'
@@ -621,12 +621,14 @@ if (( $(tput colors 2>/dev/null || echo 8) >= 256 )) || [[ ${COLORTERM:-} == *co
     C_NOTE=$'\e[38;5;110m'    # пояснения
     C_BADGE=$'\e[1;38;5;234;48;5;179m' # плашка «i» у пояснений
     C_SECTION=$'\e[1;38;5;255;48;5;60m' # плашка названия раздела
-    C_HINT=$'\e[38;5;246m'    # подсказки внизу экрана
+    C_HINT=$'\e[38;5;250m'    # подсказки внизу экрана
     C_DIM=$'\e[38;5;60m'      # линии и разделители
+    C_SEP=$'\e[38;5;242m'     # точки-разделители в подсказках
+    C_QST=$'\e[1;38;5;255m'   # строка вопроса «▸ …» - белым, синий на тёмном фоне не читается
 else
-    C_BRAND=$'\e[1;34m'; C_ACC=$'\e[1;36m'; C_KEY=$'\e[36m'; C_TXT=$'\e[97m'
+    C_BRAND=$'\e[1;34m'; C_ACC=$'\e[1;36m'; C_KEY=$'\e[1;92m'; C_TXT=$'\e[97m'; C_QST=$'\e[1;97m'
     C_OK=$'\e[1;32m'; C_ERR=$'\e[1;31m'; C_WARN=$'\e[1;33m'; C_LABEL=$'\e[37m'; C_NOTE=$'\e[96m'
-    C_HINT=$'\e[37m'; C_DIM=$'\e[90m'; C_BADGE=$'\e[1;30;43m'; C_SECTION=$'\e[1;97;44m'
+    C_HINT=$'\e[37m'; C_DIM=$'\e[90m'; C_SEP=$'\e[90m'; C_BADGE=$'\e[1;30;43m'; C_SECTION=$'\e[1;97;44m'
 fi
 C_GRAY=$C_HINT
 TTY=/dev/tty
@@ -763,7 +765,7 @@ ui_keys() {
         else
             out+="$sep$C_HINT$part$C_RESET"
         fi
-        sep="$C_DIM · $C_RESET"
+        sep="$C_SEP · $C_RESET"
     done
     printf '%s' "$out"
 }
@@ -845,12 +847,12 @@ ui_field() { # текст [yesno]
     while [[ $body == *$'\n' ]]; do body=${body%$'\n'}; done
     if [[ $last == *'?' && -n ${last//[[:space:]]/} && $last != ' '* ]]; then
         [[ -n $body ]] && { ui_body "$body"; echo >"$TTY"; }
-        printf '  %s▸%s %s%s%s\n' "$C_ACC" "$C_RESET" "$C_BRAND" "$last" "$C_RESET" >"$TTY"
+        printf '  %s▸%s %s%s%s\n' "$C_ACC" "$C_RESET" "$C_QST" "$last" "$C_RESET" >"$TTY"
     elif [[ $last == *: ]]; then
         field=${last%:}
         if [[ $field =~ ^(.+)[[:space:]]\((.+)\)$ ]]; then field=${BASH_REMATCH[1]}; note=${BASH_REMATCH[2]}; fi
         [[ -n $body ]] && { ui_body "$body"; echo >"$TTY"; }
-        printf '  %s▸%s %s%s%s\n' "$C_ACC" "$C_RESET" "$C_BRAND" "$field" "$C_RESET" >"$TTY"
+        printf '  %s▸%s %s%s%s\n' "$C_ACC" "$C_RESET" "$C_QST" "$field" "$C_RESET" >"$TTY"
         [[ -n $note ]] && g_note "$note"
     else
         ui_body "$text"
