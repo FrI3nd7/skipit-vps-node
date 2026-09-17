@@ -4152,7 +4152,7 @@ g_steps() { # шаг ...
     g_flush
     for s in "$@"; do
         G_STEP=$((G_STEP + 1))
-        s=${s//«/$C_BRAND«}; s=${s//»/»$C_RESET$C_TXT}
+        s=${s//«/$C_QST«}; s=${s//»/»$C_RESET$C_TXT}
         s=${s//⟦/$C_OK}; s=${s//⟧/$C_RESET$C_TXT}
         printf '   %s%d.%s %s%s%s\n' "$C_ACC" "$G_STEP" "$C_RESET" "$C_TXT" "$s" "$C_RESET" >"$TTY"
     done
@@ -4168,8 +4168,8 @@ g_path() {
     local rest=${1%.} part out=""
     while [[ -n $rest ]]; do
         part=${rest%% → *}; [[ $part == "$rest" ]] && rest="" || rest=${rest#* → }
-        if [[ -n $rest ]]; then out+="$C_KEY$part$C_RESET $C_DIM›$C_RESET "
-        else out+="$C_BRAND$part$C_RESET"; fi
+        if [[ -n $rest ]]; then out+="$C_KEY$part$C_RESET $C_SEP›$C_RESET "
+        else out+="$C_QST$part$C_RESET"; fi
     done
     g_flush; printf '  %s▸%s %s\n' "$C_ACC" "$C_RESET" "$out" >"$TTY"
 }
