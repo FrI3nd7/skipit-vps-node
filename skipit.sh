@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.1.2a"
+SKIPIT_VERSION="1.1.3a"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -28,6 +28,7 @@ NODE_ENV="${NODE_DIR}/.env"
 NODE_NGINX="${NODE_DIR}/nginx.conf"
 NODE_STATE="${SKIPIT_ETC}/node.conf"
 F2B_STATE="${SKIPIT_ETC}/fail2ban.conf"
+TZ_STATE="${SKIPIT_ETC}/timezone.conf"
 NODE_WEBROOT="/var/www/html"
 # Сокет «Xray → заглушка»: своя папка ноды, смонтированная в оба контейнера как /skipit
 NODE_SOCK_DIR="/skipit"                       # путь внутри контейнеров
@@ -522,6 +523,253 @@ SSH-сессия оборвётся, сервер будет недоступе�
     else
         pause
     fi
+}
+
+# ==== Часовой пояс сервера ====
+# По времени сервера пишутся журналы, ночная перезагрузка автообновлений и бэкапы
+# панели по расписанию. В чужом поясе всё это читается неудобно, поэтому пояс
+# спрашиваем один раз - при установке команды, дальше меняется из меню.
+# Контейнеры Remnawave живут в UTC (TZ=UTC в docker-compose) и пояса хоста не видят.
+
+# Пара "пояс" "город" - что предлагаем на первом экране, без поиска
+TZ_POPULAR=(
+    Europe/Moscow      "Москва"
+    UTC                "всемирное время"
+    Europe/Minsk       "Минск"
+    Asia/Almaty        "Алматы"
+    Asia/Yekaterinburg "Екатеринбург"
+    Europe/Berlin      "Берлин, Амстердам, Париж"
+    Europe/Warsaw      "Варшава"
+    Europe/London      "Лондон"
+)
+
+# Действующий пояс: сначала systemd, потом файлы - в контейнерах timedatectl нет
+tz_current() {
+    local tz l
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+    [[ -n $tz ]] || tz=$(cat /etc/timezone 2>/dev/null)
+    if [[ -z $tz ]]; then
+        l=$(readlink -f /etc/localtime 2>/dev/null)
+        [[ $l == */zoneinfo/* ]] && tz=${l#*/zoneinfo/}
+    fi
+    echo "${tz:-UTC}"
+}
+
+tz_time()  { TZ="$1" date '+%H:%M' 2>/dev/null; }          # 14:32 в этом поясе
+tz_off()   { # +0330 → UTC+3:30
+    local s=${1:0:1} h m
+    [[ $1 =~ ^[+-][0-9]{4}$ ]] || { printf 'UTC'; return; }
+    h=$((10#${1:1:2})); m=$((10#${1:3:2}))
+    (( h == 0 && m == 0 )) && { printf 'UTC'; return; }
+    if (( m )); then printf 'UTC%s%d:%02d' "$s" "$h" "$m"; else printf 'UTC%s%d' "$s" "$h"; fi
+}
+tz_label() { printf '%s · %s' "$(tz_time "$1")" "$(tz_off "$(TZ="$1" date '+%z' 2>/dev/null)")"; }
+
+# Пояс существует? Имя идёт в путь /usr/share/zoneinfo, поэтому ".." отсекаем
+# отдельно: точка сама по себе в именах поясов допустима.
+tz_valid() {
+    local tz=$1
+    [[ -n $tz && $tz != *..* ]] || return 1
+    [[ $tz =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ ]] || return 1
+    [[ -f /usr/share/zoneinfo/$tz ]]
+}
+
+tz_list() {
+    local out
+    out=$(timedatectl list-timezones 2>/dev/null)
+    [[ -n $out ]] || out=$( { echo UTC; awk '$0 !~ /^#/ && NF >= 3 { print $3 }' /usr/share/zoneinfo/zone.tab 2>/dev/null; } | sort -u)
+    printf '%s\n' "$out"
+}
+
+# База поясов: без неё выбирать не из чего. Ставим молча - вопрос и так задан.
+tz_ensure_data() {
+    [[ -d /usr/share/zoneinfo ]] && return 0
+    [[ -n $PM ]] || return 1
+    pkg_install tzdata >/dev/null 2>&1
+    [[ -d /usr/share/zoneinfo ]]
+}
+
+# Пояс по IP сервера: две площадки, обе без ключа и с коротким таймаутом.
+# Это только подсказка в меню - пояс всё равно выбирает человек.
+tz_by_ip() {
+    local u tz
+    for u in https://ipapi.co/timezone 'http://ip-api.com/line/?fields=timezone'; do
+        tz=$(curl -4 -fsS --max-time 4 "$u" 2>/dev/null)
+        tz=${tz//[[:space:]]/}
+        tz_valid "$tz" && { printf '%s' "$tz"; return 0; }
+    done
+    return 1
+}
+
+# Состояние: спрашивали пояс или нет. Пустой аргумент - установка прошла без
+# терминала, вопрос переносим на первый запуск меню.
+tz_state_save() { # [пояс]
+    if [[ -n ${1:-} ]]; then
+        printf '# SkipIt Tool — часовой пояс\nTZ_ASKED=1\nTZ_SET=%s\n' "$1" > "$TZ_STATE" 2>/dev/null
+    else
+        printf '# SkipIt Tool — часовой пояс\nTZ_ASKED=0\n' > "$TZ_STATE" 2>/dev/null
+    fi
+    chmod 600 "$TZ_STATE" 2>/dev/null
+}
+
+tz_apply() { # пояс
+    local tz=$1
+    tz_valid "$tz" || return 1
+    command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$tz" 2>/dev/null
+    if [[ $(tz_current) != "$tz" ]]; then
+        # Контейнеры и системы без systemd: те же два файла, только руками
+        [[ -f /etc/localtime || -L /etc/localtime ]] && backup_file /etc/localtime >/dev/null 2>&1
+        ln -sfn "/usr/share/zoneinfo/$tz" /etc/localtime 2>/dev/null
+        [[ -f /etc/timezone || $PM == apt ]] && echo "$tz" > /etc/timezone 2>/dev/null
+    fi
+    [[ $(tz_current) == "$tz" ]] || return 1
+    log "timezone: $tz"
+    return 0
+}
+
+# Поиск по названию города: принимает и "Madrid", и "Europe/Madrid"
+tz_search() { # → stdout: пояс
+    local q hits=() args=() tz err=""
+    while :; do
+        q=$(ui_input "Поиск часового пояса" "Название города латиницей — Madrid, New York, Belgrade.
+Можно сразу пояс целиком: Europe/Madrid.${err:+
+
+✗ $err}
+
+Город (латиницей):") || return 1
+        q=${q#"${q%%[![:space:]]*}"}; q=${q%"${q##*[![:space:]]}"}; q=${q//[[:space:]]/_}
+        [[ -n $q ]] || return 1
+        mapfile -t hits < <(tz_list | grep -iF -- "$q")
+        if (( ${#hits[@]} == 0 )); then err="ничего не нашлось: «${q//_/ }»"; continue; fi
+        if (( ${#hits[@]} == 1 )); then printf '%s' "${hits[0]}"; return 0; fi
+        if (( ${#hits[@]} > 30 )); then err="нашлось ${#hits[@]} поясов — уточните запрос"; continue; fi
+        args=()
+        for tz in "${hits[@]}"; do args+=("$tz" "$tz · $(tz_time "$tz")"); done
+        tz=$(ui_choose "Часовой пояс" "Нашлось ${#hits[@]} — выберите нужный:" "${args[@]}") || { err=""; continue; }
+        printf '%s' "$tz"
+        return 0
+    done
+}
+
+tz_pick() { # заголовок текст → stdout: выбранный пояс
+    local title=$1 text=$2 cur geo tz name i items old_cancel=$UI_CANCEL
+    cur=$(tz_current)
+    ui_loading "Определяю часовой пояс по IP сервера…"
+    geo=$(tz_by_ip) || geo=""
+    [[ $geo == "$cur" ]] && geo=""
+    while :; do
+        items=("" "Часто выбирают")
+        [[ -n $geo ]] && items+=("$geo" "$geo — по IP сервера · $(tz_time "$geo")")
+        for ((i = 0; i < ${#TZ_POPULAR[@]}; i += 2)); do
+            tz=${TZ_POPULAR[i]}; name=${TZ_POPULAR[i + 1]}
+            [[ $tz == "$cur" || $tz == "$geo" ]] && continue
+            items+=("$tz" "$name — $tz · $(tz_time "$tz")")
+        done
+        items+=("" "Другой город" search "Найти по названию — например Madrid или New York")
+        UI_CANCEL="Оставить как есть"
+        tz=$(ui_menu "$title" "$text" "${items[@]}")
+        UI_CANCEL=$old_cancel
+        [[ -n $tz ]] || return 1
+        if [[ $tz == search ]]; then
+            tz=$(tz_search) || continue
+        fi
+        printf '%s' "$tz"
+        return 0
+    done
+}
+
+# Смена пояса из меню
+tz_change() {
+    local cur tz
+    tz_ensure_data || { ui_msg "Часовой пояс" "На сервере нет базы часовых поясов (tzdata), и установить её не вышло."; return; }
+    cur=$(tz_current)
+    tz=$(tz_pick "Часовой пояс" "Сейчас на сервере: $cur · $(tz_label "$cur")
+
+Какой часовой пояс поставить?") || return
+    if [[ $tz == "$cur" ]]; then
+        ui_msg "Часовой пояс" "На сервере уже $cur — ничего не меняю."
+        return
+    fi
+    if tz_apply "$tz"; then
+        tz_state_save "$tz"
+        ui_msg "Готово" "Пояс:    $tz
+Время:   $(date '+%H:%M · %d.%m.%Y')
+
+ℹ Новое время сразу увидят journalctl, cron и новые записи в журнале SkipIt Tool.
+   Программы, которые уже запущены, возьмут пояс после перезапуска.
+   Контейнеры Remnawave специально живут в UTC — у них время не меняется."
+    else
+        ui_msg "Не получилось" "Не удалось поставить пояс $tz — на сервере остался $cur.
+
+Попробуйте вручную: timedatectl set-timezone $tz"
+    fi
+}
+
+# Вопрос про пояс - один раз, при установке команды.
+#   tz_first_run          - ставим команду прямо сейчас
+#   tz_first_run pending  - обычный запуск: спрашиваем, только если при установке
+#                           не было терминала (curl | bash из другого скрипта).
+# Серверы, где SkipIt Tool стоял до этой версии, файла состояния не имеют и
+# вопроса не увидят: пояс там меняется из меню «Часовой пояс».
+tz_first_run() { # [pending]
+    if [[ -f $TZ_STATE ]]; then
+        grep -q '^TZ_ASKED=0' "$TZ_STATE" 2>/dev/null || return 0
+    elif [[ ${1:-} == pending ]]; then
+        return 0
+    fi
+    { : >"$TTY"; } 2>/dev/null || { tz_state_save; return 0; }
+    tz_ensure_data || return 0
+    local cur tz
+    cur=$(tz_current)
+    tz=$(tz_pick "Часовой пояс сервера" "Сейчас на сервере: $cur · $(tz_label "$cur")
+
+По времени сервера пишутся журналы, ночные автообновления и бэкапы панели.
+Удобнее, когда оно совпадает с вашим — поменять можно потом в меню «Часовой пояс».
+
+Какой часовой пояс поставить?") || { tz_state_save "$cur"; return 0; }
+    if [[ $tz == "$cur" ]] || tz_apply "$tz"; then
+        tz_state_save "$tz"
+        clear >"$TTY"
+        say "Часовой пояс сервера: ${C_OK}${tz}${C_RESET} · $(tz_label "$tz")"
+    else
+        tz_state_save "$cur"
+        clear >"$TTY"
+        say "Не удалось поставить пояс $tz — оставил $cur. Поменять можно в меню «Часовой пояс»."
+    fi
+}
+
+menu_timezone() {
+    local c cur ntp items tab=$'\t'
+    while :; do
+        cur=$(tz_current)
+        items=(set "Сменить часовой пояс")
+        case $(timedatectl show -p NTPSynchronized --value 2>/dev/null) in
+            yes) ntp="время синхронизировано" ;;
+            no)  ntp="время НЕ синхронизировано — ломается TLS и REALITY"
+                 items+=(ntp "Включить синхронизацию времени") ;;
+            *)   ntp="проверить не удалось" ;;
+        esac
+        c=$(ui_menu "Часовой пояс" "Компонент${tab}Состояние
+Пояс${tab}$cur
+Время сервера${tab}$(date '+%H:%M · %d.%m.%Y')
+Смещение${tab}$(tz_off "$(date '+%z')")
+Синхронизация${tab}$ntp
+
+ℹ По времени сервера пишутся журналы, ночные автообновления и бэкапы панели.
+   Контейнеры Remnawave живут в UTC — их время от пояса сервера не зависит." \
+            "${items[@]}") || return
+        case $c in
+            set) tz_change ;;
+            ntp)
+                if timedatectl set-ntp true 2>/dev/null; then
+                    ui_msg "Готово" "Синхронизация времени включена — сервер подтянет точное время сам за минуту."
+                else
+                    ui_msg "Не получилось" "Не удалось включить синхронизацию: на сервере нет systemd-timesyncd или chrony.
+
+Поставьте вручную: apt install systemd-timesyncd"
+                fi ;;
+        esac
+    done
 }
 
 bootstrap_deps() {
@@ -1023,14 +1271,137 @@ sshd_eff() { # ключ → действующее значение
     sshd_dump | awk -v k="${1,,}" '$1==k { $1=""; sub(/^ /, ""); print; exit }'
 }
 
+# Порты SSH берутся из трёх источников, и они расходятся: директива Port,
+# ListenAddress с явно указанным портом (он сильнее Port) и то, что демон
+# слушает прямо сейчас. Раньше читалась только Port - и при строке вида
+# «ListenAddress 0.0.0.0:22» скрипт считал 22 закрытым, хотя sshd продолжал его
+# слушать: в меню значился новый порт, правило UFW для 22 удалялось, а зайти по
+# 22 по-прежнему было можно.
+
+# Ubuntu 22.10+ принимает SSH через ssh.socket: порт там задаётся в ListenStream=,
+# а Port в sshd_config не работает вовсе. Без своего drop-in смена порта на таких
+# системах молча не срабатывала - скрипт показывал новый порт, сервер продолжал
+# слушать старый, и по нему спокойно пускало.
+SSH_SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/00-skipit.conf"
+
+ssh_socket_used() {
+    [[ -d /run/systemd/system ]] || return 1
+    systemctl is-enabled --quiet ssh.socket 2>/dev/null
+}
+
+# Порты, которые слушает сам сокет
+ssh_socket_ports() {
+    ssh_socket_used || return 0
+    systemctl show ssh.socket -p Listen --value 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { n = split($i, a, ":"); print a[n] } }' |
+        sort -un | xargs
+}
+
+# Свой drop-in для ssh.socket; без аргументов - убрать его.
+# Пишется внутри транзакции: при откате конфига файл вернётся или исчезнет.
+ssh_socket_write() { # [порт ...]
+    local p
+    tx_add "$SSH_SOCKET_DROPIN"
+    if (( $# == 0 )); then
+        rm -f "$SSH_SOCKET_DROPIN"
+        rmdir "${SSH_SOCKET_DROPIN%/*}" 2>/dev/null
+    else
+        mkdir -p "${SSH_SOCKET_DROPIN%/*}"
+        { printf '# Управляется SkipIt Tool\n[Socket]\nListenStream=\n'
+          for p in "$@"; do printf 'ListenStream=%s\n' "$p"; done; } > "$SSH_SOCKET_DROPIN"
+    fi
+    systemctl daemon-reload 2>/dev/null
+    return 0
+}
+
+# Порты, прибитые строками ListenAddress (только те, где порт указан явно).
+# Формы: 1.2.3.4:22, [::]:22, [2a0d::1]:22 - и без порта: 1.2.3.4, ::1
+ssh_la_awk() { # разбор строк listenaddress из дампа sshd -T
+    awk '$1 == "listenaddress" {
+            $1 = ""; sub(/^ /, ""); sub(/ rdomain .*/, "")
+            if (match($0, /:[0-9]+$/)) {
+                p = substr($0, RSTART + 1); r = substr($0, 1, RSTART - 1)
+                if (r ~ /^\[.*\]$/ || r !~ /:/) { print p; next }
+            }
+            print "-"          # ListenAddress без порта: на нём работает Port
+        }'
+}
+
+ssh_la_ports() { # [дамп sshd -T]
+    { [[ -n ${1:-} ]] && printf '%s\n' "$1" || sshd_dump; } |
+        ssh_la_awk | grep -E '^[0-9]+$' | sort -un | xargs
+}
+
+# То же, но по самим файлам конфига. sshd -T печатает listenaddress всегда, даже
+# когда своих строк нет (это его развёрнутые умолчания), - спрашивать по нему
+# «убрать ваши ListenAddress?» значило бы спрашивать про несуществующее.
+ssh_la_conf_ports() {
+    cat "$SSHD_MAIN" "$SSHD_DROPIN_DIR"/*.conf 2>/dev/null |
+        awk 'tolower($1)=="listenaddress"{ print "listenaddress", $2 }' |
+        ssh_la_awk | grep -E '^[0-9]+$' | sort -un | xargs
+}
+
+# Порты по конфигу. ListenAddress с портом перебивает Port; сама Port действует,
+# только если такой строки нет или есть ListenAddress без порта.
+ssh_cfg_ports() {
+    local dump la la_port port plain=0 sp
+    # Сокет-активация: порт задан в ssh.socket, sshd_config тут ни при чём
+    sp=$(ssh_socket_ports)
+    [[ -n $sp ]] && { echo "$sp"; return; }
+    dump=$(sshd_dump)
+    if [[ -z $dump ]]; then
+        # sshd -T не отработал - читаем файлы, как раньше
+        port=$(cat "$SSHD_MAIN" "$SSHD_DROPIN_DIR"/*.conf 2>/dev/null |
+            awk 'tolower($1)=="port"{print $2}' | sort -un | xargs)
+        echo "${port:-22}"; return
+    fi
+    la=$(ssh_la_awk <<< "$dump")
+    la_port=$(grep -E '^[0-9]+$' <<< "$la" | sort -un | xargs)
+    grep -q '^-$' <<< "$la" && plain=1
+    port=$(awk '$1=="port"{print $2}' <<< "$dump" | sort -un | xargs)
+    { [[ -z $la_port ]] || (( plain )); } && printf '%s ' $port
+    printf '%s' "$la_port"
+    echo
+}
+
+# Порты, которые sshd слушает прямо сейчас
+ssh_live_ports() {
+    ss -Htlnp 2>/dev/null |
+        awk '/"sshd"/ { n = split($4, a, ":"); if (a[n] ~ /^[0-9]+$/) print a[n] }' |
+        sort -un | xargs
+}
+
+# Всё, по чему до SSH реально можно достучаться: конфиг плюс живые сокеты.
+# Правила UFW открываются именно по этому списку - чтобы расхождение конфига с
+# демоном не оставило сервер без входа.
 ssh_ports() {
     local p
-    p=$(sshd_dump | awk '$1=="port"{print $2}' | sort -un | xargs)
-    if [[ -z $p ]]; then
-        p=$(cat "$SSHD_MAIN" "$SSHD_DROPIN_DIR"/*.conf 2>/dev/null |
-            awk 'tolower($1)=="port"{print $2}' | sort -un | xargs)
-    fi
+    p=$({ ssh_cfg_ports; ssh_live_ports; } | tr ' ' '\n' |
+        grep -E '^[0-9]{1,5}$' | sort -un | xargs)
     echo "${p:-22}"
+}
+
+# Порты SSH для экранов: у порта, который демон держит, но UFW наружу не пускает,
+# так и написано. Иначе строка «SSH-порт: 22, 57833» после закрытия 22 в UFW
+# выглядит как «правило не сработало», хотя снаружи порт уже закрыт.
+ssh_ports_ru() {
+    local p out="" allowed on=0
+    ufw_active && { on=1; allowed=$(ufw_allowed); }
+    for p in $(ssh_ports); do
+        if (( on )) && [[ $(ufw_port_scope "$p" tcp "$allowed") == "закрыт в UFW" ]]; then
+            out+=", $p (закрыт в UFW)"
+        else
+            out+=", $p"
+        fi
+    done
+    printf '%s' "${out#, }"
+}
+
+# Лишние порты: демон слушает, а по конфигу их быть не должно
+ssh_port_check_live() { # порт, который должен остаться → лишние
+    local want=$1 p out=""
+    for p in $(ssh_live_ports); do [[ $p == "$want" ]] || out+=" $p"; done
+    printf '%s' "${out# }"
 }
 
 ssh_first_port() { local p; p=$(ssh_ports); echo "${p%% *}"; }
@@ -1535,15 +1906,17 @@ $out"; return; fi
 
 # ---- Настройки SSH-сервера ----
 ssh_change_port() {
-    local cur new p busy
+    local cur new p busy hint
     cur=$(ssh_ports)
-    new=$(ui_input "Порт SSH" "Сейчас:  $cur
+    hint=""
+    (( $(wc -w <<< "$cur") > 1 )) && hint=$'\n\n! Сейчас sshd слушает несколько портов — прошлая смена не завершена.\n  Введите тот, который нужно оставить: остальные закроются.'
+    new=$(ui_input "Порт SSH" "Сейчас:  $(ssh_ports_ru)
 UFW:     $(ufw_active && echo "новый порт откроется автоматически" || echo "не включён")
 
 ── Занятые порты
 $(ports_used_table)
 
-Старый порт закроется только после того, как вы проверите вход через новый.
+Старый порт закроется только после того, как вы проверите вход через новый.${hint}
 
 Новый порт SSH (от 1 до 65535):") || return
     new=${new//[[:space:]]/}
@@ -1561,6 +1934,21 @@ $(ports_used_table)
 Выберите другой порт для SSH."; return
     fi
 
+    # ListenAddress с портом сильнее директивы Port: пока такие строки есть,
+    # sshd останется на своих портах, а скрипт и UFW будут считать порт сменённым
+    local la fix_la=0
+    la=$(ssh_la_conf_ports)
+    if [[ -n $la ]]; then
+        ui_yesno "В конфиге есть ListenAddress" "Строки ListenAddress задают порт напрямую:  ${la// /, }
+
+Пока они там, директива Port не действует: sshd продолжит слушать эти порты,
+а SkipIt Tool и UFW будут считать, что порт уже сменился — по старому порту
+по-прежнему можно будет зайти.
+
+Закомментировать их (sshd будет слушать все адреса на порту $new)?" || return
+        fix_la=1
+    fi
+
     # Уже слушаем этот порт среди нескольких -> оставить только его
     if [[ " $cur " == *" $new "* ]]; then
         [[ $cur == "$new" ]] && { ui_msg "Порт SSH" "SSH уже работает на порту $new."; return; }
@@ -1570,7 +1958,10 @@ $(ports_used_table)
 Убедитесь, что подключение через порт $new работает!
 
 Закрыть остальные порты?" no || return
-        tx_begin; sshd_comment_everywhere port; sshd_write Port "$new"
+        tx_begin; sshd_comment_everywhere port
+        (( fix_la )) && sshd_comment_everywhere listenaddress
+        ssh_socket_used && ssh_socket_write "$new"
+        sshd_write Port "$new"
         sshd_commit || return
         ssh_after_port_close "$cur" "$new"
         return
@@ -1606,6 +1997,9 @@ $busy"; return
 
     tx_begin
     sshd_comment_everywhere port
+    (( fix_la )) && sshd_comment_everywhere listenaddress
+    # shellcheck disable=SC2086
+    ssh_socket_used && ssh_socket_write $cur "$new"
     # shellcheck disable=SC2086
     sshd_write Port $cur "$new"
     sshd_commit || return
@@ -1622,7 +2016,10 @@ $busy"; return
 Откройте новое окно терминала и подключитесь этой командой.
 
 Вход работает? Закрыть старый порт ($cur)?" no; then
-        tx_begin; sshd_comment_everywhere port; sshd_write Port "$new"
+        tx_begin; sshd_comment_everywhere port
+        (( fix_la )) && sshd_comment_everywhere listenaddress
+        ssh_socket_used && ssh_socket_write "$new"
+        sshd_write Port "$new"
         sshd_commit || return
         log "ssh port: only $new"
         f2b_sync
@@ -1635,16 +2032,32 @@ $busy"; return
 }
 
 ssh_after_port_close() { # старые_порты новый
-    local p msg="SSH теперь работает только на порту $2."
+    local p msg still skipped="" del=""
+    # Конфиг мы переписали, но верить ему нельзя: проверяем, что демон и правда
+    # отпустил старые порты. Правило UFW для порта, который всё ещё слушается,
+    # не трогаем - иначе закроем единственный работающий вход.
+    still=$(ssh_port_check_live "$2")
+    if [[ -n $still ]]; then
+        msg="! sshd всё ещё слушает:  ${still// /, }
+
+В конфиге остался только порт $2, но демон занял и другие. Обычно это строки
+ListenAddress с портом или сокет-активация systemd (ssh.socket).
+Посмотреть:  ss -tlnp | grep sshd"
+    else
+        msg="SSH теперь работает только на порту $2."
+    fi
     if ufw_active && ui_yesno "UFW" "Удалить правила UFW для старых портов SSH ($1)?"; then
         for p in $1; do
             [[ $p == "$2" ]] && continue
+            [[ " $still " == *" $p "* ]] && { skipped+=" $p"; continue; }
             ufwc --force delete allow "$p/tcp" >/dev/null 2>&1
             ufwc --force delete allow "$p/tcp" comment 'SSH (SkipIt)' >/dev/null 2>&1
             ufwc --force delete allow "$p" >/dev/null 2>&1
             [[ $p == 22 ]] && ufwc --force delete allow OpenSSH >/dev/null 2>&1
+            del+=" $p"
         done
-        msg+=$'\n'"Правила UFW для старых портов удалены."
+        [[ -n $del ]]     && msg+=$'\n\n'"Правила UFW удалены:  ${del# }"
+        [[ -n $skipped ]] && msg+=$'\n'"Оставлены (sshd их слушает):  ${skipped# }"
     fi
     ui_msg "Готово" "$msg"
 }
@@ -1731,6 +2144,7 @@ ssh_show_config() {
     out="── Подключение
 Порт:               $(_sv port)
 Адреса:             $(_sv listenaddress)
+Слушает сейчас:     $(ssh_live_ports | sed 's/ /, /g')
 
 ── Вход
 root по SSH:        $(_root "$(_sv permitrootlogin)")
@@ -1780,6 +2194,7 @@ ssh_reset() {
     for f in "$SSHD_MAIN" "$SSHD_DROPIN_DIR"/*.conf; do
         [[ -f $f ]] && grep -q '^#SkipIt# ' "$f" && { tx_add "$f"; sed -i 's/^#SkipIt# //' "$f"; }
     done
+    [[ -f $SSH_SOCKET_DROPIN ]] && ssh_socket_write
     ports=$(ssh_ports)
     if ufw_active; then
         for f in $ports; do ufwc allow "$f/tcp" comment 'SSH (SkipIt)' >/dev/null; done
@@ -1802,14 +2217,19 @@ ru_root() {
 yn_ru() { [[ $1 == yes ]] && echo "разрешён" || echo "запрещён"; }
 
 menu_ssh_server() {
-    local c ports root pass
+    local c ports live root pass hint
     while :; do
-        ports=$(ssh_ports)
+        ports=$(ssh_cfg_ports); live=$(ssh_live_ports)
         root=$(norm_sshd_val "$(sshd_eff permitrootlogin)")
         pass=$(sshd_eff passwordauthentication)
-        c=$(ui_menu "SSH-сервер" "Порт SSH:        ${ports// /, }
+        # Несколько портов - это незавершённая смена: старый ещё слушается.
+        # Правило UFW его закрывает снаружи, но в списках он остаётся - объясняем.
+        hint=""
+        (( $(wc -w <<< "${live:-$ports}") > 1 )) && hint=$'\n\n! Портов несколько — смена порта не завершена: старый ещё слушается.\n  Закрыть его: «Сменить порт SSH» → ввести тот, который нужно оставить.\n  Правило UFW закрывает порт только снаружи, sshd продолжает его держать.'
+        c=$(ui_menu "SSH-сервер" "Порт SSH:        $(ssh_ports_ru)$(
+            [[ -n $live && $live != "$ports" ]] && printf '\nСлушает сейчас:  %s  ← расходится с конфигом' "${live// /, }" )
 Вход root:       $(ru_root "$root")
-Вход по паролю:  $(yn_ru "$pass")
+Вход по паролю:  $(yn_ru "$pass")${hint}
 
 Изменения проверяются через sshd -t, при ошибке откатываются.
 Текущие подключения не разрываются." \
@@ -1837,7 +2257,7 @@ menu_users() {
         case $root in yes) root="разрешён" ;; no) root="запрещён" ;; prohibit-password|without-password) root="только по ключу" ;; esac
         case $pass in yes) pass="разрешён" ;; no) pass="запрещён" ;; esac
         c=$(ui_menu "SSH и пользователи" "Сервер:       $SERVER_IP
-SSH-порт:     $(ssh_ports)
+SSH-порт:     $(ssh_ports_ru)
 Вход root:    ${root:-—}
 По паролю:    ${pass:-—}" \
             accounts "Пользователи (создать, ключи, пароли, sudo)" \
@@ -2078,6 +2498,34 @@ ufw_port_covered() {
     return 1
 }
 
+# Что UFW думает про порт: открыт всем, открыт только с определённого адреса
+# или не открыт вовсе. Порт может слушаться и при этом быть закрытым снаружи -
+# в таблице занятых портов «все адреса» на такой порт вводило в заблуждение.
+# Список правил можно передать третьим аргументом, чтобы не звать ufw на каждый порт.
+ufw_port_scope() { # порт [протокол] [готовый вывод ufw_allowed]
+    local port=$1 proto=${2:-tcp} list=${3-} lport lproto lsrc item a b src="" any=0
+    local -a items
+    ufw_active || { echo "все адреса"; return; }
+    [[ -n $list ]] || list=$(ufw_allowed)
+    while IFS=$'\t' read -r lport lproto lsrc; do
+        [[ -n $lport ]] || continue
+        [[ -z $lproto || $lproto == "$proto" ]] || continue
+        IFS=, read -ra items <<< "$lport"
+        for item in "${items[@]}"; do
+            if [[ $item == *:* ]]; then
+                a=${item%%:*}; b=${item##*:}
+                (( port >= a && port <= b )) || continue
+            elif [[ $item != "$port" ]]; then
+                continue
+            fi
+            [[ -z $lsrc ]] && any=1 || src=$lsrc
+        done
+    done <<< "$list"
+    if (( any )); then echo "все адреса"
+    elif [[ -n $src ]]; then echo "только с $src"
+    else echo "закрыт в UFW"; fi
+}
+
 ufw_open_port() {
     local port proto src comment multi=0 out="" p
     local cmds=()
@@ -2156,7 +2604,8 @@ IP или подсеть (пусто — с любого адреса):") || ret
 
 ufw_close_port() {
     local rules=() items=() i sel p rule txt res item list="" out="" warn_ssh=0 warn_panel=0
-    local -a ports
+    local ssh_hit="" close_sshd=0 only_ssh=0
+    local -a ports keep=() drop=()
     mapfile -t rules < <(ufw_rules)
     if (( ${#rules[@]} == 0 )); then ui_msg "Закрыть порт" "ℹ Правил пока нет"; return; fi
     for i in "${!rules[@]}"; do
@@ -2171,15 +2620,29 @@ ufw_close_port() {
         ufw_rule_parse "$rule"
         IFS=, read -ra ports <<< "$R_PORT"
         for p in $(ssh_ports); do
-            for item in "${ports[@]}"; do [[ $item == "$p" ]] && warn_ssh=1; done
+            for item in "${ports[@]}"; do
+                [[ $item == "$p" ]] && { warn_ssh=1; [[ " $ssh_hit " == *" $p "* ]] || ssh_hit+=" $p"; }
+            done
         done
         [[ $R_COMMENT == SSH* || $rule == *OpenSSH* ]] && warn_ssh=1
         [[ $R_COMMENT == *"Remnawave panel"* ]] && warn_panel=1
     done
-    if (( warn_ssh || warn_panel )) && ufw_active; then
+    # Закрыть порт SSH в фаерволе и оставить его открытым у демона - полумера:
+    # снаружи не пускает, но порт живёт, светится в списках и ждёт, пока правило
+    # вернут. Поэтому закрываем и в sshd - но только если остаётся другой порт,
+    # иначе закрытие правила отрезало бы доступ к серверу совсем.
+    if [[ -n $ssh_hit ]]; then
+        for p in $(ssh_ports); do
+            if [[ " $ssh_hit " == *" $p "* ]]; then drop+=("$p"); else keep+=("$p"); fi
+        done
+        if (( ${#drop[@]} && ${#keep[@]} )); then close_sshd=1; else only_ssh=1; fi
+    fi
+    if (( close_sshd )) || { (( warn_ssh || warn_panel )) && ufw_active; }; then
         local text="Удалятся:"$'\n'"${list%$'\n'}"$'\n'
-        (( warn_ssh ))   && text+=$'\n'"! Удаляется правило SSH — можно потерять доступ к серверу"
-        (( warn_panel )) && text+=$'\n'"! Удаляется правило панели — нода потеряет связь с Remnawave"
+        (( close_sshd ))  && text+=$'\n'"! Порт SSH ${drop[*]} закроется и в sshd — останется только ${keep[*]}"
+        (( only_ssh ))    && text+=$'\n'"! Это единственный порт SSH — в sshd он останется, иначе доступ к серверу пропадёт"
+        (( warn_ssh ))    && text+=$'\n'"! Удаляется правило SSH — можно потерять доступ к серверу"
+        (( warn_panel ))  && text+=$'\n'"! Удаляется правило панели — нода потеряет связь с Remnawave"
         text+=$'\n\n'"Всё равно удалить?"
         ui_yesno "Удаление правил" "$text" no || return
     fi
@@ -2201,6 +2664,22 @@ ufw_close_port() {
         fi
     done
     log "ufw close: $(echo "$sel" | xargs)"
+
+    # Тот же порт - и у демона
+    if (( close_sshd )); then
+        tx_begin
+        sshd_comment_everywhere port
+        ssh_socket_used && ssh_socket_write "${keep[@]}"
+        sshd_write Port "${keep[@]}"
+        if sshd_commit; then
+            log "ssh port: closed ${drop[*]} together with ufw, left ${keep[*]}"
+            out+=$'\n'"✓ SSH больше не слушает ${drop[*]} — остался ${keep[*]}"
+        else
+            out+=$'\n'"✗ SSH: закрыть ${drop[*]} не вышло, конфиг откачен"
+        fi
+    elif (( only_ssh )); then
+        out+=$'\n'"ℹ В sshd порт ${ssh_hit# } оставлен: он единственный, иначе доступ к серверу пропал бы"
+    fi
     ui_msg "Закрыть порт" "${out%$'\n'}"
 }
 
@@ -2312,7 +2791,7 @@ menu_ufw() {
         fi
         c=$(ui_menu "Фаервол UFW" "Состояние:  $st
 Правил:     $(ufw_rules | wc -l)
-SSH-порт:   $(ssh_ports | sed 's/ /, /g')
+SSH-порт:   $(ssh_ports_ru)
 IPv6:       $([[ $(ufw_ipv6) == yes ]] && echo включён || echo отключён)" \
             ""       "Правила" \
             status   "Статус и список правил" \
@@ -2814,6 +3293,17 @@ node_write_env() { # SECRET_KEY
 # ---- Проверки ввода, DNS, порты ----
 valid_domain() { [[ ${#1} -le 253 && $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; }
 
+# Домен из формы: спрашиваем, пока не введут корректный. Пустой ответ - отмена.
+ask_domain() { # заголовок текст [значение] → stdout: домен
+    local d
+    while :; do
+        d=$(ui_input "$1" "$2" "${3:-}") || return 1
+        d=${d//[[:space:]]/}; d=${d,,}; d=${d%.}
+        valid_domain "$d" && { printf '%s' "$d"; return 0; }
+        ui_msg "Ошибка" "Некорректный домен: «$d»"
+    done
+}
+
 valid_ipv4() {
     local IFS=. o
     [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
@@ -2965,8 +3455,9 @@ port_node_reserved() { # порт
 
 # Таблица занятых TCP-портов: "Порт<TAB>Кто использует<TAB>Доступ"
 ports_used_table() {
-    local line addr port host name who
+    local line addr port host name who allowed
     local -A by_name by_scope
+    allowed=$(ufw_allowed)
     while IFS= read -r line; do
         addr=$(awk '{print $4}' <<< "$line")
         port=${addr##*:}; host=${addr%:*}
@@ -2982,7 +3473,8 @@ ports_used_table() {
         if [[ $host == 127.0.0.1 || $host == "[::1]" ]]; then
             [[ -z ${by_scope[$port]:-} ]] && by_scope[$port]="только локально"
         else
-            by_scope[$port]="все адреса"
+            # Слушается на всех адресах - но снаружи пускает только UFW
+            by_scope[$port]=$(ufw_port_scope "$port" tcp "$allowed")
         fi
     done < <(ss -Htlnp 2>/dev/null)
     if node_state_load; then
@@ -3630,6 +4122,8 @@ server_tokens off;
 # Запас под длинные и дополнительные домены: при стандартном размере корзины (обычно 64)
 # nginx не стартует с «could not build server_names_hash» на имени длиннее ~60 символов
 server_names_hash_bucket_size 128;
+
+$(nginx_gzip_conf)
 
 # Connection для проксирования: upgrade для WebSocket, close для обычных запросов.
 # Общий для всех server - пригодится и панели на этом же сервере.
@@ -4717,6 +5211,227 @@ node_done_screen() { # домен
     return 0
 }
 
+# ==== Мастер «всё на один сервер» ====
+# Панель, страница подписки и нода ставятся одним заходом: мастер задаёт все вопросы
+# заранее и складывает ответы сюда, а _panel_install и _node_install берут готовое и
+# ничего не переспрашивают. WZ_ON=0 - обычная установка по одному компоненту, как была.
+WZ_ON=0
+WZ_PANEL_DOMAIN=""; WZ_SUB_DOMAIN=""; WZ_PROX_DOMS=""
+WZ_NODE_DOMAIN=""; WZ_NODE_PORT=""; WZ_NODE_TPL=""
+
+wz_asked() { (( WZ_ON )); }   # «вопрос уже задан мастером» - использовать как: wz_asked || ui_yesno ...
+wz_reset() {
+    WZ_ON=0
+    WZ_PANEL_DOMAIN=""; WZ_SUB_DOMAIN=""; WZ_PROX_DOMS=""
+    WZ_NODE_DOMAIN=""; WZ_NODE_PORT=""; WZ_NODE_TPL=""
+}
+
+# ---- Вопросы про ноду: спрашиваем отдельно от установки, чтобы мастер мог
+# задать их заранее, а _node_install - взять готовые ответы ----
+
+# Домен ноды: за прокси Cloudflare не работают ни REALITY, ни HTTP-01
+node_dns_ask() { # домен
+    node_check_dns "$1"
+    case $? in
+        0) ;;
+        2) ui_yesno "DNS: прокси Cloudflare" "$DNS_MSG
+
+REALITY через прокси Cloudflare не работает, сертификат HTTP-01 тоже не выпустится.
+Переключите запись в режим «DNS only» (серое облако).
+
+Продолжить всё равно?" no || return 1 ;;
+        *) ui_yesno "DNS не совпадает" "$DNS_MSG
+
+Если запись только что создана — подождите пару минут.
+Без правильной A-записи сертификат HTTP-01 не выпустится.
+
+Продолжить всё равно?" no || return 1 ;;
+    esac
+    return 0
+}
+
+node_port_ask() { # схема [значение] → stdout: порт
+    local layout=$1 port busy
+    while :; do
+        port=$(ui_input "Порт ноды" "Этот же порт укажите в панели (NODE_PORT).
+
+Порт, на который панель подключается к ноде:" "${2:-}") || return 1
+        port=${port//[[:space:]]/}
+        if [[ ! $port =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 || port == 80 || port == 443 )) ||
+           [[ $layout == balancer && ( $port == "$NODE_XHTTP_PORT" || $port == "$NODE_WS_PORT" || $port == "$NODE_WS_PUBLIC" ) ]]; then
+            ui_msg "Ошибка" "Некорректный порт: «$port» (80, 443$([[ $layout == balancer ]] && echo ", $NODE_XHTTP_PORT, $NODE_WS_PORT, $NODE_WS_PUBLIC") заняты схемой ноды)."; continue
+        fi
+        busy=$(port_foreign "$port")
+        [[ -n $busy ]] && { ui_msg "Порт занят" "Порт $port уже занят:
+
+$busy"; continue; }
+        if port_in_ephemeral "$port"; then
+            ui_yesno "Порт ноды" "$(port_ephemeral_warning "$port" "нода")" no || continue
+        fi
+        break
+    done
+    printf '%s' "$port"
+}
+
+# Сертификат ноды: только спрашиваем, ничего не ставим и не выпускаем. Ответы - в NCERT_*
+NCERT_METHOD=""; NCERT_NAME=""; NCERT_BASE=""; NCERT_TOKEN=""; NCERT_EMAIL=""
+ncert_choice_ru() {
+    case $NCERT_METHOD in
+        reuse) echo "готовый ($NCERT_NAME)" ;;
+        http)  echo "HTTP-01" ;;
+        cf)    echo "Cloudflare DNS: $NCERT_BASE и *.$NCERT_BASE" ;;
+    esac
+}
+
+# Строка про сертификат ноды в сводке мастера. Wildcard на общую зону покрывает и
+# домен ноды - выпуск там физически один, и делать вид, что их два, нечестно.
+wz_ncert_ru() {
+    if [[ $NCERT_METHOD == cf && $NCERT_BASE == "$CERT_NAME" ]]; then
+        echo "тот же wildcard *.$NCERT_BASE — он покрывает и домен ноды"
+    else
+        echo "$(ncert_choice_ru) — отдельный выпуск"
+    fi
+}
+# Сертификат ноды по ответам, которые уже дали для панели: способ, токен и email
+# общие, выпуск — отдельный. Спрашиваем только то, чего в ответах нет: зону, если
+# домен ноды лежит в другой, и токен, если старый эту зону не открывает.
+# 0 - ответы готовы, 1 - отмена, 2 - так не выйдет, нужен обычный опрос.
+node_cert_from_panel() { # домен ноды
+    local d=$1 z
+    NCERT_METHOD=""; NCERT_NAME=""; NCERT_BASE=""; NCERT_TOKEN=""; NCERT_EMAIL=""
+    case $CERT_METHOD in
+        http)
+            NCERT_METHOD=http; NCERT_NAME=$d; NCERT_EMAIL=$CERT_EMAIL ;;
+        cf)
+            NCERT_METHOD=cf; NCERT_TOKEN=$CERT_TOKEN; NCERT_EMAIL=$CERT_EMAIL
+            for z in "${CERT_ZONES[@]}"; do
+                cert_in_zone "$d" "$z" && { NCERT_BASE=$z; break; }
+            done
+            if [[ -z $NCERT_BASE ]]; then
+                while :; do
+                    NCERT_BASE=$(ui_input "Зона Cloudflare для ноды" "Домены панели и подписки в других зонах ($(cert_list_ru "${CERT_ZONES[@]}")),
+поэтому для $d нужна ещё одна.
+
+Зона Cloudflare (должна быть в вашем аккаунте):" "$(base_domain "$d")") || return 1
+                    NCERT_BASE=${NCERT_BASE//[[:space:]]/}; NCERT_BASE=${NCERT_BASE,,}
+                    valid_domain "$NCERT_BASE" && cert_in_zone "$d" "$NCERT_BASE" && break
+                    ui_msg "Ошибка" "«$NCERT_BASE» не подходит: $d должен быть этой зоной или её поддоменом."
+                done
+                # Тот же токен может не открывать новую зону - тогда спросим отдельный
+                while ! cf_zone_check "$NCERT_TOKEN" "$NCERT_BASE"; do
+                    ui_yesno "Токен не открывает зону $NCERT_BASE" "Токен: $(cf_mask "$NCERT_TOKEN")
+
+$CF_ERR
+
+y — ввести другой токен для этой зоны
+n — оставить прежний и выпускать как есть
+
+Ввести другой токен?" || break
+                    NCERT_TOKEN=$(ui_input "Cloudflare API-токен для $NCERT_BASE" "Zone Resources:  зона $NCERT_BASE
+
+API-токен Cloudflare:") || return 1
+                    NCERT_TOKEN=$(cf_clean_token "$NCERT_TOKEN")
+                done
+            fi
+            NCERT_NAME=$NCERT_BASE ;;
+        *) return 2 ;;   # готовый сертификат панели ноде не отдаём - спросим обычным порядком
+    esac
+    return 0
+}
+
+node_cert_ask() { # домен [подпись в сводке]
+    local domain=$1 label=${2:-Сертификат} d name busy
+    NCERT_METHOD=""; NCERT_NAME=""; NCERT_BASE=""; NCERT_TOKEN=""; NCERT_EMAIL=""
+
+    # Уже есть подходящий сертификат - предложить его
+    for d in /etc/letsencrypt/live/*/; do
+        name=$(basename "$d")
+        [[ -f $(cert_file "$name") ]] && cert_covers "$name" "$domain" || continue
+        (( $(cert_days_left "$name") >= 30 )) || continue
+        if ui_yesno "Сертификат уже есть" "Найден действующий сертификат для $domain:
+  $name — $(cert_domains "$name")
+  осталось $(cert_days_left "$name") дн., способ: $(cert_method_ru "$name")
+
+Использовать его?"; then
+            NCERT_METHOD=reuse; NCERT_NAME=$name
+        fi
+        break
+    done
+
+    if [[ -z $NCERT_METHOD ]]; then
+        NCERT_METHOD=$(ui_choose "SSL-сертификат" "Как выпустить сертификат Let's Encrypt для $domain?" \
+            http "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
+            cf   "Cloudflare DNS — wildcard *.домен (нужен API-токен)") || return 1
+    fi
+    case $NCERT_METHOD in
+        reuse) ui_ctx_add "$label" "существующий ($NCERT_NAME)" ;;
+        http)  ui_ctx_add "$label" "HTTP-01" ;;
+        cf)    ui_ctx_add "$label" "Cloudflare DNS" ;;
+    esac
+    if [[ $NCERT_METHOD == http ]]; then
+        busy=$(port_listeners 80)
+        if [[ -n $busy ]]; then
+            ui_msg "Порт 80 занят" "HTTP-01 не сработает — порт 80 занят:
+
+$busy
+
+Освободите порт или выберите способ Cloudflare DNS."
+            return 1
+        fi
+    fi
+    if [[ $NCERT_METHOD == cf ]]; then
+        while :; do
+            NCERT_BASE=$(ui_input "Зона Cloudflare" "Сертификат будет выпущен на домен и *.домен.
+
+Зона Cloudflare (должна быть в вашем аккаунте):" "$(base_domain "$domain")") || return 1
+            NCERT_BASE=${NCERT_BASE//[[:space:]]/}; NCERT_BASE=${NCERT_BASE,,}
+            if valid_domain "$NCERT_BASE" && [[ $domain == "$NCERT_BASE" || $domain == *".$NCERT_BASE" ]]; then break; fi
+            ui_msg "Ошибка" "«$NCERT_BASE» не подходит: $domain должен быть этим доменом или его поддоменом."
+        done
+        ui_ctx_add "Зона CF" "$NCERT_BASE (*.$NCERT_BASE)"
+        if [[ $domain != "$NCERT_BASE" && $domain == *.*".$NCERT_BASE" ]]; then
+            ui_yesno "Внимание" "Wildcard *.$NCERT_BASE не покрывает $domain (поддомен второго уровня).
+
+Продолжить всё равно?" no || return 1
+        fi
+        while :; do
+            NCERT_TOKEN=$(ui_input "Cloudflare API-токен" "▸ Cloudflare → My Profile → API Tokens → Create Token
+Шаблон:          «Edit zone DNS»
+Zone Resources:  зона $NCERT_BASE
+Вставить:        правая кнопка мыши или Ctrl+Shift+V
+
+API-токен Cloudflare:") || return 1
+            NCERT_TOKEN=$(cf_clean_token "$NCERT_TOKEN")
+            if (( ${#NCERT_TOKEN} < 20 )); then
+                ui_msg "Ошибка" "Токен не вставился или слишком короткий: $(cf_mask "$NCERT_TOKEN").
+API-токен Cloudflare — строка примерно из 40 символов."
+                continue
+            fi
+            cf_zone_check "$NCERT_TOKEN" "$NCERT_BASE" && break
+            ui_yesno "Проверка токена не прошла" "Токен: $(cf_mask "$NCERT_TOKEN")
+
+$CF_ERR
+
+n — ввести токен заново.
+
+Продолжить с этим токеном без проверки?" no && break
+        done
+        ui_ctx_add "Токен CF" "$(cf_mask "$NCERT_TOKEN")"
+    fi
+    if [[ $NCERT_METHOD != reuse ]]; then
+        while :; do
+            NCERT_EMAIL=$(ui_input "Email для Let's Encrypt" "На него придёт предупреждение, если сертификат не продлится.
+
+Email (можно оставить пустым):") || return 1
+            NCERT_EMAIL=${NCERT_EMAIL//[[:space:]]/}
+            [[ -z $NCERT_EMAIL || $NCERT_EMAIL =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
+            ui_msg "Ошибка" "Некорректный email: «$NCERT_EMAIL»"
+        done
+        ui_ctx_add "Email" "${NCERT_EMAIL:-не указан}"
+    fi
+    return 0
+}
+
 # ---- Установка ----
 node_install() { UI_CTX=""; _node_install; local rc=$?; UI_CTX=""; return $rc; }
 
@@ -4725,7 +5440,7 @@ _node_install() {
     local old_ip="" old_port="" had_state=0 warn=""
     if node_state_load; then
         had_state=1; old_ip=$NODE_PANEL_IP; old_port=$NODE_PORT
-        ui_yesno "Переустановка" "Нода уже установлена: $NODE_DOMAIN
+        wz_asked || ui_yesno "Переустановка" "Нода уже установлена: $NODE_DOMAIN
 
 docker-compose.yml, .env и nginx.conf будут перезаписаны (старые — в бэкап).
 Ключи REALITY сохранятся — профиль в панели менять не придётся.
@@ -4734,7 +5449,7 @@ docker-compose.yml, .env и nginx.conf будут перезаписаны (ст
     else
         NODE_PORT=2222
     fi
-    ui_yesno "Установка ноды Remnawave" "── Что понадобится
+    wz_asked || ui_yesno "Установка ноды Remnawave" "── Что понадобится
 Домен:       A-запись на IP этого сервера ($SERVER_IP)
 IP панели:   сервер с панелью Remnawave
 SECRET_KEY:  ключ ноды из панели
@@ -4751,14 +5466,14 @@ SECRET_KEY:  ключ ноды из панели
 UFW:         порты схемы для всех, порт ноды только для IP панели
 
 Начать?" || return
-    ipv6_check_wizard || return
+    wz_asked || ipv6_check_wizard || return
 
     # Панель на этом же сервере - ставим связку: 443 забирает Xray, а панель со
     # страницей подписки уезжают за его unix-сокет, туда же, где сайт-заглушка.
     # Схема только шаблонная: балансиру нужны ещё два публичных порта.
     local bundle=0
     if panel_installed 2>/dev/null; then
-        ui_yesno "Панель на этом сервере" "── Сейчас
+        wz_asked || ui_yesno "Панель на этом сервере" "── Сейчас
 Панель:       $PANEL_DOMAIN$( sub_installed 2>/dev/null && printf '\nПодписка:     %s' "$SUB_DOMAIN" )
 Порт 443:     держит nginx панели
 
@@ -4795,31 +5510,14 @@ UFW:         порты схемы для всех, порт ноды тольк
     fi
     ui_ctx_add "Схема" "$(node_layout_ru "$layout")"
 
-    while :; do
-        domain=$(ui_input "Домен ноды" "Он же SNI для REALITY.
+    if wz_asked; then domain=$WZ_NODE_DOMAIN
+    else
+        domain=$(ask_domain "Домен ноды" "Он же SNI для REALITY.
 Пример:  node1.example.com
 
 Домен, на который подключаются клиенты:" "$NODE_DOMAIN") || return
-        domain=${domain//[[:space:]]/}; domain=${domain,,}; domain=${domain%.}
-        valid_domain "$domain" && break
-        ui_msg "Ошибка" "Некорректный домен: «$domain»"
-    done
-    node_check_dns "$domain"
-    case $? in
-        0) ;;
-        2) ui_yesno "DNS: прокси Cloudflare" "$DNS_MSG
-
-REALITY через прокси Cloudflare не работает, сертификат HTTP-01 тоже не выпустится.
-Переключите запись в режим «DNS only» (серое облако).
-
-Продолжить всё равно?" no || return ;;
-        *) ui_yesno "DNS не совпадает" "$DNS_MSG
-
-Если запись только что создана — подождите пару минут.
-Без правильной A-записи сертификат HTTP-01 не выпустится.
-
-Продолжить всё равно?" no || return ;;
-    esac
+        node_dns_ask "$domain" || return
+    fi
     ui_ctx_add "Домен" "$domain"
 
     if (( bundle )); then
@@ -4855,25 +5553,8 @@ IP-адрес сервера с панелью Remnawave:" "$NODE_PANEL_IP") || 
     ui_ctx_add "IP панели" "$panel_ip"
     fi
 
-    while :; do
-        port=$(ui_input "Порт ноды" "Этот же порт укажите в панели (NODE_PORT).
-
-Порт, на который панель подключается к ноде:" "$NODE_PORT") || return
-        port=${port//[[:space:]]/}
-        if [[ ! $port =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 || port == 80 || port == 443 )) ||
-           [[ $layout == balancer && ( $port == "$NODE_XHTTP_PORT" || $port == "$NODE_WS_PORT" || $port == "$NODE_WS_PUBLIC" ) ]]; then
-            ui_msg "Ошибка" "Некорректный порт: «$port» (80, 443$([[ $layout == balancer ]] && echo ", $NODE_XHTTP_PORT, $NODE_WS_PORT, $NODE_WS_PUBLIC") заняты схемой ноды)."; continue
-        fi
-        busy=$(port_foreign "$port")
-        [[ -n $busy ]] && { ui_msg "Порт занят" "Порт $port уже занят:
-
-$busy"; continue; }
-        break
-    done
-
-    if port_in_ephemeral "$port"; then
-        ui_yesno "Порт ноды" "$(port_ephemeral_warning "$port" "нода")" no || return
-    fi
+    if wz_asked; then port=$WZ_NODE_PORT
+    else port=$(node_port_ask "$layout" "$NODE_PORT") || return; fi
     ui_ctx_add "Порт ноды" "$port"
 
     node_keys_ensure || { ui_msg "Ошибка" "Не удалось сгенерировать ключи REALITY (нужен openssl 1.1.1+)."; return; }
@@ -4945,94 +5626,14 @@ SECRET_KEY из панели (можно вставить строку «SECRET_
     ui_ctx_add "SECRET_KEY" "$(cf_mask "$secret")"
     fi
 
-    # Уже есть подходящий сертификат - предложить его
-    for d in /etc/letsencrypt/live/*/; do
-        name=$(basename "$d")
-        [[ -f $(cert_file "$name") ]] && cert_covers "$name" "$domain" || continue
-        (( $(cert_days_left "$name") >= 30 )) || continue
-        if ui_yesno "Сертификат уже есть" "Найден действующий сертификат для $domain:
-  $name — $(cert_domains "$name")
-  осталось $(cert_days_left "$name") дн., способ: $(cert_method_ru "$name")
+    # Вопросы про сертификат вынесены в node_cert_ask: мастер «всё на один сервер»
+    # задаёт их заранее и кладёт ответы в те же NCERT_*
+    wz_asked || node_cert_ask "$domain" || return
+    method=$NCERT_METHOD; cert_name=$NCERT_NAME; base=$NCERT_BASE
+    token=$NCERT_TOKEN; email=$NCERT_EMAIL
 
-Использовать его?"; then
-            method=reuse; cert_name=$name
-        fi
-        break
-    done
-
-    if [[ -z $method ]]; then
-        method=$(ui_choose "SSL-сертификат" "Как выпустить сертификат Let's Encrypt для $domain?" \
-            http "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
-            cf   "Cloudflare DNS — wildcard *.домен (нужен API-токен)") || return
-    fi
-    case $method in
-        reuse) ui_ctx_add "Сертификат" "существующий ($cert_name)" ;;
-        http)  ui_ctx_add "Сертификат" "HTTP-01" ;;
-        cf)    ui_ctx_add "Сертификат" "Cloudflare DNS" ;;
-    esac
-    if [[ $method == http ]]; then
-        busy=$(port_listeners 80)
-        if [[ -n $busy ]]; then
-            ui_msg "Порт 80 занят" "HTTP-01 не сработает — порт 80 занят:
-
-$busy
-
-Освободите порт или выберите способ Cloudflare DNS."
-            return
-        fi
-    fi
-    if [[ $method == cf ]]; then
-        while :; do
-            base=$(ui_input "Зона Cloudflare" "Сертификат будет выпущен на домен и *.домен.
-
-Зона Cloudflare (должна быть в вашем аккаунте):" "$(base_domain "$domain")") || return
-            base=${base//[[:space:]]/}; base=${base,,}
-            if valid_domain "$base" && [[ $domain == "$base" || $domain == *".$base" ]]; then break; fi
-            ui_msg "Ошибка" "«$base» не подходит: $domain должен быть этим доменом или его поддоменом."
-        done
-        ui_ctx_add "Зона CF" "$base (*.$base)"
-        if [[ $domain != "$base" && $domain == *.*".$base" ]]; then
-            ui_yesno "Внимание" "Wildcard *.$base не покрывает $domain (поддомен второго уровня).
-
-Продолжить всё равно?" no || return
-        fi
-        while :; do
-            token=$(ui_input "Cloudflare API-токен" "▸ Cloudflare → My Profile → API Tokens → Create Token
-Шаблон:          «Edit zone DNS»
-Zone Resources:  зона $base
-Вставить:        правая кнопка мыши или Ctrl+Shift+V
-
-API-токен Cloudflare:") || return
-            token=$(cf_clean_token "$token")
-            if (( ${#token} < 20 )); then
-                ui_msg "Ошибка" "Токен не вставился или слишком короткий: $(cf_mask "$token").
-API-токен Cloudflare — строка примерно из 40 символов."
-                continue
-            fi
-            cf_zone_check "$token" "$base" && break
-            ui_yesno "Проверка токена не прошла" "Токен: $(cf_mask "$token")
-
-$CF_ERR
-
-n — ввести токен заново.
-
-Продолжить с этим токеном без проверки?" no && break
-        done
-        ui_ctx_add "Токен CF" "$(cf_mask "$token")"
-    fi
-    if [[ $method != reuse ]]; then
-        while :; do
-            email=$(ui_input "Email для Let's Encrypt" "На него придёт предупреждение, если сертификат не продлится.
-
-Email (можно оставить пустым):") || return
-            email=${email//[[:space:]]/}
-            [[ -z $email || $email =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
-            ui_msg "Ошибка" "Некорректный email: «$email»"
-        done
-        ui_ctx_add "Email" "${email:-не указан}"
-    fi
-
-    if [[ -f $NODE_WEBROOT/index.html ]]; then tpl=$(site_choose keep "$domain") || return
+    if wz_asked; then tpl=$WZ_NODE_TPL
+    elif [[ -f $NODE_WEBROOT/index.html ]]; then tpl=$(site_choose keep "$domain") || return
     else tpl=$(site_choose "" "$domain") || return; fi
     if [[ $tpl == wt:* ]]; then
         if ! wt_fetch_list; then
@@ -5063,7 +5664,7 @@ $busy
         cf)    cert_ru="Cloudflare DNS, *.$base" ;;
     esac
     UI_CTX=""
-    ui_yesno "Подтверждение" "Установить ноду?
+    wz_asked || ui_yesno "Подтверждение" "Установить ноду?
 
   Схема:        $(node_layout_ru "$layout")
   Порты:        $(node_public_ports "$layout" | sed 's/ /, /g')/tcp для всех
@@ -5168,10 +5769,14 @@ $(cert_fail_reason || echo "Проверьте A-запись и доступн�
     # Xray конфиг, Xray не поднимется, и порт останется ничьим.
     if (( bundle )) && (( mk_node )); then
         n_say "Завожу профиль и ноду в панели…"
-        local node_uuid
-        if node_uuid=$(panel_create_node "$domain" "$port" "$layout"); then
+        if panel_create_node "$domain" "$port" "$layout"; then
             n_say "Профиль и нода созданы, ключи REALITY уже внутри профиля"
-            log "panel node created: $node_uuid ($domain:$port)"
+            if [[ -n $PANEL_HOST_ERR ]]; then
+                n_say "Хост $(node_tag "$domain" steal): $PANEL_HOST_ERR"
+            else
+                n_say "Хост $(node_tag "$domain" steal) создан, инбаунд добавлен в сквод"
+            fi
+            log "panel node created: $PANEL_NODE_UUID ($domain:$port)"
         else
             node_fail "Не удалось завести ноду в панели: $PANEL_NODE_ERR
 
@@ -5217,7 +5822,8 @@ $(cert_fail_reason || echo "Проверьте A-запись и доступн�
     fi
     log "node install: ok$( (( bundle )) && echo " (связка с панелью)" )"
 
-    node_done_screen "$domain"
+    # В мастере «всё на один сервер» итоговый экран общий, его показывает мастер
+    wz_asked || node_done_screen "$domain"
 }
 
 # ---- Диагностика ----
@@ -6352,6 +6958,23 @@ $listen
 EOF
 }
 
+# Сжатие. Фронтенд панели тянет WASM-модуль и бандлы на десятки мегабайт: без gzip
+# они едут по сети как есть, и страница профилей открывается минутами. Ответы идут
+# через proxy_pass, поэтому обязателен gzip_proxied - по умолчанию nginx их не жмёт.
+# text/html сжимается всегда, его в списке типов не указывают.
+nginx_gzip_conf() {
+cat <<'EOF'
+gzip            on;
+gzip_vary       on;
+gzip_proxied    any;
+gzip_comp_level 5;
+gzip_min_length 1024;
+gzip_types      application/wasm application/javascript text/javascript application/json
+                text/css text/plain text/xml image/svg+xml application/manifest+json
+                font/woff font/woff2;
+EOF
+}
+
 panel_nginx_conf() { # домен серт путь cookie api-ключ [домен-подписки серт-подписки]
 cat <<EOF
 # SkipIt Tool · панель $1${6:+ + страница подписки $6}
@@ -6359,6 +6982,8 @@ cat <<EOF
 
 server_tokens off;
 server_names_hash_bucket_size 128;
+
+$(nginx_gzip_conf)
 
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
@@ -6447,15 +7072,18 @@ PANEL_PROXY_HDR=(-H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1")
 # В связке все данные у нас уже есть: профиль Xray генерирует node_profile_json,
 # адрес и порт известны, токен выпущен при установке панели. Гонять человека в UI
 # ради этого незачем.
-# Печатает uuid созданной ноды; текст проблемы - в PANEL_NODE_ERR.
-PANEL_NODE_ERR=""
+# uuid созданной ноды - в PANEL_NODE_UUID, текст проблемы - в PANEL_NODE_ERR.
+# Через stdout ничего не возвращаем: вызов из $( ) уносил бы обе переменные в
+# подоболочку, и на экране вместо причины оставалась пустота.
+PANEL_NODE_ERR=""; PANEL_NODE_UUID=""
 panel_create_node() { # домен порт схема
     local domain=$1 port=$2 layout=$3
-    local name=${domain%%.*} tok body out prof inb
-    PANEL_NODE_ERR=""
+    local name=${domain%%.*} tok body out prof inb steal
+    PANEL_NODE_ERR=""; PANEL_NODE_UUID=""
 
     tok=$(panel_api_token) || { PANEL_NODE_ERR="у SkipIt Tool нет API-токена панели"; return 1; }
-    command -v jq >/dev/null 2>&1 || ensure_pkg jq jq >/dev/null 2>&1
+    # Ставим молча: это середина установки, вопрос «поставить jq?» здесь не к месту
+    command -v jq >/dev/null 2>&1 || pkg_install jq >/dev/null 2>&1
     command -v jq >/dev/null 2>&1 || { PANEL_NODE_ERR="не установлен пакет jq"; return 1; }
     # Имя ноды в панели - минимум 3 символа, иначе панель отклонит запрос
     (( ${#name} >= 3 )) || name="node-$name"
@@ -6472,6 +7100,9 @@ panel_create_node() { # домен порт схема
     inb=$(jq -r '[.response.inbounds[]?.uuid] | map(select(. != null)) | @json' <<< "$out")
     [[ -n $inb && $inb != "[]" ]] || {
         PANEL_NODE_ERR="в созданном профиле нет инбаундов"; return 1; }
+    # Отдельно - steal-инбаунд: под него заводится хост Self-steal (TCP)
+    steal=$(jq -r --arg t "$(node_tag "$domain" steal)" \
+        '.response.inbounds[]? | select(.tag == $t) | .uuid' <<< "$out" 2>/dev/null | head -n 1)
 
     # 3. Нода под этот профиль. Адрес - домен ноды: панель живёт в контейнере,
     #    и петлевой адрес привёл бы её саму к себе, а не к ноде на хосте.
@@ -6480,20 +7111,33 @@ panel_create_node() { # домен порт схема
         "$(jq -Rn --arg v "$prof" '$v')" "$inb")
     out=$(panel_api_post "/nodes" "$body") || {
         PANEL_NODE_ERR="панель не приняла ноду: $PANEL_API_ERR"; return 1; }
-    jq -r '.response.uuid // empty' <<< "$out"
+    PANEL_NODE_UUID=$(jq -r '.response.uuid // empty' <<< "$out")
+
+    # 4. Хост под Self-steal (TCP) и его инбаунд в сквод. Не вышло - не беда:
+    #    нода уже создана и работает, текст проблемы остаётся в PANEL_HOST_ERR.
+    panel_create_steal_host "$prof" "$steal" "$domain" || true
+    return 0
 }
 
-# POST в API панели. Тело - вторым аргументом, ошибка - в PANEL_API_ERR.
+# Запрос в API панели. Тело - третьим аргументом, ошибка - в PANEL_API_ERR.
+# Тело идёт через stdin: шаблон Xray JSON - это десятки килобайт, аргументом
+# командной строки такое передавать незачем.
 PANEL_API_ERR=""
-panel_api_post() { # путь тело
+panel_api_req() { # метод путь [тело]
     local tok code out tmp
     PANEL_API_ERR=""
     tok=$(panel_api_token) || { PANEL_API_ERR="нет токена"; return 1; }
     tmp=$(mktemp) || return 1
-    code=$(printf '%s' "$2" | curl -sS -o "$tmp" -w '%{http_code}' --max-time 25 \
-        "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
-        -H "Content-Type: application/json" --data-binary @- \
-        "$(panel_api)$1" 2>/dev/null) || code=000
+    if [[ -n ${3:-} ]]; then
+        code=$(printf '%s' "$3" | curl -sS -o "$tmp" -w '%{http_code}' --max-time 25 \
+            -X "$1" "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
+            -H "Content-Type: application/json" --data-binary @- \
+            "$(panel_api)$2" 2>/dev/null) || code=000
+    else
+        code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 25 \
+            -X "$1" "${PANEL_PROXY_HDR[@]}" -H "Authorization: Bearer $tok" \
+            "$(panel_api)$2" 2>/dev/null) || code=000
+    fi
     out=$(cat "$tmp"); rm -f "$tmp"
     case $code in
         200|201) printf '%s' "$out"; return 0 ;;
@@ -6501,6 +7145,759 @@ panel_api_post() { # путь тело
         *)   PANEL_API_ERR="код $code$(jq -r 'if .errors then " — " + ([.errors[].message] | join("; ")) elif .message then " — " + (.message|tostring) else "" end' <<< "$out" 2>/dev/null)" ;;
     esac
     return 1
+}
+panel_api_post() { panel_api_req POST "$1" "${2:-}"; }
+panel_api_get()  { panel_api_req GET "$1"; }
+
+# Хост под Self-steal (TCP) - тот самый, который раньше человек заводил руками по
+# подсказке мастера. Всё нужное уже есть: профиль, его inbound, домен и 443.
+# Ошибка сюда установку не роняет: нода работает и без хоста, текст - в PANEL_HOST_ERR.
+PANEL_HOST_ERR=""
+panel_create_steal_host() { # uuid-профиля uuid-инбаунда домен
+    local prof=$1 inb=$2 domain=$3 remark body
+    PANEL_HOST_ERR=""
+    [[ -n $inb ]] || { PANEL_HOST_ERR="в профиле не нашёлся инбаунд $(node_tag "$domain" steal)"; return 1; }
+    remark=$(node_tag "$domain" steal)
+    # Поля - ровно те, что мастер просил заполнить в UI: примечание, адрес, порт,
+    # SNI и отпечаток. Остальное панель проставит по умолчанию.
+    body=$(jq -cn --arg p "$prof" --arg i "$inb" --arg r "$remark" --arg d "$domain" \
+        '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$r,
+          address:$d,port:443,sni:$d,fingerprint:"firefox",
+          securityLayer:"DEFAULT",isDisabled:false}') || {
+        PANEL_HOST_ERR="не удалось собрать запрос (jq)"; return 1; }
+    panel_api_post "/hosts" "$body" >/dev/null || {
+        PANEL_HOST_ERR="панель не приняла хост: $PANEL_API_ERR"; return 1; }
+    log "panel host created: $remark"
+    panel_squad_add_inbound "$inb" || return 1
+    return 0
+}
+
+# Инбаунд - в сквод. Без этого хост в панели есть, а в подписку не попадает:
+# Remnawave отдаёт клиенту только те хосты, чей inbound лежит в его скводе.
+# Трогаем Default-Squad свежей панели (или единственный, если он один): PATCH
+# перезаписывает список целиком, поэтому шлём прежние инбаунды плюс новый.
+panel_squad_add_inbound() { # uuid-инбаунда
+    local inb=$1 out squad list body
+    out=$(panel_api_get "/internal-squads") || {
+        PANEL_HOST_ERR="хост создан, но список скводов не получен: $PANEL_API_ERR"; return 1; }
+    squad=$(jq -r '(.response.internalSquads // []) as $s
+        | (($s | map(select(.name == "Default-Squad"))) + (if ($s | length) == 1 then $s else [] end))
+        | .[0].uuid // empty' <<< "$out" 2>/dev/null)
+    [[ -n $squad ]] || {
+        PANEL_HOST_ERR="хост создан, но сквод Default-Squad не нашёлся — добавьте инбаунд в сквод сами"; return 1; }
+    list=$(jq -c --arg s "$squad" --arg i "$inb" \
+        '[(.response.internalSquads[]? | select(.uuid == $s) | .inbounds[]?.uuid), $i] | unique' <<< "$out" 2>/dev/null)
+    body=$(jq -cn --arg s "$squad" --argjson l "$list" '{uuid:$s,inbounds:$l}') || {
+        PANEL_HOST_ERR="хост создан, но не удалось собрать запрос к скводу"; return 1; }
+    panel_api_req PATCH "/internal-squads" "$body" >/dev/null || {
+        PANEL_HOST_ERR="хост создан, но инбаунд в сквод не добавился: $PANEL_API_ERR"; return 1; }
+    log "panel squad: inbound $inb added to $squad"
+    return 0
+}
+
+# ==== Шаблон Xray JSON «RU-Routing» ====
+# Клиентский конфиг с раздельным роутингом: .ru, .su, .рф, госсайты, банки и
+# российские сервисы идут напрямую, Telegram - через прокси, IPv6 и QUIC на 443
+# закрыты. Панель отдаёт его клиентам Xray JSON вместо шаблона по умолчанию,
+# но только если шаблон выбран у хоста - сам по себе он ничего не меняет.
+# Заводится при установке панели и пересоздаётся пунктом меню.
+PANEL_RU_TPL="RU-Routing"
+PANEL_TPL_ERR=""; PANEL_RU_TPL_OK=0
+panel_ru_template_ensure() {
+    local out uuid body
+    PANEL_TPL_ERR=""
+    panel_api_token >/dev/null 2>&1 || {
+        PANEL_TPL_ERR="у SkipIt Tool нет API-токена панели"; return 1; }
+    command -v jq >/dev/null 2>&1 || pkg_install jq >/dev/null 2>&1
+    command -v jq >/dev/null 2>&1 || { PANEL_TPL_ERR="не установлен пакет jq"; return 1; }
+
+    out=$(panel_api_get "/subscription-templates") || {
+        PANEL_TPL_ERR="панель не отдала список шаблонов: $PANEL_API_ERR"; return 1; }
+    uuid=$(jq -r --arg n "$PANEL_RU_TPL" \
+        '.response.templates[]? | select(.templateType == "XRAY_JSON" and .name == $n) | .uuid' <<< "$out" 2>/dev/null | head -n 1)
+    if [[ -z $uuid ]]; then
+        # Создание принимает только имя и тип, содержимое приезжает вторым запросом
+        out=$(panel_api_post "/subscription-templates" \
+            "$(jq -cn --arg n "$PANEL_RU_TPL" '{name:$n,templateType:"XRAY_JSON"}')") || {
+            PANEL_TPL_ERR="панель не приняла шаблон: $PANEL_API_ERR"; return 1; }
+        uuid=$(jq -r '.response.uuid // empty' <<< "$out" 2>/dev/null)
+        [[ -n $uuid ]] || { PANEL_TPL_ERR="панель не вернула uuid шаблона"; return 1; }
+    fi
+    body=$(panel_ru_routing_json | jq -c --arg u "$uuid" '{uuid:$u,templateJson:.}' 2>/dev/null) || body=""
+    [[ -n $body ]] || { PANEL_TPL_ERR="не удалось собрать шаблон (jq)"; return 1; }
+    panel_api_req PATCH "/subscription-templates" "$body" >/dev/null || {
+        PANEL_TPL_ERR="панель не сохранила содержимое шаблона: $PANEL_API_ERR"; return 1; }
+    log "panel template: $PANEL_RU_TPL ok ($uuid)"
+    return 0
+}
+
+panel_ru_routing_json() {
+cat <<'SKIPIT_RU_ROUTING_EOF'
+{
+  "dns": {
+    "servers": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "queryStrategy": "UseIPv4"
+  },
+  "routing": {
+    "rules": [
+      {
+        "port": 53,
+        "type": "field",
+        "outboundTag": "dns-out"
+      },
+      {
+        "type": "field",
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "block"
+      },
+      {
+        "ip": [
+          "::/0"
+        ],
+        "type": "field",
+        "outboundTag": "block"
+      },
+      {
+        "port": "443",
+        "type": "field",
+        "network": "udp",
+        "outboundTag": "block"
+      },
+      {
+        "ip": [
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10"
+        ],
+        "type": "field",
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "regexp:[.]ru$",
+          "regexp:[.]su$",
+          "regexp:[.]xn--p1ai$",
+          "domain:ipify.org",
+          "domain:checkip.amazonaws.com",
+          "domain:ifconfig.me",
+          "domain:ipapi.is",
+          "domain:iplocate.io",
+          "domain:ip.sb",
+          "domain:2ip.ru",
+          "domain:mangalib.me",
+          "domain:animego.me",
+          "domain:showip.net",
+          "domain:avtoto.ru",
+          "domain:tilda.cc",
+          "domain:kinescope.io",
+          "domain:kinescopecdn.net",
+          "domain:redheadsound.studio",
+          "domain:vtbglobalperspectives.com",
+          "domain:vtb-direct.com",
+          "domain:sber.world",
+          "domain:sber.ws",
+          "domain:sbercoin.com",
+          "domain:ssb.msk.ru",
+          "domain:vlb100.ru",
+          "domain:slavbank.ru",
+          "domain:prvbank.ru",
+          "domain:pvubank.com",
+          "domain:vtb-grants.fut.ru",
+          "domain:selkombank.ru",
+          "domain:ankb.ru",
+          "domain:bank-arzamas.ru",
+          "domain:bankermak.ru",
+          "domain:alefbank.com",
+          "domain:forshtadt.ru",
+          "domain:bfa.ru",
+          "domain:rkbank.ru",
+          "domain:mvs-bank.ru",
+          "domain:bank-credit-suisse-moscow.ru",
+          "domain:ziraatbank.ru",
+          "domain:jpmorgan.ru",
+          "domain:noosferabank.ru",
+          "domain:westernunion.ru",
+          "domain:tagbank.ru",
+          "domain:korona.com",
+          "domain:credit-zenit.ru",
+          "domain:zenit-card.ru",
+          "domain:autobahn.db.com",
+          "domain:commerzbank.ru",
+          "domain:mizuhogroup.com",
+          "domain:ibamoscow.ru",
+          "domain:ubs.com",
+          "domain:smbcr-bank.ru",
+          "domain:yoobusiness.ru",
+          "domain:ru.ccb.com",
+          "domain:bank131.com",
+          "domain:asia-pay.ru",
+          "domain:rncoluminis.ru",
+          "domain:government.ru",
+          "domain:gov.ru",
+          "domain:gosuslugi.ru",
+          "domain:gu-st.ru",
+          "domain:emias.info",
+          "domain:mgfoms.ru",
+          "domain:edu.ru",
+          "domain:cbr.ru",
+          "domain:cikrf.ru",
+          "domain:ebs.ru",
+          "domain:goskey.ru",
+          "domain:grfc.ru",
+          "domain:izbirkom.ru",
+          "domain:kremlin.ru",
+          "domain:mil.ru",
+          "domain:nalog.ru",
+          "domain:xn--80ajghhoc2aj1c8b.xn--p1ai",
+          "domain:mos.ru",
+          "domain:mosreg.ru",
+          "domain:spb.ru",
+          "domain:sevastopol.ru",
+          "domain:sev.ru",
+          "domain:adygeya.ru",
+          "domain:bashkiria.ru",
+          "domain:buryatia.ru",
+          "domain:chuvashia.ru",
+          "domain:crimea.ru",
+          "domain:dagestan.ru",
+          "domain:grozny.ru",
+          "domain:i-ola.ru",
+          "domain:izhevsk.ru",
+          "domain:kalmykia.ru",
+          "domain:karelia.ru",
+          "domain:kazan.ru",
+          "domain:kchr.ru",
+          "domain:khakassia.ru",
+          "domain:mari-el.ru",
+          "domain:mari.ru",
+          "domain:mordovia.ru",
+          "domain:nalchik.ru",
+          "domain:ptz.ru",
+          "domain:rkomi.ru",
+          "domain:tatarstan.ru",
+          "domain:tuva.ru",
+          "domain:udm.ru",
+          "domain:udmurtia.ru",
+          "domain:ulan-ude.ru",
+          "domain:vladikavkaz.ru",
+          "domain:yakutia.ru",
+          "domain:altai.ru",
+          "domain:chita.ru",
+          "domain:kamchatka.ru",
+          "domain:khabarovsk.ru",
+          "domain:khv.ru",
+          "domain:krasnodar.su",
+          "domain:krasnoyarsk.ru",
+          "domain:kuban.ru",
+          "domain:marine.ru",
+          "domain:perm.ru",
+          "domain:stavropol.ru",
+          "domain:stv.ru",
+          "domain:vl.ru",
+          "domain:vladivostok.ru",
+          "domain:amur.ru",
+          "domain:arkhangelsk.ru",
+          "domain:astrakhan.ru",
+          "domain:belgorod.ru",
+          "domain:bir.ru",
+          "domain:bryansk.ru",
+          "domain:cbg.ru",
+          "domain:chel.ru",
+          "domain:chelyabinsk.ru",
+          "domain:ekburg.ru",
+          "domain:xn--80acgfbsl1azdqr.xn--p1ai",
+          "domain:irk.ru",
+          "domain:irkutsk.ru",
+          "domain:ivanovo.ru",
+          "domain:jar.ru",
+          "domain:kaluga.ru",
+          "domain:kemerovo.ru",
+          "domain:kirov.ru",
+          "domain:koenig.ru",
+          "domain:kostroma.ru",
+          "domain:kurgan.ru",
+          "domain:kursk.ru",
+          "domain:lipetsk.ru",
+          "domain:magadan.ru",
+          "domain:murmansk.ru",
+          "domain:nn.ru",
+          "domain:nov.ru",
+          "domain:novosibirsk.ru",
+          "domain:nsk.ru",
+          "domain:omsk.ru",
+          "domain:orb.ru",
+          "domain:oryol.ru",
+          "domain:penza.ru",
+          "domain:psk",
+          "domain:psk.ru",
+          "domain:pskov.ru",
+          "domain:rnd.ru",
+          "domain:ryazan.ru",
+          "domain:sakhalin.ru",
+          "domain:samara.ru",
+          "domain:saratov.ru",
+          "domain:simbirsk.ru",
+          "domain:smolensk.ru",
+          "domain:tambov.ru",
+          "domain:tom.ru",
+          "domain:tomsk.ru",
+          "domain:tsaritsyn.ru",
+          "domain:tsk.ru",
+          "domain:tula.ru",
+          "domain:tver.ru",
+          "domain:tyumen.ru",
+          "domain:vladimir.ru",
+          "domain:vlg.ru",
+          "domain:volgograd.ru",
+          "domain:vologda.ru",
+          "domain:voronezh.ru",
+          "domain:vrn.ru",
+          "domain:vyatka.ru",
+          "domain:yaroslavl.ru",
+          "domain:yuzhno-sakhalinsk.ru",
+          "domain:chukotka.ru",
+          "domain:jamal.ru",
+          "domain:surgut.ru",
+          "domain:yamal.ru",
+          "domain:zdrav10.ru",
+          "domain:1c-bitrix.ru",
+          "domain:1c.ru",
+          "domain:1cfresh.com",
+          "domain:1cloud.ru",
+          "domain:1internet.tv",
+          "domain:2gis.ae",
+          "domain:2gis.am",
+          "domain:2gis.az",
+          "domain:2gis.by",
+          "domain:2gis.com",
+          "domain:2gis.com.cy",
+          "domain:2gis.cz",
+          "domain:2gis.ge",
+          "domain:2gis.kg",
+          "domain:2gis.kz",
+          "domain:2gis.ru",
+          "domain:2gis.tj",
+          "domain:2gis.ua",
+          "domain:2gis.uz",
+          "domain:47news.ru",
+          "domain:4meeting.me",
+          "domain:5ka.ru",
+          "domain:5post.market",
+          "domain:abr.ru",
+          "domain:aclub.ru",
+          "domain:adfox.ru",
+          "domain:admetrica.ru",
+          "domain:aeroflot.ru",
+          "domain:alfa-bank.com",
+          "domain:alfa-bank.ru",
+          "domain:alfa-finance.com",
+          "domain:alfa-fx.com",
+          "domain:alfa-pc.com",
+          "domain:alfa-usa.com",
+          "domain:alfabank.com",
+          "domain:alfabank.ru",
+          "domain:alfafinance.biz",
+          "domain:alfafinance.ru",
+          "domain:alfafuture.com",
+          "domain:alfafuture.ru",
+          "domain:alfafx.com",
+          "domain:alfaleasing.ru",
+          "domain:alfaprivate.com",
+          "domain:alformacap.com",
+          "domain:alformacapital.com",
+          "domain:auth-nsdi.ru",
+          "domain:auto.ru",
+          "domain:av.ru",
+          "domain:avito.ru",
+          "domain:avito.st",
+          "domain:baltbank.ru",
+          "domain:banka-ui.dev",
+          "domain:banki.ru",
+          "domain:bankline.ru",
+          "domain:beeline.ru",
+          "domain:beta-bank.com",
+          "domain:bitrix24.ru",
+          "domain:bronevik.com",
+          "domain:cdn-tinkoff.ru",
+          "domain:cdn-vk.ru",
+          "domain:chizhik.club",
+          "domain:citydrive.ru",
+          "domain:clstorage.net",
+          "domain:credistory.ru",
+          "domain:csat.ru",
+          "domain:cscampus.ru",
+          "domain:dbo-dengi.online",
+          "domain:dellin.ru",
+          "domain:dixy.ru",
+          "domain:dnevnik.ru",
+          "domain:dns-shop.ru",
+          "domain:dodopizza.ru",
+          "domain:dom.ru",
+          "domain:domclick.ru",
+          "domain:donationalerts.com",
+          "domain:drweb.ru",
+          "domain:dzen.ru",
+          "domain:dzeninfra.ru",
+          "domain:e5.ru",
+          "domain:edadeal.io",
+          "domain:edadeal.ru",
+          "domain:fastvps.ru",
+          "domain:finuslugi.ru",
+          "domain:fivepost.ru",
+          "domain:fix-price.com",
+          "domain:gazeta.ru",
+          "domain:gazprombank.ru",
+          "domain:gazprombank.tech",
+          "domain:gazprompay.ru",
+          "domain:gorodpay.ru",
+          "domain:gpb.ru",
+          "domain:gpmdi.ru",
+          "domain:hh.ru",
+          "domain:idx5.ru",
+          "domain:imgsmail.ru",
+          "domain:investalfabank.com",
+          "domain:iz.ru",
+          "domain:jivo.ru",
+          "domain:jivochat.com",
+          "domain:jivosite.com",
+          "domain:jx5.ru",
+          "domain:kaspersky.com",
+          "domain:kaspersky.ru",
+          "domain:kazanexpress.ru",
+          "domain:kinopoisk-ru.clstorage.net",
+          "domain:kinopoisk.ru",
+          "domain:kommersant.ru",
+          "domain:kp.ru",
+          "domain:krasyar.ru",
+          "domain:krd.ru",
+          "domain:kuper.ru",
+          "domain:lead-pro2023.online",
+          "domain:lemanapro.ru",
+          "domain:lenta.com",
+          "domain:lenta.ru",
+          "domain:lmru.tech",
+          "domain:magnit.ru",
+          "domain:mail.ru",
+          "domain:max.ru",
+          "domain:megafon.ru",
+          "domain:megamarket.ru",
+          "domain:megamarket.tech",
+          "domain:memealerts.com",
+          "domain:mirpayonline.ru",
+          "domain:miya-news.online",
+          "domain:mm.ru",
+          "domain:mnogolososya.ru",
+          "domain:moex.com",
+          "domain:mradx.net",
+          "domain:mts.ru",
+          "domain:mtsdengi.ru",
+          "domain:mvk.com",
+          "domain:myapelsin.ru",
+          "domain:mycdn.me",
+          "domain:mymts.ru",
+          "domain:naydex.net",
+          "domain:nbki.ru",
+          "domain:netmonet.co",
+          "domain:nspk.ru",
+          "domain:ok.ru",
+          "domain:okcdn.ru",
+          "domain:okko.sport",
+          "domain:okko.tv",
+          "domain:okolo.app",
+          "domain:oneme.ru",
+          "domain:ozon.ru",
+          "domain:ozone.ru",
+          "domain:ozonusercontent.com",
+          "domain:perekrestok.ru",
+          "domain:pochta.ru",
+          "domain:psbank.ru",
+          "domain:psblog.ru",
+          "domain:qms.ru",
+          "domain:rambler.ru",
+          "domain:rbc.ru",
+          "domain:res-nsdi.ru",
+          "domain:rostaxi.org",
+          "domain:rostelecom.ru",
+          "domain:rshb.ru",
+          "domain:rt.ru",
+          "domain:rtbcdn.ru",
+          "domain:russiacalling.com",
+          "domain:rutube.ru",
+          "domain:rutubelist.ru",
+          "domain:rzd-bonus.ru",
+          "domain:rzd.ru",
+          "domain:sbermarket.ru",
+          "domain:sbermegamarket.ru",
+          "domain:sbpgpb.ru",
+          "domain:sistema-capital.com",
+          "domain:spvb.ru",
+          "domain:static-storage.net",
+          "domain:svoy.academy",
+          "domain:t2.ru",
+          "domain:tamtam.chat",
+          "domain:taximaxim.ru",
+          "domain:taxsee.com",
+          "domain:tbank-online.com",
+          "domain:tele2.ru",
+          "domain:timeweb.cloud",
+          "domain:timeweb.com",
+          "domain:tips.tips",
+          "domain:tnt-online.ru",
+          "domain:tochka-tech.com",
+          "domain:tochka.com",
+          "domain:topdelivery.ru",
+          "domain:trbcdn.net",
+          "domain:tsx.x5static.net",
+          "domain:tu-tu.ru",
+          "domain:turbopages.org",
+          "domain:tutu.ru",
+          "domain:usedesk.ru",
+          "domain:userapi.com",
+          "domain:uxfeedback.ru",
+          "domain:vgtrk.ru",
+          "domain:victoria-group.ru",
+          "domain:vk-analytics.ru",
+          "domain:vk-apps.com",
+          "domain:vk-apps.ru",
+          "domain:vk-cdn.me",
+          "domain:vk-cdn.net",
+          "domain:vk-portal.net",
+          "domain:vk.cc",
+          "domain:vk.com",
+          "domain:vk.company",
+          "domain:vk.design",
+          "domain:vk.link",
+          "domain:vk.me",
+          "domain:vk.ru",
+          "domain:vk.team",
+          "domain:vkcache.com",
+          "domain:vkcloud-static.ru",
+          "domain:vkgo.app",
+          "domain:vklive.app",
+          "domain:vkmessenger.app",
+          "domain:vkmessenger.com",
+          "domain:vkontakte.ru",
+          "domain:vkuser.net",
+          "domain:vkuseraudio.com",
+          "domain:vkuseraudio.net",
+          "domain:vkuseraudio.ru",
+          "domain:vkusercdn.ru",
+          "domain:vkuserlive.net",
+          "domain:vkuserphoto.ru",
+          "domain:vkuservideo.com",
+          "domain:vkuservideo.net",
+          "domain:vkuservideo.ru",
+          "domain:vkusnoitochka.ru",
+          "domain:vkusvill.ru",
+          "domain:vkvideo.ru",
+          "domain:vtb-liga.fut.ru",
+          "domain:vtb-russia.com",
+          "domain:vtb.bank.in",
+          "domain:vtb.com",
+          "domain:vtb.corp.ru",
+          "domain:vtb.digital",
+          "domain:vtb.fut.ru",
+          "domain:vtb.promo",
+          "domain:vtb.ru",
+          "domain:vtb24.com",
+          "domain:vtb24.ru",
+          "domain:vtbcareer.com",
+          "domain:vtbfamily.ru",
+          "domain:vtbindia.com",
+          "domain:vtbkep.site",
+          "domain:vtbpartners.com",
+          "domain:vtbrussia.com",
+          "domain:vtbrussia.ru",
+          "domain:vtbstrana.ru",
+          "domain:wb.ru",
+          "domain:webvisor.com",
+          "domain:webvisor.org",
+          "domain:whoosh.bike",
+          "domain:wildberries.ru",
+          "domain:wink.ru",
+          "domain:x5.ru",
+          "domain:x5.tech",
+          "domain:x5club.ru",
+          "domain:x5id.ru",
+          "domain:x5l.ru",
+          "domain:x5paket.ru",
+          "domain:x5q.ru",
+          "domain:xn----7sb7akeedqd.xn--p1ai",
+          "domain:xn--80aacoonefzg3am8b1fsb.xn--p1ai",
+          "domain:xn--90ab2c.xn--p1ai",
+          "domain:xn--90aifd0aza.site",
+          "domain:xn--b1aew.xn--p1ai",
+          "domain:xn--d1acpjx3f.xn--p1ai",
+          "domain:ya.ru",
+          "domain:yads.tech",
+          "domain:yandex",
+          "domain:yandex-bank.net",
+          "domain:yandex-images.clstorage.net",
+          "domain:yandex-team.ru",
+          "domain:yandex.aero",
+          "domain:yandex.az",
+          "domain:yandex.by",
+          "domain:yandex.cloud",
+          "domain:yandex.co.il",
+          "domain:yandex.com",
+          "domain:yandex.com.am",
+          "domain:yandex.com.ge",
+          "domain:yandex.com.ru",
+          "domain:yandex.com.tr",
+          "domain:yandex.com.ua",
+          "domain:yandex.de",
+          "domain:yandex.ee",
+          "domain:yandex.eu",
+          "domain:yandex.fi",
+          "domain:yandex.fr",
+          "domain:yandex.jobs",
+          "domain:yandex.kg",
+          "domain:yandex.kz",
+          "domain:yandex.lt",
+          "domain:yandex.lv",
+          "domain:yandex.md",
+          "domain:yandex.net",
+          "domain:yandex.org",
+          "domain:yandex.pl",
+          "domain:yandex.ru",
+          "domain:yandex.st",
+          "domain:yandex.sx",
+          "domain:yandex.tj",
+          "domain:yandex.tm",
+          "domain:yandex.tr",
+          "domain:yandex.ua",
+          "domain:yandex.uz",
+          "domain:yandexadexchange.net",
+          "domain:yandexcloud.net",
+          "domain:yandexcom.net",
+          "domain:yandexmetrica.com",
+          "domain:yandexwebcache.net",
+          "domain:yandexwebcache.org",
+          "domain:yastat.net",
+          "domain:yastatic-net.ru",
+          "domain:yastatic.net",
+          "domain:yota.ru",
+          "domain:youla-web-static.mrgcdn.ru",
+          "domain:youla.io",
+          "domain:youla.ru",
+          "domain:zentotem.net",
+          "domain:hematonix.ru",
+          "domain:medtrum.ru",
+          "domain:medtrum.eu",
+          "domain:anytimeru.com",
+          "domain:lumiflex.ru",
+          "domain:ican-sinocare.ru",
+          "domain:freestylediabetes.ru",
+          "domain:rsscenter.cloud",
+          "domain:dbankcloud.ru"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "domain:telegram.org",
+          "domain:t.me",
+          "domain:telegram.me",
+          "domain:tdesktop.com",
+          "domain:telesco.pe",
+          "domain:telegram.dog"
+        ],
+        "outboundTag": "proxy"
+      },
+      {
+        "ip": [
+          "91.108.4.0/22",
+          "91.108.8.0/22",
+          "91.108.12.0/22",
+          "91.108.16.0/22",
+          "91.108.56.0/22",
+          "149.154.160.0/20",
+          "185.76.151.0/24"
+        ],
+        "type": "field",
+        "outboundTag": "proxy"
+      },
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "balancerTag": "PROXY"
+      }
+    ],
+    "balancers": [
+      {
+        "tag": "PROXY",
+        "selector": [
+          "proxy"
+        ],
+        "strategy": {
+          "type": "leastPing"
+        },
+        "fallbackTag": "proxy"
+      }
+    ],
+    "domainMatcher": "hybrid",
+    "domainStrategy": "AsIs"
+  },
+  "inbounds": [
+    {
+      "tag": "socks",
+      "port": 10808,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "udp": true,
+        "auth": "noauth"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "dns-out",
+      "protocol": "dns"
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "burstObservatory": {
+    "pingConfig": {
+      "timeout": "2s",
+      "interval": "10s",
+      "sampling": 2,
+      "destination": "http://www.gstatic.com/generate_204"
+    },
+    "subjectSelector": [
+      "proxy"
+    ]
+  }
+}
+SKIPIT_RU_ROUTING_EOF
 }
 
 
@@ -6678,8 +8075,8 @@ cert_covers_all() { # имя домен...
     return 0
 }
 
-cert_ask() { # "домен [домен...]" заголовок ["домен-за-прокси [домен...]"]
-    local title=$2 d z name busy list subj bad cf_head
+cert_ask() { # "домен [домен...]" заголовок ["домен-за-прокси [домен...]"] [приписка к вопросу]
+    local title=$2 note=${4:-} d z name busy list subj bad cf_head
     local -a doms rest left zones prox
     read -r -a doms <<< "$1"
     CERT_NAME=""; CERT_METHOD=""; CERT_EMAIL=""; CERT_TOKEN=""; CERT_ZONE=""
@@ -6739,12 +8136,16 @@ cert_ask() { # "домен [домен...]" заголовок ["домен-за
   Cloudflare DNS работает при любых настройках прокси."
         fi
         CERT_METHOD=$(ui_choose "$title · сертификат" "$cf_head
-
+${note:+
+$note
+}
 Как выпустить сертификат Let's Encrypt $subj?" \
             cf   "Cloudflare DNS — работает при любых настройках прокси (нужен API-токен)" \
             http "HTTP-01 — через 80 порт, без токенов") || return 1
     else
-        CERT_METHOD=$(ui_choose "$title · сертификат" "Как выпустить сертификат Let's Encrypt $subj?" \
+        CERT_METHOD=$(ui_choose "$title · сертификат" "${note:+$note
+
+}Как выпустить сертификат Let's Encrypt $subj?" \
             http "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
             cf   "Cloudflare DNS — wildcard *.домен (нужен API-токен)") || return 1
     fi
@@ -6815,6 +8216,15 @@ Email (можно оставить пустым):") || return 1
         ui_msg "Ошибка" "Некорректный email: «$CERT_EMAIL»"
     done
     return 0
+}
+
+# То же в одну короткую строку: для сводки мастера, где домены и так перечислены выше
+cert_choice_short() {
+    case $CERT_METHOD in
+        reuse) echo "готовый ($CERT_NAME)" ;;
+        http)  echo "HTTP-01" ;;
+        cf)    echo "Cloudflare DNS: $(cert_list_ru "${CERT_ZONES[@]}")" ;;
+    esac
 }
 
 # Краткое описание выбора для экрана подтверждения
@@ -7187,7 +8597,31 @@ panel_install() { UI_CTX=""; _panel_install "$@"; local rc=$?; UI_CTX=""; return
 # Всё на один сервер. Отдельной копии логики не пишем: ставим панель со
 # страницей подписки обычным мастером, а следом мастер ноды сам видит панель
 # и предлагает связку - забрать 443 и увести панель за свой unix-сокет.
+# Всё на один сервер. Сначала мастер спрашивает всё, что нужно и панели, и ноде,
+# и только потом ставит: между панелью и нодой вопросов больше не будет.
 bundle_all_install() {
+    wz_reset
+    bundle_all_ask || { wz_reset; return; }
+
+    WZ_ON=1
+    panel_install with_sub
+    if ! panel_installed 2>/dev/null; then wz_reset; return; fi
+    node_install
+    wz_reset
+
+    if node_installed 2>/dev/null; then
+        bundle_all_done_screen
+    else
+        # Нода не встала, но панель работает: адрес входа и пароль администратора
+        # показать обязательно - больше их взять неоткуда
+        panel_sub_done_screen
+    fi
+}
+
+# Все вопросы одним заходом. Ответы уходят в WZ_*, CERT_* (панель) и NCERT_* (нода) -
+# оттуда их и берут _panel_install и _node_install.
+bundle_all_ask() {
+    local busy rc
     ui_yesno "Панель, страница подписки и нода — на один сервер" "── Что понадобится
 Три домена:   панель, страница подписки, домен ноды (он же SNI для REALITY)
 A-записи:     все три на IP этого сервера ($SERVER_IP)
@@ -7205,20 +8639,142 @@ A-записи:     все три на IP этого сервера ($SERVER_IP)
               Общий выдал бы связь между заглушкой и панелью.
 
 ── Порядок
-1. Панель и страница подписки (свой nginx на 443)
-2. Нода — заберёт 443 и уведёт панель за свой сокет
+1. Сначала вопросы — все сразу, ничего ставить не начинаем
+2. Потом установка: панель со страницей подписки, следом нода
+   Нода заберёт 443 и уведёт панель за свой сокет
 
-Начать?" || return
+Начать?" || return 1
 
-    panel_install with_sub
-    if ! panel_installed 2>/dev/null; then
-        return
+    # 443 нужен и панели, и ноде: если порт чужой, дальше спрашивать незачем
+    busy=$(port_owner 443); rc=$?
+    if (( rc != 1 )); then
+        ui_msg "Порт 443 занят" "Схеме нужен порт 443, а его занял: $busy
+
+Освободите порт и запустите установку снова."
+        return 1
     fi
-    ui_msg "Панель готова" "Панель $PANEL_DOMAIN установлена.
+    ipv6_check_wizard || return 1
 
-Теперь поставим ноду. Она заберёт порт 443, а панель со страницей подписки
-переедут за её unix-сокет — снаружи для них ничего не изменится."
-    node_install
+    WZ_PANEL_DOMAIN=$(ask_domain "Домен панели · 1 из 3" "Пример:  panel.example.com
+
+Домен, по которому вы будете открывать панель:" "$PANEL_DOMAIN") || return 1
+    web_check_dns_ui "$WZ_PANEL_DOMAIN" "Панель" || return 1
+    (( CF_PROXIED )) && WZ_PROX_DOMS=$WZ_PANEL_DOMAIN
+    ui_ctx_add "Домен панели" "$WZ_PANEL_DOMAIN"
+
+    while :; do
+        WZ_SUB_DOMAIN=$(ask_domain "Домен страницы подписки · 2 из 3" "Отдельный домен, A-запись на этот же сервер ($SERVER_IP).
+Пример:  sub.example.com
+
+Домен, по которому клиенты будут открывать подписку:" "$SUB_DOMAIN") || return 1
+        [[ $WZ_SUB_DOMAIN != "$WZ_PANEL_DOMAIN" ]] && break
+        ui_msg "Ошибка" "Домен подписки должен отличаться от домена панели ($WZ_PANEL_DOMAIN)."
+    done
+    web_check_dns_ui "$WZ_SUB_DOMAIN" "Страница подписки" || return 1
+    (( CF_PROXIED )) && WZ_PROX_DOMS="${WZ_PROX_DOMS:+$WZ_PROX_DOMS }$WZ_SUB_DOMAIN"
+    ui_ctx_add "Домен подписки" "$WZ_SUB_DOMAIN"
+
+    while :; do
+        WZ_NODE_DOMAIN=$(ask_domain "Домен ноды · 3 из 3" "Он же SNI для REALITY, в Cloudflare — только «DNS only» (серое облако).
+Пример:  node1.example.com
+
+Домен, на который подключаются клиенты:" "$NODE_DOMAIN") || return 1
+        [[ $WZ_NODE_DOMAIN != "$WZ_PANEL_DOMAIN" && $WZ_NODE_DOMAIN != "$WZ_SUB_DOMAIN" ]] && break
+        ui_msg "Ошибка" "Домен ноды должен отличаться от доменов панели и страницы подписки."
+    done
+    node_dns_ask "$WZ_NODE_DOMAIN" || return 1
+    ui_ctx_add "Домен ноды" "$WZ_NODE_DOMAIN"
+
+    WZ_NODE_PORT=$(node_port_ask steal "${NODE_PORT:-2222}") || return 1
+    ui_ctx_add "Порт ноды" "$WZ_NODE_PORT"
+
+    # Про сертификаты спрашиваем один раз на все три домена: способ, зона, токен и
+    # email общие. Выпусков при этом два - панель со страницей подписки отдельно,
+    # нода отдельно: общий сертификат выдал бы связь заглушки с панелью.
+    cert_ask "$WZ_PANEL_DOMAIN $WZ_SUB_DOMAIN" "Панель, подписка и нода" "$WZ_PROX_DOMS" \
+"ℹ Это вопрос заодно и про ноду: $WZ_NODE_DOMAIN получит свой сертификат —
+  тем же способом, с тем же токеном и email, спрашивать второй раз не буду.
+  Отдельный он потому, что общий выдал бы связь заглушки с панелью." || return 1
+    ui_ctx_add "Сертификаты" "$(cert_choice_ru)"
+    node_cert_from_panel "$WZ_NODE_DOMAIN"; rc=$?
+    case $rc in
+        0) ;;
+        2) node_cert_ask "$WZ_NODE_DOMAIN" "Сертификат ноды" || return 1 ;;
+        *) return 1 ;;
+    esac
+
+    if [[ -f $NODE_WEBROOT/index.html ]]; then WZ_NODE_TPL=$(site_choose keep "$WZ_NODE_DOMAIN") || return 1
+    else WZ_NODE_TPL=$(site_choose "" "$WZ_NODE_DOMAIN") || return 1; fi
+
+    UI_CTX=""
+    ui_yesno "Подтверждение" "Поставить панель, страницу подписки и ноду?
+
+  Домен панели:       $WZ_PANEL_DOMAIN
+  Домен подписки:     $WZ_SUB_DOMAIN
+  Домен ноды:         $WZ_NODE_DOMAIN
+  Порт ноды:          $WZ_NODE_PORT
+  Сертификат панели:  $(cert_choice_short)
+  Сертификат ноды:    $(wz_ncert_ru)
+  Заглушка:           $(site_title "$WZ_NODE_TPL")
+  Папки:              $PANEL_DIR, $NODE_DIR
+  Порт 443:           займёт Xray ноды, панель уйдёт за его сокет
+
+ℹ Больше вопросов не будет: дальше всё ставится и настраивается само.
+ℹ Ноду в панели, её профиль и API-токен страницы подписки мастер заведёт сам.
+
+Начать установку?" || return 1
+    return 0
+}
+
+bundle_all_done_screen() {
+    UI_CTX=""
+    ui_head "Панель, страница подписки и нода установлены"
+    g_kv "Панель" "https://$PANEL_DOMAIN"
+    g_kv "Ссылки клиентов" "https://$SUB_DOMAIN/…"
+    g_kv "Нода" "$NODE_DOMAIN — сайт-заглушка на https://$NODE_DOMAIN"
+    g_kv "Папки" "$PANEL_DIR, $NODE_DIR"
+    g_kv "Автобэкап" "ежедневно в 04:20"
+    g_gap
+    g_line "Адрес входа в панель — откройте его один раз в браузере:"
+    g_gap
+    printf '%s\n' "$(panel_url)" | g_code
+    if [[ -n $PANEL_ADMIN_PASS ]]; then
+        g_gap
+        g_line "Администратор панели создан, войдите этими данными:"
+        g_gap
+        g_code_kv "логин" "$PANEL_ADMIN_USER" "пароль" "$PANEL_ADMIN_PASS"
+        g_gap
+        g_note "Сохраните пароль — больше он показан не будет, в лог не пишется."
+        g_note "Сменить его можно в самой панели после входа."
+        if [[ -n $PANEL_API_TOKEN ]]; then
+            g_note "API-токен для страницы подписки уже выпущен и вставлен — делать ничего не нужно."
+        else
+            g_note "А вот API-токен выпустить не удалось: $PANEL_BOOTSTRAP_ERR"
+            g_note "Сделайте руками: Настройки → API Tokens → создайте токен,"
+            g_note "затем Страница подписки → Сменить API-токен."
+        fi
+    else
+        g_gap
+        g_note "Администратора создайте сами при первом входе."
+        g_note "Потом: Настройки → API Tokens → создайте токен."
+        g_note "И вставьте его: Страница подписки → Сменить API-токен."
+    fi
+    g_gap
+    g_line "Что осталось:"
+    g_gap
+    g_line "1. Ничего обязательного: профиль, нода и хост $(node_tag "$NODE_DOMAIN" steal) уже созданы."
+    g_line "   Остальные хосты, если понадобятся:"
+    g_path "SkipIt Tool → Нода Remnawave → Что создать в панели"
+    g_gap
+    (( PANEL_RU_TPL_OK )) && g_note "Шаблон Xray JSON «$PANEL_RU_TPL» создан — выберите его у хоста, если нужен раздельный роутинг."
+    g_note "Порт 443 держит Xray ноды: панель и страница подписки работают через её nginx."
+    g_note "Без cookie домен панели отвечает 404 — боты её не найдут."
+    local a
+    printf '\n  %s ' "$(ui_keys "Enter — в меню · d — запустить диагностику")" >"$TTY"
+    ui_readline a || return 0
+    a=${a,,}; a=${a//[[:space:]]/}
+    [[ $a == d || $a == в ]] && { panel_diag; sub_diag; node_diag; }
+    return 0
 }
 
 _panel_install() {
@@ -7229,7 +8785,7 @@ _panel_install() {
     [[ ${1:-} == with_sub ]] && with_sub=1
     if panel_state_load && [[ -f $PANEL_COMPOSE ]]; then
         reinstall=1
-        ui_yesno "Переустановка панели" "── Что уже установлено
+        wz_asked || ui_yesno "Переустановка панели" "── Что уже установлено
 Домен:   $PANEL_DOMAIN
 Папка:   $PANEL_DIR
 
@@ -7242,7 +8798,7 @@ _panel_install() {
 
 Переустановить панель?" no || return
     fi
-    ui_yesno "$( (( with_sub )) && echo "Установка панели и страницы подписки" || echo "Установка панели Remnawave" )" "── Что понадобится
+    wz_asked || ui_yesno "$( (( with_sub )) && echo "Установка панели и страницы подписки" || echo "Установка панели Remnawave" )" "── Что понадобится
 $( if (( with_sub )); then echo "Домен панели:    A-запись на IP этого сервера ($SERVER_IP)
 Домен подписки:  отдельный домен, тоже на этот сервер"
 else echo "Домен:  A-запись на IP этого сервера ($SERVER_IP)"; fi )
@@ -7261,37 +8817,33 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
 ℹ Docker ставится официальным установщиком get.docker.com — сторонний скрипт с правами root
 
 Начать?" || return
-    ipv6_check_wizard || return
+    wz_asked || ipv6_check_wizard || return
 
-    while :; do
-        domain=$(ui_input "Домен панели" "Пример:  panel.example.com
+    local prox_doms=""
+    if wz_asked; then domain=$WZ_PANEL_DOMAIN; prox_doms=$WZ_PROX_DOMS
+    else
+        domain=$(ask_domain "Домен панели" "Пример:  panel.example.com
 
 Домен, по которому вы будете открывать панель:" "$PANEL_DOMAIN") || return
-        domain=${domain//[[:space:]]/}; domain=${domain,,}; domain=${domain%.}
-        valid_domain "$domain" && break
-        ui_msg "Ошибка" "Некорректный домен: «$domain»"
-    done
-    local prox_doms=""
-    web_check_dns_ui "$domain" "Панель" || return
-    (( CF_PROXIED )) && prox_doms="$domain"
+        web_check_dns_ui "$domain" "Панель" || return
+        (( CF_PROXIED )) && prox_doms="$domain"
+    fi
     ui_ctx_add "$( (( with_sub )) && echo "Домен панели" || echo "Домен" )" "$domain"
 
     if (( with_sub )); then
+        if wz_asked; then sub_dom=$WZ_SUB_DOMAIN
+        else
         while :; do
-            sub_dom=$(ui_input "Домен страницы подписки" "Отдельный домен, A-запись на этот же сервер ($SERVER_IP).
+            sub_dom=$(ask_domain "Домен страницы подписки" "Отдельный домен, A-запись на этот же сервер ($SERVER_IP).
 Пример:  sub.example.com
 
 Домен, по которому клиенты будут открывать подписку:" "$SUB_DOMAIN") || return
-            sub_dom=${sub_dom//[[:space:]]/}; sub_dom=${sub_dom,,}; sub_dom=${sub_dom%.}
-            if ! valid_domain "$sub_dom"; then
-                ui_msg "Ошибка" "Некорректный домен: «$sub_dom»"
-                continue
-            fi
             [[ $sub_dom != "$domain" ]] && break
             ui_msg "Ошибка" "Домен подписки должен отличаться от домена панели ($domain)."
         done
         web_check_dns_ui "$sub_dom" "Страница подписки" || return
         (( CF_PROXIED )) && prox_doms="${prox_doms:+$prox_doms }$sub_dom"
+        fi
         ui_ctx_add "Домен подписки" "$sub_dom"
     fi
     if [[ -n $prox_doms ]]; then
@@ -7343,7 +8895,7 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
     # Сертификат спрашиваем один раз - сразу на оба домена, один общий выпуск.
     # Только спрашиваем; сам выпуск - после подтверждения, шагом 2/5
     local cert_ru
-    if ! cert_ask "$domain${sub_dom:+ $sub_dom}" "$( (( with_sub )) && echo "Панель и страница подписки" || echo "Панель" )" \
+    if ! wz_asked && ! cert_ask "$domain${sub_dom:+ $sub_dom}" "$( (( with_sub )) && echo "Панель и страница подписки" || echo "Панель" )" \
                   "$prox_doms"; then return; fi
     PANEL_CERT_METHOD=$CERT_METHOD; PANEL_CERT_NAME=$CERT_NAME
     sub_cert=$CERT_NAME
@@ -7374,7 +8926,7 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
   Папка:            $PANEL_DIR
   Порт:             443/tcp"
     fi
-    ui_yesno "Подтверждение" "$confirm
+    wz_asked || ui_yesno "Подтверждение" "$confirm
 
 ℹ Секретный адрес входа покажу в конце — сохраните его" || return
 
@@ -7463,6 +9015,14 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
         if (( brc == 0 )); then
             sub_write_env "$SUB_PANEL_URL" "$PANEL_API_TOKEN" "" ""
             n_say "Токен выпущен и записан в $SUB_ENV"
+            # Шаблон Xray JSON «RU-Routing» - пока токен свежий и панель под рукой
+            if panel_ru_template_ensure; then
+                PANEL_RU_TPL_OK=1
+                n_say "Шаблон Xray JSON «$PANEL_RU_TPL» создан"
+            else
+                n_say "Шаблон «$PANEL_RU_TPL» создать не удалось: $PANEL_TPL_ERR"
+                n_say "Повторить: SkipIt Tool → Панель → Шаблон Xray JSON «$PANEL_RU_TPL»"
+            fi
         else
             n_say "Автоматически не получилось: $PANEL_BOOTSTRAP_ERR"
             # rc=3 - админ уже создан, пароль знаем только мы: его обязательно
@@ -7475,7 +9035,9 @@ else echo "Домен:  A-запись на IP этого сервера ($SERVE
         sub_state_save
     fi
     log "panel install: ok with_sub=$with_sub"
-    if (( with_sub )); then panel_sub_done_screen; else panel_done_screen; fi
+    if wz_asked; then :
+    elif (( with_sub )); then panel_sub_done_screen
+    else panel_done_screen; fi
 }
 
 panel_sub_done_screen() {
@@ -7499,6 +9061,7 @@ panel_sub_done_screen() {
         g_note "Сменить его можно в самой панели после входа."
         if [[ -n $PANEL_API_TOKEN ]]; then
             g_note "API-токен для страницы подписки уже выпущен и вставлен — делать ничего не нужно."
+            (( PANEL_RU_TPL_OK )) && g_note "Шаблон Xray JSON «$PANEL_RU_TPL» создан — выберите его у хоста, если нужен раздельный роутинг."
         else
             g_note "А вот API-токен выпустить не удалось: $PANEL_BOOTSTRAP_ERR"
             g_note "Сделайте руками: Настройки → API Tokens → создайте токен,"
@@ -7543,6 +9106,9 @@ panel_done_screen() {
     g_note "Адрес всегда можно посмотреть заново: SkipIt Tool → Панель → Адрес входа."
     g_gap
     g_line "При первом входе панель попросит создать администратора."
+    g_gap
+    g_note "Шаблон Xray JSON «$PANEL_RU_TPL» — в меню: SkipIt Tool → Панель → Шаблон Xray JSON."
+    g_note "Ему нужен API-токен панели: выпустите его в «Настройки → API Tokens»."
     local a
     printf '\n  %s ' "$(ui_keys "Enter — в меню · d — запустить диагностику")" >"$TTY"
     ui_readline a || return 0
@@ -7999,6 +9565,8 @@ nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · об
             cron      "$(panel_backup_cron_on && echo "Выключить автобэкап" || echo "Включить автобэкап")" \
             ""        "Настройки" \
             newpath   "Сменить адрес входа" \
+            nginxgen  "Пересоздать nginx.conf по шаблону SkipIt Tool" \
+            rutpl     "Шаблон Xray JSON «$PANEL_RU_TPL»" \
             cert      "Сертификат: статус и перевыпуск" \
             resetadm  "Сбросить администратора (забыт пароль)" \
             ""        "Опасные действия" \
@@ -8016,11 +9584,80 @@ nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · об
             cron)      panel_backup_cron_toggle ;;
             resetadm)  panel_reset_admin ;;
             newpath)   panel_change_path ;;
+            nginxgen)  panel_nginx_rebuild ;;
+            rutpl)     panel_ru_template_menu ;;
             cert)      panel_cert ;;
             reinstall) panel_install ;;
             remove)    panel_remove ;;
         esac
     done
+}
+
+# Переписать nginx.conf по шаблону текущей версии SkipIt Tool. Так на уже
+# установленную панель приезжают правки шаблона (например сжатие gzip),
+# и для этого не нужно ничего переустанавливать.
+panel_nginx_rebuild() {
+    local ngx bak err
+    ngx=$(panel_nginx_file)
+    ui_yesno "Пересоздать nginx.conf" "── Что будет
+Файл:      $ngx$(panel_bundled && printf '\nЭто конфиг ноды: в связке панель живёт в нём')
+Заново:    соберётся по шаблону SkipIt Tool v${SKIPIT_VERSION}
+Бэкап:     прежняя версия уйдёт в $SKIPIT_BACKUPS
+Проверка:  nginx -t, при ошибке файл вернётся как был
+
+ℹ Ручные правки в файле пропадут.
+ℹ Домен, адрес входа и сертификат не меняются.
+
+! nginx перечитает конфиг на ходу — клиенты этого не заметят
+
+Пересоздать?" no || return
+    bak=$(backup_file "$ngx")
+    if ! panel_nginx_write; then
+        ui_msg "Ошибка" "Не удалось собрать nginx.conf."
+        return
+    fi
+    if ! err=$(docker exec "$(panel_nginx_ctr)" nginx -t 2>&1); then
+        [[ -n $bak ]] && cat "$bak" > "$ngx"
+        ui_msg "Ошибка в nginx.conf" "nginx не принял новый конфиг, файл возвращён как был:
+
+$err"
+        return
+    fi
+    panel_nginx_reload
+    log "panel nginx rebuild (backup: $bak)"
+    ui_msg "Готово" "nginx.conf пересоздан и применён.${bak:+
+
+Бэкап: $bak}"
+}
+
+# Создать (или переписать) шаблон «RU-Routing» на уже установленной панели.
+# Нужен API-токен: он есть, если панель ставилась вместе со страницей подписки
+# или в связке. Панель без страницы токена не выпускает - об этом и сообщаем.
+panel_ru_template_menu() {
+    ui_yesno "Шаблон Xray JSON «$PANEL_RU_TPL»" "── Что будет
+Шаблон:    $PANEL_RU_TPL, тип Xray JSON
+Где:       Панель → Шаблоны → Xray JSON
+Внутри:    .ru, .su, .рф, госсайты, банки и российские сервисы — напрямую
+           Telegram — через прокси, IPv6 и QUIC на 443 — в блок
+Если есть: содержимое перепишется по шаблону SkipIt Tool v${SKIPIT_VERSION}
+
+ℹ Сам по себе шаблон ничего не меняет: выберите его у хоста, поле «Шаблон Xray JSON».
+ℹ Клиенты без Xray JSON (обычные ссылки, Clash, Sing-box) его не видят.
+
+Создать?" || return
+    if panel_ru_template_ensure; then
+        ui_msg "Готово" "Шаблон «$PANEL_RU_TPL» на месте.
+
+Панель → Шаблоны → Xray JSON → $PANEL_RU_TPL
+
+Чтобы он заработал, откройте нужный хост и выберите его в поле «Шаблон Xray JSON»."
+    else
+        ui_msg "Не получилось" "$PANEL_TPL_ERR
+
+Токен SkipIt Tool выпускает, когда панель ставится со страницей подписки или в связке.
+Панель без страницы подписки токена не имеет — выпустите его в панели
+(Настройки → API Tokens) и вставьте: Страница подписки → Сменить API-токен."
+    fi
 }
 
 panel_cert() {
@@ -8339,7 +9976,7 @@ _sub_install() {
 ℹ Страница публичная: по её ссылке клиенты забирают свои конфиги
 
 Начать?" || return
-    ipv6_check_wizard || return
+    wz_asked || ipv6_check_wizard || return
 
     while :; do
         domain=$(ui_input "Домен страницы подписки" "Пример:  sub.example.com
@@ -10608,6 +12245,7 @@ fail2ban:   $(f2b_state_ru)
             ""      "Сервер" \
             kernel  "Ядро Linux — sysctl, BBR" \
             ipv6    "IPv6 — включить, выключить, основной протокол" \
+            tz      "Часовой пояс — $(tz_current) · $(date '+%H:%M')" \
             upgrade "Обновление сервера — пакеты системы" \
             autoupd "Автообновления безопасности${autoupd_st:+ — $autoupd_st}" \
             monitor "Монитор ресурсов (btop)" \
@@ -10630,6 +12268,7 @@ fail2ban:   $(f2b_state_ru)
             f2b)    menu_fail2ban ;;
             kernel) menu_kernel ;;
             ipv6)   menu_ipv6 ;;
+            tz)     menu_timezone ;;
             upgrade) menu_sys_upgrade ;;
             autoupd) menu_autoupd ;;
             monitor) sys_btop ;;
@@ -10694,7 +12333,7 @@ main() {
 
     case ${1:-} in
         install)
-            bootstrap_deps; self_install
+            bootstrap_deps; self_install; tz_first_run
             say "Готово! Запускайте командой: ${C_ACC}${SKIPIT_CMD}${C_RESET}"
             exit 0 ;;
         uninstall)
@@ -10709,6 +12348,7 @@ main() {
     if [[ ! -x $SKIPIT_BIN ]]; then
         self_install && say "Команда ${SKIPIT_CMD} установлена — дальше запускайте просто: ${SKIPIT_CMD}"
         sleep 1
+        tz_first_run
     fi
 
     { : >"$TTY"; } 2>/dev/null || die "Нужен интерактивный терминал (SSH-сессия)."
@@ -10717,6 +12357,7 @@ main() {
     trap 'printf "\n\n  %sSkipIt Tool%s закрыт: его открыли в другом окне.\n\n" "$C_BRAND" "$C_RESET" >"$TTY" 2>/dev/null; exit 143' TERM HUP
     trap ':' INT   # Ctrl+C отменяет текущее действие, а не закрывает панель
     update_check_bg
+    tz_first_run pending
 
     say "Собираю сведения о сервере..."
     server_info_init
