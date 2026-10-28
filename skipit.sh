@@ -7,7 +7,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.1.3a"
+SKIPIT_VERSION="1.2.0"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -63,10 +63,41 @@ pause(){ echo; printf '  %s ' "$(ui_keys "Enter — вернуться в мен
 # (trap ':' INT, чтобы не закрывать панель), и read там не прерывается.
 # Код != 0 - нажат Ctrl+C или ввод закрыт.
 ui_readline() { # имя-переменной
-    local _l
-    _l=$(IFS= read -r _x <"$TTY" || exit 1; printf '%s' "$_x") || return 1
-    printf -v "$1" '%s' "$_l"
+    local _l _rc
+    trap ':' INT
+    while :; do
+        _l=$(IFS= read -r _x <"$TTY" || exit 1; printf '%s' "$_x"); _rc=$?
+        (( _rc == 0 )) && { printf -v "$1" '%s' "$_l"; return 0; }
+        # Ctrl+C внутри мастера - сначала спросить, точно ли прерываем
+        (( _rc > 128 && ${UI_GUARD:-0} )) || return 1
+        ui_cancel_confirm && return 1
+        printf '\r\e[K  %s❯%s ' "${C_ACC:-}" $'\e[0m' >"$TTY"
+    done
 }
+
+# Мастера установки ставят UI_GUARD=1: тогда Ctrl+C не обрывает настройку сразу,
+# а показывает экран подтверждения. Он рисуется на запасном экране терминала,
+# и после «продолжить» прежний экран возвращается как был.
+UI_GUARD=0
+ui_cancel_confirm() { # → 0: прервать
+    local a rc
+    {
+        printf '\e[?1049h\e[H\e[2J'
+        UI_SECTION="" ui_titlebar "🕒 Пауза"; echo
+        printf '  %sВы нажали %sCtrl+C%s%s. Настройка пока не прервана.%s\n\n' "$C_QST" "$C_WARN" "$C_RESET" "$C_QST" "$C_RESET"
+        ui_buttons "Enter" "→ Продолжить" "$C_OK" "y" "✕ Прервать" "$C_ERR"
+        printf '\n  %sПрервать — введённое не сохранится, сделанные шаги откатятся%s\n' "$C_HINT" "$C_RESET"
+        echo; ui_rule; echo; ui_rule
+        printf '\n\e[3A\r  %s❯%s ' "$C_ACC" "$C_RESET"
+    } >"$TTY"
+    a=$(IFS= read -r _x <"$TTY" || exit 1; printf '%s' "$_x"); rc=$?
+    printf '\e[?1049l' >"$TTY"
+    (( rc != 0 )) && return 0
+    a=${a,,}; a=${a//[[:space:]]/}
+    [[ $a == y || $a == yes || $a == д || $a == да ]]
+}
+
+ui_cancel_word() { (( ${UI_GUARD:-0} )) && printf 'прервать настройку' || printf 'отмена'; }
 
 # Дополнить строку пробелами до ширины w (с учётом кириллицы)
 pad() { local s=$1 w=$2; printf '%s%*s' "$s" $(( w > ${#s} ? w - ${#s} : 0 )) ''; }
@@ -811,6 +842,12 @@ SkipIt Tool v${SKIPIT_VERSION} — VPS Control Center
   ${SKIPIT_CMD} uninstall    удалить команду
   ${SKIPIT_CMD} update       обновить SkipIt Tool с GitHub (--yes: без вопросов)
   ${SKIPIT_CMD} version      версия
+
+Служебные (их вызывают cron и systemd, вручную не нужны):
+  ${SKIPIT_CMD} tg-backup     собрать бэкап и отправить в Telegram
+  ${SKIPIT_CMD} panel-backup  дамп базы панели в /var/backups/skipit
+  ${SKIPIT_CMD} shield-apply  применить правила щита
+  ${SKIPIT_CMD} shield-flush  снять правила щита
 EOF
 }
 
@@ -892,19 +929,165 @@ ui_dims() {
 }
 
 ui_rule() {
-    local w=$(( UI_W - 2 )); (( w > 72 )) && w=72
+    # та же длина, что у толстых линий (home_rule, ui_rule_grad) - иначе тонкие короче
+    local w=$(( UI_W - 2 )); (( w > 84 )) && w=84
     printf '  %s%s%s\n' "$C_DIM" "$(printf '─%.0s' $(seq 1 "$w"))" "$C_RESET"
 }
 
 ui_banner() {
-    # Ширина рамки считается по этой же строке без цветов - знак логотипа
-    # обязан входить в неё, иначе рамка разъедется
-    local plain="${SKIPIT_MARK}  SkipIt Tool  ·  VPS Control Center  ·  v${SKIPIT_VERSION}" line
-    line=$(printf '─%.0s' $(seq 1 $(( ${#plain} + 4 ))))
-    printf '  %s╭%s╮%s\n' "$C_BRAND" "$line" "$C_RESET"
-    printf '  %s│%s  %s%s  SkipIt Tool%s  %s·  VPS Control Center  ·  v%s%s  %s│%s\n' \
-        "$C_BRAND" "$C_RESET" "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_HINT" "$SKIPIT_VERSION" "$C_RESET" "$C_BRAND" "$C_RESET"
-    printf '  %s╰%s╯%s\n' "$C_BRAND" "$line" "$C_RESET"
+    local i
+    echo
+    for i in "${!HOME_LOGO[@]}"; do printf '  %s%s%s\n' "${HOME_GRAD[$i]}" "${HOME_LOGO[$i]}" "$C_RESET"; done
+    printf '\n  %s%s SkipIt Tool%s  %s·  VPS Control Center  ·  v%s%s\n' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_HINT" "$SKIPIT_VERSION" "$C_RESET"
+    ui_rule
+}
+
+# ---- Оформление всех экранов: шапка с крошками, линия-перелив, статусы ----
+# Раздел, из которого пришли с главного экрана (иконка и название) - для крошек
+UI_SECTION=""
+if [[ $C_BRAND == *'38;5;'* ]]; then
+    UI_GRAD=(51 45 39 33 27 33 39 45)
+else
+    UI_GRAD=()
+fi
+
+# Линия с переливом цвета, как на главном экране
+ui_rule_grad() {
+    local w=$(( UI_W - 2 )) i seg n out=""; (( w > 84 )) && w=84
+    if (( ${#UI_GRAD[@]} == 0 )); then printf '  %s%s%s\n' "$C_BRAND" "$(printf '━%.0s' $(seq 1 "$w"))" "$C_RESET"; return; fi
+    n=${#UI_GRAD[@]}; seg=$(( (w + n - 1) / n ))
+    for (( i = 0; i < w; i++ )); do
+        (( i % seg == 0 )) && out+=$'\e[38;5;'"${UI_GRAD[$(( i / seg ))]}m"
+        out+="━"
+    done
+    printf '  %s%s\n' "$out" "$C_RESET"
+}
+
+# Иконка статуса по заголовку окна-сообщения
+ui_title_icon() {
+    case $1 in
+        Готово*|*" обновлён"|*включён|*выключен|"IPv6 работает") printf '🟢 ' ;;
+        Ошибка*|"Не получилось"*|"Не удалось"*|*"не работает") printf '❌ ' ;;
+        Внимание*|Осторожно*) printf '🚨 ' ;;
+    esac
+}
+
+# Шапка: ❯▌ SkipIt Tool › 🏰 Раздел › Экран            сервер · 17:42
+ui_titlebar() { # заголовок
+    local t=$1 crumb="" right cols
+    if [[ -n $UI_SECTION ]]; then
+        local sec_name=${UI_SECTION#* }
+        if [[ -z $t || $t == "$sec_name" || $sec_name == "$t"* || $t == "$sec_name"* ]]; then
+            crumb="${C_QST}${UI_SECTION}${C_RESET}"
+        else
+            crumb="${C_HINT}${UI_SECTION}${C_RESET} ${C_ACC}›${C_RESET} ${C_QST}$(ui_title_icon "$t")${t}${C_RESET}"
+        fi
+    else
+        crumb="${C_QST}$(ui_title_icon "$t")${t}${C_RESET}"
+    fi
+    printf '\n  %s%s SkipIt Tool%s %s›%s %s' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_ACC" "$C_RESET" "$crumb"
+    cols=$(tput cols 2>/dev/null); [[ $cols =~ ^[0-9]+$ ]] || cols=80
+    right="$(hostname -s 2>/dev/null) · $(date '+%H:%M')"
+    if (( cols >= 96 )); then
+        local at=$(( (UI_W - 2 > 84 ? 84 : UI_W - 2) + 3 - ${#right} )) plain
+        plain=$(printf '%s' "$crumb" | sed 's/\x1b\[[0-9;]*m//g')
+        # 2 отступ + «❯▌ SkipIt Tool › » 17 + крошка, эмодзи шире на клетку - запас 4
+        (( 2 + 17 + ${#plain} + 4 < at )) && printf '\e[%dG%s%s%s' "$at" "$C_DIM" "$right" "$C_RESET"
+    fi
+    echo
+    ui_rule_grad
+}
+
+# Две кнопки рядом: что будет по каждой клавише - видно без чтения текста.
+# Рамки ставим по абсолютной колонке (\e[NG), поэтому эмодзи их не сдвигают.
+ui_buttons() { # клавиша1 подпись1 цвет1 клавиша2 подпись2 цвет2
+    local w=36 l1=3 l2 line i k lab col max
+    l2=$(( l1 + w + 2 ))
+    line=$(printf '─%.0s' $(seq 1 $(( w - 2 ))))
+    printf '  %s╭%s╮%s' "$3" "$line" "$C_RESET"; printf '\e[%dG%s╭%s╮%s\n' "$l2" "$6" "$line" "$C_RESET"
+    for i in 1 2; do
+        if (( i == 1 )); then k=$1; lab=$2; col=$3; else k=$4; lab=$5; col=$6; fi
+        max=$(( w - 7 - ${#k} )); (( ${#lab} > max )) && lab="${lab:0:$(( max - 1 ))}…"
+        local at=$(( i == 1 ? l1 : l2 ))
+        printf '\e[%dG%s│%s %s %s %s %s%s%s' "$at" "$col" "$C_RESET" $'\e[1;30;48;5;'"$( [[ $col == "$C_ERR" ]] && echo 167 || { [[ $col == "$C_OK" ]] && echo 72 || echo 245; } )m" "$k" "$C_RESET" "$C_QST" "$lab" "$C_RESET"
+        printf '\e[%dG%s│%s' $(( at + w - 1 )) "$col" "$C_RESET"
+    done
+    echo
+    printf '  %s╰%s╯%s' "$3" "$line" "$C_RESET"; printf '\e[%dG%s╰%s╯%s\n' "$l2" "$6" "$line" "$C_RESET"
+}
+
+# Эмодзи пункта меню по смыслу. Только проверенный набор - те, что ровно
+# рисуются в терминале автора (Windows): 🚀 🔍 🌍 💾 🏰 🔐 🧱 🚨 🔄 🌐 📶 📦 🕒
+# 📊 🧹 🆙 📖 ❌ 🚪 🟢 👤 📁 📂 💬 🔁. Остальные (⚡ 🔒 🔌 🤖 👀 📤 📥 и др.)
+# в части шрифтов выходят узкими или другой картинкой - их не берём.
+# Текст пункта ставится по колонке, поэтому ширина эмодзи строку не сдвигает.
+ui_item_icon() { # текст
+    local t=${1,,}
+    case $t in
+        "http-01"*)                                       printf '🌐' ;;
+        "cloudflare dns"*)                                printf '🔐' ;;
+        "zerossl"*)                                       printf '🌍' ;;
+        "панель + страница подписки + нода"*)              printf '🚀' ;;
+        "панель + страница подписки"*)                    printf '📁' ;;
+        "панель")                                         printf '📊' ;;
+        "нода")                                           printf '📶' ;;
+        "страница подписки")                              printf '📖' ;;
+        "fq + bbr"*)                                      printf '🚀' ;;
+        "cake + bbr"*)                                    printf '👤' ;;
+        "лёгкий"*)                                        printf '💾' ;;
+        "дальние клиенты"*)                               printf '🌍' ;;
+        "udp —"*)                                         printf '📶' ;;
+        *"что входит"*)                                   printf '📁' ;;
+        *"настройки щита"*)                               printf '🏰' ;;
+        *"хранить"*)                                      printf '📂' ;;
+        *"удалить"*|*"удаление"*)                         printf '❌' ;;
+        *"сбросить"*|*"сброс "*|*"вернуть исходн"*)       printf '🧹' ;;
+        *"разблок"*|*"разрешить"*)                        printf '🟢' ;;
+        *"заблок"*|*"запретить"*)                         printf '🚨' ;;
+        *"выключить"*|*"остановить"*|*"отключить"*)       printf '🚪' ;;
+        *"включить"*|*"запустить"*)                       printf '🟢' ;;
+        *"восстанов"*)                                    printf '🔁' ;;
+        *"отправить"*)                                    printf '🚀' ;;
+        *"перезапус"*|*"перезагруз"*)                     printf '🔄' ;;
+        *"обновить"*|*"обновлен"*)                        printf '🆙' ;;
+        *"переустанов"*|*"установить"*|*"пересоздать"*)   printf '📦' ;;
+        *"сертификат"*|*"ключ"*|*"токен"*|*"пароль"*|*"secret"*) printf '🔐' ;;
+        *"лог"*|*"журнал"*|*"последние баны"*)            printf '📖' ;;
+        *"статистик"*)                                    printf '📊' ;;
+        *"провер"*|*"диагност"*|*"показать"*|*"статус"*|*"список"*|*"текущие"*|*"что будет"*|*"заблокированные"*) printf '🔍' ;;
+        *"редакт"*|*"nano"*|*"nginx.conf"*)               printf '📂' ;;
+        *"бота"*|*" чат"*)                                printf '💬' ;;
+        *"расписан"*|*"время"*|*"пояс"*)                 printf '🕒' ;;
+        *"бэкап"*)                                        printf '💾' ;;
+        *"шаблон"*|*"профил"*|*"схем"*|*"заполнить"*)     printf '🧱' ;;
+        *"пользовател"*|*"администратор"*|*"sudo"*|*"root"*) printf '👤' ;;
+        *"белый список"*)                                 printf '📁' ;;
+        *"сайт"*|*"заглушк"*)                             printf '🌍' ;;
+        *"щит"*|*"защит"*|*"повторные"*)                  printf '🏰' ;;
+        *"фаервол"*|*"ufw"*|*"политик"*)                  printf '🧱' ;;
+        *"fail2ban"*|*"подбор"*|*"сканирован"*)           printf '🚨' ;;
+        *"ssh"*)                                          printf '🔐' ;;
+        *"ядр"*|*"sysctl"*|*"bbr"*)                       printf '🚀' ;;
+        *"порт"*|*"адрес"*|*"домен"*|*"ipv6"*|*"ipv4"*|*"ip "*|*" ip"*) printf '🌐' ;;
+        *"панель"*|*"нода"*|*"ноду"*|*"подписк"*)         printf '📦' ;;
+        *)                                                printf '📂' ;;
+    esac
+}
+
+# Пункт меню: состояние в конце строки подсвечиваем
+#   «… — вкл» зелёным, «… — выкл / выключен / не …» жёлтым
+ui_item_text() { # текст опасный(0|1)
+    local t=$1 head tail
+    if (( ${2:-0} )); then printf '%s%s%s' "$C_ERR" "$t" "$C_RESET"; return; fi
+    if [[ $t == *' — '* ]]; then
+        head=${t% — *}; tail=${t##* — }
+        case $tail in
+            вкл|включён|включена|работает|да*|"автоматически") printf '%s%s%s %s—%s %s%s%s' "$C_TXT" "$head" "$C_RESET" "$C_DIM" "$C_RESET" "$C_OK" "$tail" "$C_RESET"; return ;;
+            выкл|выключен*|"не "*|нет*|"без ограничений") printf '%s%s%s %s—%s %s%s%s' "$C_TXT" "$head" "$C_RESET" "$C_DIM" "$C_RESET" "$C_WARN" "$tail" "$C_RESET"; return ;;
+            *) printf '%s%s%s %s— %s%s' "$C_TXT" "$head" "$C_RESET" "$C_HINT" "$tail" "$C_RESET"; return ;;
+        esac
+    fi
+    printf '%s%s%s' "$C_TXT" "$t" "$C_RESET"
 }
 
 # Шапка окна: чистый экран, "SkipIt Tool › Заголовок", линия
@@ -913,8 +1096,7 @@ ui_head() {
     ui_dims
     {
         clear
-        printf '\n  %s%s SkipIt Tool%s %s›%s %s%s%s\n' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_ACC" "$C_RESET" "$C_TXT" "$1" "$C_RESET"
-        ui_rule
+        ui_titlebar "$1"
         echo
         ui_ctx
     } >"$TTY"
@@ -937,9 +1119,25 @@ ui_kvline() { # строка plain
 ui_textblock() { # текст цвет [plain]
     local color=$2 plain=${3:-0} line rest p ok i
     local -a ks vs
+    # Пояснение «ℹ …» с продолжением на следующих строках (с отступом) склеиваем
+    # в одну строку: перенос по ширине окна сделает g_note, и строки не рвутся
+    local src="" in_note=0 tl0
+    while IFS= read -r line; do
+        tl0=${line#"${line%%[![:space:]]*}"}
+        if [[ $tl0 == 'ℹ '* ]]; then in_note=1; src+="$line"$'\n'; continue; fi
+        if (( in_note )) && [[ $line == '  '* && -n $tl0 && $tl0 != [✓✗!▸]' '* ]]; then
+            src="${src%$'\n'} $tl0"$'\n'; continue
+        fi
+        in_note=0; src+="$line"$'\n'
+    done <<< "$1"
     while IFS= read -r line; do
         ks=(); vs=(); ok=0
         local tl=${line#"${line%%[![:space:]]*}"}
+        if [[ $tl =~ ^⟦score⟧\ ([0-9]+)$ ]]; then g_flush; ui_score "${BASH_REMATCH[1]}" >"$TTY"; continue; fi
+        if [[ $tl =~ ^⟦summary⟧\ ([0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]]; then
+            g_flush; ui_summary "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" >"$TTY"; continue
+        fi
+        if [[ $tl =~ ^([✓✗!])\ (.+)$ ]]; then g_flush; ui_check_line "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >"$TTY"; continue; fi
         if [[ $tl == '▸ '* ]]; then g_flush; g_path "${tl#▸ }"; continue; fi
         # "1. Текст" - нумерованный шаг, как на экранах мастера (номер из текста)
         if [[ $tl =~ ^([0-9]+)\.\ (.+)$ ]]; then g_flush; G_STEP=$(( BASH_REMATCH[1] - 1 )); g_steps "${BASH_REMATCH[2]}"; continue; fi
@@ -974,16 +1172,56 @@ ui_textblock() { # текст цвет [plain]
             g_flush
             case $line in
                 '') echo ;;
+                '── В порядке'*|'── Уже в порядке'*|'── Действует сейчас'*) printf '  %s %s %s\n' $'\e[1;30;48;5;72m'  "${line#── }" "$C_RESET" ;;
+                '── Настроено'*)        printf '  %s %s %s\n' $'\e[1;97;48;5;240m' "${line#── }" "$C_RESET"; UI_DIM_KV=1 ;;
+                '── Требует внимания'*) printf '  %s %s %s\n' $'\e[1;30;48;5;179m' "${line#── }" "$C_RESET" ;;
                 '── '*) printf '  %s %s %s\n' "$C_SECTION" "${line#── }" "$C_RESET" ;;
                 '▸ '*) g_path "${line#▸ }"; continue ;;
                 *'✓ '*) printf '  %s\n' "${line/✓/$C_OK✓$C_RESET$C_HINT}$C_RESET" ;;
                 *'✗ '*) printf '  %s\n' "${line/✗/$C_ERR✗$C_RESET$C_TXT}$C_RESET" ;;
                 *'! '*) printf '  %s\n' "${line/!/$C_WARN!$C_RESET$C_TXT}$C_RESET" ;;
-                *) printf '  %s%s%s\n' "$color" "$line" "$C_RESET" ;;
+                *)
+                    # длинную строку переносим по ширине окна, как пояснения
+                    local ww=$(( ${UI_W:-78} - 4 )) wl; (( ww > 84 )) && ww=84
+                    if (( ${#line} > ww )) && [[ $line != ' '* ]]; then
+                        while IFS= read -r wl; do printf '  %s%s%s\n' "$color" "$wl" "$C_RESET"; done < <(ui_wrap "$line" "$ww")
+                    else
+                        printf '  %s%s%s\n' "$color" "$line" "$C_RESET"
+                    fi ;;
             esac >"$TTY"
         fi
-    done <<< "$1"
+    done <<< "${src%$'\n'}"
     g_flush
+}
+
+# Строка оценки: крупно число, слово и цветная шкала
+ui_score() { # процент
+    local p=$1 col word w=40 f i bar="" e=""
+    if   (( p >= 90 )); then col=$C_OK;  word="отлично"
+    elif (( p >= 70 )); then col=$C_OK;  word="хорошо"
+    elif (( p >= 45 )); then col=$C_WARN; word="слабо"
+    else                     col=$C_ERR; word="опасно"; fi
+    f=$(( (p * w + 50) / 100 ))
+    for (( i = 0; i < w; i++ )); do if (( i < f )); then bar+="━"; else e+="─"; fi; done
+    printf '  %s●%s %s%s из 100%s  %s%s%s\n' "$col" "$C_RESET" "$C_QST" "$p" "$C_RESET" "$col" "$word" "$C_RESET"
+    printf '  %s%s%s%s%s%s\n' "$col" "$bar" "$C_RESET" "$C_DIM" "$e" "$C_RESET"
+}
+
+# Итог проверок одной строкой: ● 4 в порядке   ● 3 внимание   ● 0 ошибок
+ui_summary() { # успешно внимание ошибки
+    printf '  %s●%s %s%s%s в порядке   %s●%s %s%s%s %s   %s●%s %s%s%s %s\n' \
+        "$C_OK" "$C_RESET" "$C_QST" "$1" "$C_RESET" \
+        "$( (( $2 )) && printf '%s' "$C_WARN" || printf '%s' "$C_DIM")" "$C_RESET" "$C_QST" "$2" "$C_RESET" "внимание" \
+        "$( (( $3 )) && printf '%s' "$C_ERR" || printf '%s' "$C_DIM")" "$C_RESET" "$C_QST" "$3" "$C_RESET" "$(ru_plural "$3" ошибка ошибки ошибок)"
+}
+
+# Строка проверки «✓ / ! / ✗ текст — пояснение»: цветная точка, текст, пояснение приглушено
+ui_check_line() { # знак текст
+    local col head tail=""
+    case $1 in ✓) col=$C_OK ;; '!') col=$C_WARN ;; *) col=$C_ERR ;; esac
+    head=$2
+    if [[ $head == *' — '* ]]; then tail=${head#* — }; head=${head%% — *}; fi
+    printf '   %s●%s %s%s%s%s\n' "$col" "$C_RESET" "$C_TXT" "$head" "$C_RESET" "${tail:+ $C_HINT— $tail$C_RESET}"
 }
 
 # Ответы мастера, которые видны на каждом следующем экране: строки "ключ<TAB>значение"
@@ -1051,13 +1289,23 @@ ui_msg() {   # заголовок текст
 }
 
 ui_yesno() { # заголовок текст [no — по умолчанию «нет»]
-    local def=y keys="y — да · n — нет · Enter — да" a err=""
-    [[ ${3:-} == no ]] && { def=n; keys="y — да · n — нет · Enter — нет"; }
+    local def=y a err="" q yl nl
+    [[ ${3:-} == no ]] && def=n
     ui_head "$1"
     ui_field "$2" yesno
+    # Подпись кнопки «да» - из самого вопроса: «Удалить ноду?» → «Да, удалить ноду»
+    q=$(grep -v '^ ' <<< "$2" | grep '?$' | tail -n 1); q=${q%\?}
+    yl="Да${q:+, ${q,}}"
+    nl="Нет, назад"
+    echo >"$TTY"
+    if [[ $def == n ]]; then
+        ui_buttons "y" "$yl" "$C_ERR" "n·Enter" "$nl" "$C_DIM" >"$TTY"
+    else
+        ui_buttons "y·Enter" "$yl" "$C_OK" "n" "$nl" "$C_DIM" >"$TTY"
+    fi
     ui_ask_open
     while :; do
-        ui_ask "$keys" "$err"
+        ui_ask "" "$err"
         ui_readline a || return 1
         a=${a,,}; a=${a//[[:space:]]/}; [[ -z $a ]] && a=$def
         case $a in
@@ -1113,23 +1361,33 @@ ui_field_box() { # подсказка
 }
 
 ui_input() { # заголовок текст [значение] → stdout
-    ui_head "$1"
-    ui_field "$2"
-    ui_field_box "Enter — готово · Ctrl+C — отмена"
-    local v
-    { read -e -r -i "${3:-}" -p "$UI_READ_PROMPT_IN" v; } <"$TTY" >"$TTY" 2>"$TTY" || return 1
-    printf '%s' "$v"
+    local v rc
+    trap ':' INT
+    while :; do
+        ui_head "$1"
+        ui_field "$2"
+        ui_field_box "Enter — готово · Ctrl+C — $(ui_cancel_word)"
+        v=$( { read -e -r -i "${3:-}" -p "$UI_READ_PROMPT_IN" _x; } <"$TTY" >"$TTY" 2>"$TTY" || exit 1; printf '%s' "$_x"); rc=$?
+        (( rc == 0 )) && { printf '%s' "$v"; return 0; }
+        (( rc > 128 && ${UI_GUARD:-0} )) || return 1
+        ui_cancel_confirm && return 1
+    done
 }
 
 ui_pass() {  # заголовок текст -> stdout
-    trap 'stty echo <"$TTY" 2>/dev/null; echo >"$TTY"; exit 130' INT
-    ui_head "$1"
-    ui_field "$2"
-    ui_field_box "ввод скрыт · Enter — готово · Ctrl+C — отмена"
-    local v
-    { read -r -s -p "  ${C_ACC}❯${C_RESET} " v; } <"$TTY" 2>"$TTY" || { stty echo <"$TTY" 2>/dev/null; return 1; }
-    echo >"$TTY"
-    printf '%s' "$v"
+    local v rc
+    trap ':' INT
+    while :; do
+        ui_head "$1"
+        ui_field "$2"
+        ui_field_box "ввод скрыт · Enter — готово · Ctrl+C — $(ui_cancel_word)"
+        v=$( { read -r -s -p "  ${C_ACC}❯${C_RESET} " _x; } <"$TTY" 2>"$TTY" || exit 1; printf '%s' "$_x"); rc=$?
+        stty echo <"$TTY" 2>/dev/null
+        echo >"$TTY"
+        (( rc == 0 )) && { printf '%s' "$v"; return 0; }
+        (( rc > 128 && ${UI_GUARD:-0} )) || return 1
+        ui_cancel_confirm && return 1
+    done
 }
 
 # Нумерованный список.
@@ -1142,8 +1400,7 @@ _ui_list() { # заголовок текст тег описание ... → std
         if (( UI_BANNER )); then
             ui_banner
         else
-            printf '\n  %s%s SkipIt Tool%s %s›%s %s%s%s\n' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_ACC" "$C_RESET" "$C_TXT" "$title" "$C_RESET"
-            ui_rule
+            ui_titlebar "$title"
             [[ -n $UI_CTX ]] && { echo; ui_ctx; }
         fi
         if [[ -n $text ]]; then
@@ -1154,12 +1411,21 @@ _ui_list() { # заголовок текст тег описание ... → std
         local total=0 i=1 nw
         while (( i < $# )); do [[ -n ${!i} ]] && total=$((total + 1)); i=$((i + 2)); done
         nw=$(( ${#total} + 2 ))
-        local lead=1; (( UI_BANNER )) && lead=0
+        local lead=1 danger=0; (( UI_BANNER )) && lead=0
         while (( $# >= 2 )); do
             if [[ -z $1 ]]; then
                 if [[ -n $2 ]]; then
                     (( lead )) || echo
-                    printf '  %s %s %s\n' "$C_SECTION" "$2" "$C_RESET"
+                    # «Опасные действия» - красной плашкой, пункты под ней тоже красные
+                    if [[ $2 == "Опасные действия" ]]; then
+                        danger=1; printf '  %s %s %s\n' $'\e[1;97;48;5;124m' "$2" "$C_RESET"
+                    elif [[ $2 == "Нужно исправить" ]]; then
+                        danger=0; printf '  %s %s %s\n' $'\e[1;97;48;5;124m' "$2" "$C_RESET"
+                    elif [[ $2 == "Стоит улучшить" ]]; then
+                        danger=0; printf '  %s %s %s\n' $'\e[1;30;48;5;179m' "$2" "$C_RESET"
+                    else
+                        danger=0; printf '  %s %s %s\n' "$C_SECTION" "$2" "$C_RESET"
+                    fi
                 else
                     echo
                 fi
@@ -1167,11 +1433,13 @@ _ui_list() { # заголовок текст тег описание ... → std
             else
                 lead=0
                 n=$((n + 1)); tags+=("$1")
-                printf '   %s%*s%s  %s%s%s\n' "$C_ACC" "$nw" "[$n]" "$C_RESET" "$C_TXT" "$2" "$C_RESET"
+                printf '   %s%*s%s  %s\e[%dG%s\n' "$C_ACC" "$nw" "[$n]" "$C_RESET" "$(ui_item_icon "$2")" $(( nw + 9 )) "$(ui_item_text "$2" "$danger")"
             fi
             shift 2
         done
-        printf '\n   %s%*s%s  %s%s%s\n' "$C_LABEL" "$nw" "[0]" "$C_RESET" "$C_HINT" "$UI_CANCEL" "$C_RESET"
+        # «Назад» - в той же колонке, что и текст пунктов, иконка - в колонке иконок
+        printf '\n   %s%*s%s  %s%s\e[%dG%s%s\n' "$C_LABEL" "$nw" "[0]" "$C_RESET" "$C_HINT" \
+            "$( [[ $UI_CANCEL == Выход ]] && echo '🚪' || echo '↩')" $(( nw + 9 )) "$UI_CANCEL" "$C_RESET"
         [[ -n $UI_FOOTER ]] && printf '%s\n' "$UI_FOOTER"
     } >"$TTY"
     local err="" keys="1-$n — выбрать · 0 — ${UI_CANCEL,,}"
@@ -1690,7 +1958,7 @@ revoke_sudo() {
     rm -f "$(sudoers_file "$1")"
 }
 
-user_create() { UI_CTX=""; _user_create; local rc=$?; UI_CTX=""; return $rc; }
+user_create() { local UI_GUARD=1; UI_CTX=""; _user_create; local rc=$?; UI_CTX=""; return $rc; }
 
 _user_create() {
     local u auth pass="" gen=0 keys="" want_sudo=0 nopass=0 shell=/bin/bash out summary nkeys
@@ -2226,21 +2494,24 @@ menu_ssh_server() {
         # Правило UFW его закрывает снаружи, но в списках он остаётся - объясняем.
         hint=""
         (( $(wc -w <<< "${live:-$ports}") > 1 )) && hint=$'\n\n! Портов несколько — смена порта не завершена: старый ещё слушается.\n  Закрыть его: «Сменить порт SSH» → ввести тот, который нужно оставить.\n  Правило UFW закрывает порт только снаружи, sshd продолжает его держать.'
-        c=$(ui_menu "SSH-сервер" "Порт SSH:        $(ssh_ports_ru)$(
+        c=$(ui_menu "SSH и пользователи" "Порт SSH:        $(ssh_ports_ru)$(
             [[ -n $live && $live != "$ports" ]] && printf '\nСлушает сейчас:  %s  ← расходится с конфигом' "${live// /, }" )
 Вход root:       $(ru_root "$root")
 Вход по паролю:  $(yn_ru "$pass")${hint}
 
 Изменения проверяются через sshd -t, при ошибке откатываются.
 Текущие подключения не разрываются." \
-            ""    "Настройки" \
+            ""    "SSH-сервер" \
             port  "Сменить порт SSH" \
             root  "Вход root" \
             pass  "Вход по паролю" \
+            ""    "Пользователи" \
+            accounts "Пользователи — создать, ключи, пароли, sudo" \
             ""    "Обзор и сброс" \
-            show  "Показать итоговые настройки" \
-            reset "Сбросить настройки SkipIt Tool") || return
+            show  "Показать итоговые настройки SSH" \
+            reset "Сбросить настройки SSH от SkipIt Tool") || return
         case $c in
+            accounts) menu_user_accounts ;;
             port)  ssh_change_port ;;
             root)  ssh_root_login ;;
             pass)  ssh_password_auth ;;
@@ -2250,24 +2521,8 @@ menu_ssh_server() {
     done
 }
 
-menu_users() {
-    local c root pass
-    while :; do
-        root=$(sshd_eff permitrootlogin); pass=$(sshd_eff passwordauthentication)
-        case $root in yes) root="разрешён" ;; no) root="запрещён" ;; prohibit-password|without-password) root="только по ключу" ;; esac
-        case $pass in yes) pass="разрешён" ;; no) pass="запрещён" ;; esac
-        c=$(ui_menu "SSH и пользователи" "Сервер:       $SERVER_IP
-SSH-порт:     $(ssh_ports_ru)
-Вход root:    ${root:-—}
-По паролю:    ${pass:-—}" \
-            accounts "Пользователи (создать, ключи, пароли, sudo)" \
-            sshd     "SSH-сервер (порт, вход root, пароли)") || return
-        case $c in
-            accounts) menu_user_accounts ;;
-            sshd)     menu_ssh_server ;;
-        esac
-    done
-}
+# SSH-сервер и пользователи - один экран: раньше это были два пункта лишнего меню
+menu_users() { menu_ssh_server; }
 
 menu_user_accounts() {
     local c
@@ -2799,11 +3054,11 @@ IPv6:       $([[ $(ufw_ipv6) == yes ]] && echo включён || echo отклю
             close    "Закрыть порт (удалить правила)" \
             ""       "Доступ" \
             "$toggle_tag" "$toggle_txt" \
-            ipv6     "$([[ $(ufw_ipv6) == yes ]] && echo "Отключить IPv6 в UFW" || echo "Включить IPv6 в UFW")" \
             block    "Заблокировать IP / подсеть" \
             allowip  "Разрешить весь трафик с IP" \
-            ""       "Политики и сброс" \
+            ""       "Настройки и сброс" \
             policy   "Политики по умолчанию" \
+            ipv6     "$([[ $(ufw_ipv6) == yes ]] && echo "Отключить IPv6 в UFW" || echo "Включить IPv6 в UFW")" \
             reset    "Сбросить все правила") || return
         case $c in
             status)  ufw_show_status ;;
@@ -2880,14 +3135,47 @@ swap_ensure() {
 # Основной сетевой интерфейс и его очередь
 sysctl_iface()  { ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}'; }
 qdisc_now()     { tc qdisc show dev "$1" root 2>/dev/null | awk '{print $2; exit}'; }
-sysctl_profile_ru() { case $1 in fq) echo "fq + BBR" ;; cake) echo "CAKE + BBR" ;; *) echo "${1:-не записан}" ;; esac; }
-sysctl_file_profile() { [[ -f $SYSCTL_FILE ]] && sysctl_file_value net.core.default_qdisc; }
+# Профили: fq и cake - общие, lite/far/udp - под задачу ноды (все три на fq + BBR)
+sysctl_profile_ru() {
+    case $1 in
+        fq)   echo "fq + BBR" ;;
+        cake) echo "CAKE + BBR" ;;
+        lite) echo "Лёгкий · fq + BBR" ;;
+        far)  echo "Дальние клиенты · fq + BBR" ;;
+        udp)  echo "UDP · fq + BBR" ;;
+        *)    echo "${1:-не записан}" ;;
+    esac
+}
+sysctl_qdisc_of() { [[ $1 == cake ]] && echo cake || echo fq; }   # очередь профиля
+# Профиль записанного файла: по метке, у старых файлов - по очереди
+sysctl_file_profile() {
+    [[ -f $SYSCTL_FILE ]] || return 0
+    local p; p=$(sed -n 's/^# skipit-profile: *\([a-z]*\).*/\1/p' "$SYSCTL_FILE" | head -n 1)
+    [[ -n $p ]] && echo "$p" || sysctl_file_value net.core.default_qdisc
+}
 
-sysctl_template() { # fq|cake
-    local q=${1:-fq} ct; ct=$(sysctl_ct_max)
+sysctl_template() { # fq|cake|lite|far|udp
+    local prof=${1:-fq} q ct; ct=$(sysctl_ct_max); q=$(sysctl_qdisc_of "$prof")
+    # Буферы и очереди по профилю: rmem/wmem max, tcp_rmem/tcp_wmem (мин, старт, max),
+    # notsent_lowat, backlog, таймауты UDP в conntrack
+    local bmax=33554432 trm="4096 131072 33554432" twm="4096 65536 33554432" nsl=131072 \
+          bl=65536 bud=600 udpmin=16384 udpto=60 udpst=180 twb=1048576 extra=""
+    case $prof in
+        lite) bmax=16777216; trm="4096 87380 8388608"; twm="4096 65536 8388608"; nsl=65536
+              bl=16384; twb=262144
+              extra="# Лёгкий: буферы до 8 МБ на соединение - сотня клиентов не съест RAM сервера" ;;
+        far)  bmax=67108864; trm="4096 262144 67108864"; twm="4096 131072 67108864"
+              extra="# Дальние клиенты: буферы до 64 МБ - скорость держится при пинге 100-300 мс
+# и после потерь у мобильных; метрики прошлых соединений не мешают новым
+net.ipv4.tcp_no_metrics_save = 1" ;;
+        udp)  bmax=33554432; bl=131072; bud=1000; udpmin=65536; udpto=120; udpst=300
+              extra="# UDP: Hysteria2/TUIC/WireGuard ставят себе буфер до rmem_max - 32 МБ хватает
+# на гигабит; очередь входящих пакетов длиннее, UDP-сессии живут дольше" ;;
+    esac
     cat <<EOF
 # Оптимизация ядра для xray-ноды (100+ пользователей). Файл записан SkipIt Tool.
-# Профиль: $(sysctl_profile_ru "$q")
+# skipit-profile: $prof
+# Профиль: $(sysctl_profile_ru "$prof")
 # Применить вручную: sysctl -p $SYSCTL_FILE
 # TCP Fast Open намеренно не включается.
 
@@ -2914,27 +3202,27 @@ net.ipv4.tcp_congestion_control = bbr
 # трафик, поэтому высокий потолок не съедает RAM на простаивающих клиентах
 net.core.rmem_default = 262144
 net.core.wmem_default = 262144
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
+net.core.rmem_max = $bmax
+net.core.wmem_max = $bmax
 net.core.optmem_max = 65536
-net.ipv4.tcp_rmem = 4096 131072 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_rmem = $trm
+net.ipv4.tcp_wmem = $twm
+net.ipv4.udp_rmem_min = $udpmin
+net.ipv4.udp_wmem_min = $udpmin
 
 # Задержка: не копить неотправленное в ядре, не сбрасывать разгон на паузах
-net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_notsent_lowat = $nsl
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 
 # Много одновременных подключений и пакетов
 net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65536
-net.core.netdev_budget = 600
+net.core.netdev_max_backlog = $bl
+net.core.netdev_budget = $bud
 net.core.netdev_budget_usecs = 8000
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = 1048576
+net.ipv4.tcp_max_tw_buckets = $twb
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_rfc1337 = 1
@@ -2950,8 +3238,8 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 60
-net.netfilter.nf_conntrack_udp_timeout = 60
-net.netfilter.nf_conntrack_udp_timeout_stream = 180
+net.netfilter.nf_conntrack_udp_timeout = $udpto
+net.netfilter.nf_conntrack_udp_timeout_stream = $udpst
 
 # Исходящие порты с 10000: не займут порты сервисов ноды (2222, 8443...)
 net.ipv4.ip_local_port_range = 10000 65535
@@ -2959,6 +3247,7 @@ net.ipv4.ip_local_port_range = 10000 65535
 # Память: не уходить в swap, пока есть RAM
 vm.swappiness = 10
 EOF
+    [[ -n $extra ]] && printf '\n%s\n' "$extra"
 }
 
 sysctl_keys() { # ключи из текста на stdin
@@ -3044,21 +3333,26 @@ sysctl_errors_text() { # ошибки
     printf ':\n%s\n' "$1"
 }
 
-# Выбор профиля с текущим состоянием сверху -> fq|cake
+# Выбор профиля с текущим состоянием сверху -> fq|cake|lite|far|udp
 sysctl_choose_profile() { # заголовок
-    local ifc; ifc=$(sysctl_iface)
+    local ifc ram rec; ifc=$(sysctl_iface); ram=$(sysctl_ram_mb)
+    # совет по этому серверу: до ~1 ГБ RAM - лёгкий, иначе fq
+    [[ $ram =~ ^[0-9]+$ ]] && (( ram <= 1100 )) && rec=lite || rec=fq
     ui_choose "$1" "TCP сейчас:      $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 Очередь сейчас:  $(qdisc_now "$ifc") (${ifc:-?})
 Профиль SkipIt Tool:  $(sysctl_profile_ru "$(sysctl_file_profile)")
-Сервер:          RAM $(sysctl_ram_mb) МБ · CPU $(nproc 2>/dev/null)
+Сервер:          RAM $ram МБ · CPU $(nproc 2>/dev/null)
 
-── Профили
-fq + BBR:    точный темп отправки, минимальная нагрузка на CPU
-CAKE + BBR:  делит канал поровну между пользователями, нагрузка на CPU выше
+ℹ Все профили включают BBR. Для этого сервера подходит: $(sysctl_profile_ru "$rec")
 
 Какой профиль?" \
-        fq   "fq + BBR" \
-        cake "CAKE + BBR"
+        "" "Основные" \
+        fq   "fq + BBR — для большинства нод$( [[ $rec == fq ]] && echo " · рекомендуется")" \
+        cake "CAKE + BBR — делит канал поровну между клиентами, CPU выше" \
+        "" "Под задачу ноды" \
+        lite "Лёгкий — сервер до 1 ГБ RAM, буферы меньше$( [[ $rec == lite ]] && echo " · рекомендуется")" \
+        far  "Дальние клиенты — пинг 100+ мс, мобильные, буферы до 64 МБ" \
+        udp  "UDP — Hysteria2, TUIC, WireGuard: большие буферы UDP"
 }
 
 sysctl_install() {
@@ -3072,13 +3366,14 @@ sysctl_install() {
         return
     fi
     ifc=$(sysctl_iface)
+    local q; q=$(sysctl_qdisc_of "$prof")
     n=$(sysctl_template "$prof" | sysctl_keys | wc -l)
     [[ -f $SYSCTL_FILE ]] && exists=$'\n'"Файл уже есть — текущая версия сохранится в бэкап."
     ui_yesno "Оптимизация ядра" "Профиль:     $(sysctl_profile_ru "$prof")
 Файл:        $SYSCTL_FILE
 Параметров:  $n
 conntrack:   $(sysctl_ct_max) соединений (по RAM $(sysctl_ram_mb) МБ)
-Интерфейс:   ${ifc:-?} → очередь $prof
+Интерфейс:   ${ifc:-?} → очередь $q
 ${exists}
 Применяется сразу и сохраняется после перезагрузки.
 
@@ -3087,7 +3382,7 @@ ${exists}
     mkdir -p "$(dirname "$SYSCTL_FILE")" "$SKIPIT_ETC"
     old_keys=$(sysctl_file_keys)
     new_keys=$(sysctl_template "$prof" | sysctl_keys)
-    sysctl_load_modules "$prof"
+    sysctl_load_modules "$q"
     # shellcheck disable=SC2046
     sysctl_remember $(echo "$new_keys")
     [[ -f $SYSCTL_FILE ]] && bak=$(backup_file "$SYSCTL_FILE")
@@ -3097,7 +3392,7 @@ ${exists}
     # shellcheck disable=SC2046
     [[ -n $removed ]] && sysctl_restore_keys $(echo "$removed")
     errs=$(sysctl_apply_file)
-    qerr=$(sysctl_apply_qdisc "$prof")
+    qerr=$(sysctl_apply_qdisc "$q")
     [[ -n $qerr ]] && errs+=$'\n'"tc: $qerr"
     log "sysctl install $SYSCTL_FILE profile=$prof${bak:+ (backup: $bak)}"
     ui_msg "Готово" "Профиль:  $(sysctl_profile_ru "$prof")
@@ -3194,7 +3489,7 @@ TCP:             $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         [[ $VIRT == lxc || $VIRT == openvz ]] && hdr+=$'\n\n'"ВНИМАНИЕ: $VIRT — многие параметры ядра недоступны."
         c=$(ui_menu "Ядро Linux (sysctl)" "$hdr" \
             ""       "Профиль" \
-            install  "Записать профиль (fq + BBR / CAKE + BBR)" \
+            install  "Записать профиль — fq, CAKE, Лёгкий, Дальние, UDP" \
             template "Что будет записано" \
             ""       "Параметры" \
             show     "Текущие значения параметров" \
@@ -3696,7 +3991,14 @@ menu_ipv6() {
 
 node_step() { # "1/6  Docker"
     G_NOTE_OPEN=0
-    printf '\n  %s[%s]%s %s%s%s\n' "$C_ACC" "${1%% *}" "$C_RESET" "$C_TXT" "${1#*  }" "$C_RESET"
+    local nm=${1%% *} cur tot bar="" i
+    cur=${nm%%/*}; tot=${nm##*/}
+    if [[ $cur =~ ^[0-9]+$ && $tot =~ ^[0-9]+$ ]] && (( tot > 0 )); then
+        for (( i = 1; i <= tot; i++ )); do if (( i <= cur )); then bar+="━━"; else bar+="──"; fi; done
+        printf '\n  %s%s%s %s%s%s  %s%s%s\n' "$C_OK" "$bar" "$C_RESET" "$C_ACC" "$nm" "$C_RESET" "$C_QST" "${1#*  }" "$C_RESET"
+    else
+        printf '\n  %s[%s]%s %s%s%s\n' "$C_ACC" "$nm" "$C_RESET" "$C_TXT" "${1#*  }" "$C_RESET"
+    fi
 }
 n_say()     { G_NOTE_OPEN=0; printf '       %s%s%s\n' "$C_NOTE" "$*" "$C_RESET"; }
 node_fail() { printf '\n  %s✗%s %s%s%s\n' "$C_ERR" "$C_RESET" "$C_TXT" "$*" "$C_RESET"; log "node: FAIL $*"; pause; }
@@ -3721,7 +4023,8 @@ cert_domains() { openssl x509 -noout -ext subjectAltName -in "$(cert_file "$1")"
 cert_method_ru() { # имя
     local a; a=$(awk -F' = ' '$1=="authenticator"{print $2}' "/etc/letsencrypt/renewal/$1.conf" 2>/dev/null)
     case $a in
-        standalone) echo "HTTP-01" ;; dns-cloudflare) echo "Cloudflare DNS (wildcard)" ;;
+        standalone) grep -q 'zerossl' "/etc/letsencrypt/renewal/$1.conf" 2>/dev/null && echo "HTTP-01 · ZeroSSL" || echo "HTTP-01" ;;
+        dns-cloudflare) echo "Cloudflare DNS (wildcard)" ;;
         "") echo "неизвестно" ;; *) echo "$a" ;;
     esac
 }
@@ -3825,11 +4128,29 @@ cert_fail_reason() { # → многострочный текст или пуст
     local err when
     err=$(cert_last_error) || return 1
     case $err in
-        *rateLimited*|*"too many certificates"*)
+        *rateLimited*|*"too many"*)
+            # время снятия - по часам сервера, а не в UTC
             when=$(sed -n 's/.*retry after \([0-9-]* [0-9:]*\) UTC.*/\1/p' <<< "$err")
-            printf 'Лимит Let'"'"'s Encrypt: на этот набор доменов за последнюю неделю\nуже выпущено 5 сертификатов.'
-            [[ -n $when ]] && printf '\nПовторить можно после %s UTC.' "$when"
-            printf '\n\nЧто можно сделать:\n  · дождаться снятия лимита\n  · выпустить сертификат на ДРУГОЙ набор имён — счётчик у каждого набора свой\n  · выпустить через Cloudflare DNS на зону и *.зону'
+            [[ -n $when ]] && when=$(date -d "$when UTC" '+%d.%m %H:%M' 2>/dev/null || echo "$when UTC")
+            if [[ $err == *"per-registered-domain"* || $err == *"already issued for \""* ]]; then
+                # 50 в неделю на весь домен второго уровня - считаются ВСЕ его поддомены
+                local reg; reg=$(sed -n 's/.*already issued for \\\{0,1\}"\([^"\\]*\)\\\{0,1\}".*/\1/p' <<< "$err")
+                printf 'Лимит Let'"'"'s Encrypt на домен %s: за неделю на его поддомены\nуже выпущено 50 сертификатов — это не ваши, а всех, кто им пользуется.' "${reg:-второго уровня}"
+                [[ -n $when ]] && printf '\nСвободное место появится около %s — но его могут снова занять другие.' "$when"
+                printf '\n\nЭто бывает с общими бесплатными доменами (strangled.net, mooo.com и т. п.).\nЧто можно сделать:\n  · взять свой домен — от 100–200 ₽ в год, лимит будет только ваш\n  · бесплатный DuckDNS (имя.duckdns.org) — там у каждого поддомена свой лимит\n  · попробовать позже, после указанного времени'
+            elif [[ $err == *"exact set"* || $err == *"duplicate"* ]]; then
+                printf 'Лимит Let'"'"'s Encrypt: на этот же набор имён за неделю уже выпущено\n5 сертификатов (частые переустановки).'
+                [[ -n $when ]] && printf '\nПовторить можно после %s.' "$when"
+                printf '\n\nЧто можно сделать:\n  · дождаться снятия лимита\n  · выпустить на ДРУГОЙ набор имён — счётчик у каждого набора свой\n  · выпустить через Cloudflare DNS на зону и *.зону'
+            elif [[ $err == *"failed authorization"* || $err == *"failed validation"* ]]; then
+                printf 'Лимит Let'"'"'s Encrypt: слишком много неудачных проверок домена за час.'
+                [[ -n $when ]] && printf '\nПовторить можно после %s.' "$when"
+                printf '\n\nСначала проверьте, что A-запись домена ведёт на этот сервер и порт 80 открыт.'
+            else
+                printf 'Лимит Let'"'"'s Encrypt.'
+                [[ -n $when ]] && printf ' Повторить можно после %s.' "$when"
+                printf '\n\n%s' "$err"
+            fi
             ;;
         *urn:ietf:params:acme:error:*)
             printf '%s' "$err" ;;
@@ -3837,14 +4158,65 @@ cert_fail_reason() { # → многострочный текст или пуст
     esac
 }
 
+# ZeroSSL - второй бесплатный центр сертификации, по тому же протоколу ACME,
+# но со своими лимитами: выручает, когда у Let's Encrypt кончился лимит на домен
+# (общие домены вроде strangled.net). Ключи доступа (EAB) выдаются по email
+# автоматически; адрес ZeroSSL certbot запоминает в renewal - продление само.
+ZEROSSL_ACME="https://acme.zerossl.com/v2/DV90"
+CERT_CA=""            # "" - Let's Encrypt, zerossl - ZeroSSL (для cert_issue_http)
+ZS_ERR=""
+zerossl_eab() { # email → ZS_KID ZS_HMAC
+    local r
+    ZS_KID=""; ZS_HMAC=""; ZS_ERR=""
+    r=$(curl -sS --max-time 20 -X POST "https://api.zerossl.com/acme/eab-credentials-email" \
+        --data-urlencode "email=$1" 2>&1) || { ZS_ERR="нет связи с api.zerossl.com"; return 1; }
+    ZS_KID=$(sed -n 's/.*"eab_kid" *: *"\([^"]*\)".*/\1/p' <<< "$r")
+    ZS_HMAC=$(sed -n 's/.*"eab_hmac_key" *: *"\([^"]*\)".*/\1/p' <<< "$r")
+    [[ -n $ZS_KID && -n $ZS_HMAC ]] && return 0
+    ZS_ERR="ZeroSSL не выдал ключи: $(sed -n 's/.*"type" *: *"\([^"]*\)".*/\1/p' <<< "$r" | head -n 1)"
+    return 1
+}
+cert_ca_ru() { [[ ${1:-$CERT_CA} == zerossl ]] && echo "ZeroSSL" || echo "Let's Encrypt"; }
+
+# Let's Encrypt отказал из-за лимита - предложить сразу выпустить через ZeroSSL,
+# не начиная установку заново. Email без него не обойтись - спросим, если пусто.
+cert_retry_zerossl() { # имя-переменной-email домен...
+    local -n _em=$1; shift
+    [[ $CERT_CA == zerossl ]] && return 1
+    local err; err=$(cert_last_error) || return 1
+    [[ $err == *rateLimited* || $err == *"too many"* ]] || return 1
+    ui_yesno "Лимит Let's Encrypt" "$(cert_fail_reason)
+
+Выпустить сертификат через ZeroSSL прямо сейчас?
+Проверка та же, через 80 порт, продление — автоматическое.
+
+Выпустить через ZeroSSL?" || return 1
+    while [[ -z $_em ]]; do
+        _em=$(ui_input "ZeroSSL · email" "ZeroSSL выдаёт ключи доступа по email — без него не выпустит.
+
+Email:") || return 1
+        _em=${_em//[[:space:]]/}
+        [[ $_em =~ ^[^@]+@[^@]+\.[^@]+$ ]] || { ui_msg "Ошибка" "Некорректный email: «$_em»"; _em=""; }
+    done
+    clear
+    CERT_CA=zerossl
+    say "Выпускаю сертификат ZeroSSL для $(cert_list_ru "$@")..."
+    cert_issue_http "$_em" "$@"
+}
+
 cert_issue_http() { # email домен... (все домены - в один сертификат, имя по первому)
     local rc em=(--register-unsafely-without-email) email=$1 d
-    local -a args=()
+    local -a args=() ca=()
     shift
     [[ -n $email ]] && em=(-m "$email")
     for d; do args+=(-d "$d"); done
+    if [[ $CERT_CA == zerossl ]]; then
+        [[ -n $email ]] || { ZS_ERR="для ZeroSSL нужен email"; return 1; }
+        zerossl_eab "$email" || return 1
+        ca=(--server "$ZEROSSL_ACME" --eab-kid "$ZS_KID" --eab-hmac-key "$ZS_HMAC")
+    fi
     "$ACME_OPEN" force
-    certbot certonly --standalone --non-interactive --agree-tos "${em[@]}" \
+    certbot certonly --standalone --non-interactive --agree-tos "${em[@]}" "${ca[@]}" \
         --cert-name "$1" "${args[@]}" --key-type ecdsa
     rc=$?
     "$ACME_CLOSE"
@@ -4263,7 +4635,7 @@ services:
     cap_add:
       - NET_ADMIN
     ulimits:
-      nofile: 262144
+      nofile: 1048576
     env_file: .env
     volumes:
       - ./run:${NODE_SOCK_DIR}
@@ -4427,7 +4799,22 @@ node_tag() { # домен тип(steal|xhttp|ws)
     case $2 in ws) echo "ws-bal-$n" ;; *) echo "$2-$n" ;; esac
 }
 
-node_reality_json() { # домен → realitySettings (отступ 8)
+node_reality_json() { # домен [схема] → realitySettings (отступ 8)
+    local lim=""
+    # Балансир: трафик, который REALITY отдаёт сайту-заглушке (чужие и сканеры),
+    # ограничен по скорости после первого мегабайта - заглушку не выкачать и
+    # не использовать как зеркало, а прощупывание сервера идёт медленно
+    [[ ${2:-} == balancer ]] && lim=',
+          "limitFallbackUpload": {
+            "afterBytes": 1048576,
+            "bytesPerSec": 65536,
+            "burstBytesPerSec": 131072
+          },
+          "limitFallbackDownload": {
+            "afterBytes": 1048576,
+            "bytesPerSec": 262144,
+            "burstBytesPerSec": 524288
+          }'
 cat <<EOF
         "realitySettings": {
           "target": "$NODE_SOCK",
@@ -4435,7 +4822,7 @@ cat <<EOF
           "xver": 2,
           "shortIds": [$(sed 's/[^,]*/"&"/g; s/,/, /g' <<< "$NODE_SID")],
           "privateKey": "$NODE_PRIV",
-          "serverNames": ["$1"]
+          "serverNames": ["$1"]$lim
         }
 EOF
 }
@@ -4489,7 +4876,7 @@ $(node_sniffing_json)
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
-$(node_reality_json "$1"),
+$(node_reality_json "$1" "$2"),
 $(node_sockopt_json)
       }
 EOF
@@ -4514,7 +4901,7 @@ $(node_sniffing_json)
           "path": "$NODE_XHTTP_PATH",
           "extra": {
             "xmux": {
-              "cMaxReuseTimes": "50-100",
+              "cMaxReuseTimes": "100-200",
               "maxConcurrency": "4-8",
               "maxConnections": 0,
               "hKeepAlivePeriod": 0,
@@ -4529,7 +4916,7 @@ $(node_sniffing_json)
             "scStreamUpServerSecs": "10-40"
           }
         },
-$(node_reality_json "$1"),
+$(node_reality_json "$1" "$2"),
 $(node_sockopt_json)
       }
     },
@@ -4625,7 +5012,7 @@ ui_wrap() { # текст ширина
 g_note() {
     local first=$(( ! G_NOTE_OPEN )) w line
     g_flush
-    w=$(( ${UI_W:-78} - 6 )); (( w > 66 )) && w=66; (( w < 30 )) && w=30
+    w=$(( ${UI_W:-78} - 6 )); (( w > 80 )) && w=80; (( w < 30 )) && w=30
     while IFS= read -r line; do
         if (( first )); then
             printf '  %s i %s %s%s%s\n' "$C_BADGE" "$C_RESET" "$C_NOTE" "$line" "$C_RESET" >"$TTY"
@@ -4672,7 +5059,7 @@ G_ROWS=()
 g_kv()   { G_NOTE_OPEN=0; G_ROWS+=("$1"$'\t'"$2"); }
 # Цвет значения в таблицах по смыслу; если не распознано - цвет по умолчанию
 ui_cell_color() { # значение цвет_по_умолчанию
-    local re='^[▰▱]+ ([0-9]+)%'
+    local re='^[━─▰▱]+ ([0-9]+)%'
     if [[ $1 =~ $re ]]; then
         if (( BASH_REMATCH[1] < 60 )); then printf '%s' "$C_OK"
         elif (( BASH_REMATCH[1] < 85 )); then printf '%s' "$C_WARN"
@@ -4680,77 +5067,76 @@ ui_cell_color() { # значение цвет_по_умолчанию
         return
     fi
     case $1 in
-        да|активен|работает|включён|включена|действует*|разрешить|совпадает|разбан) printf '%s' "$C_OK" ;;
-        нет|0|—|выключена) printf '%s' "$C_HINT" ;;
-        выключен*|"не установлен"|скоро*|≠*|остановлен) printf '%s' "$C_WARN" ;;
-        заблокирован|ОСТАНОВЛЕН|ПЕРЕЗАПУСКАЕТСЯ|истёк|НЕТ|запретить|отклонить|бан) printf '%s' "$C_ERR" ;;
+        да|да\ *|активен|работает*|включён*|включена*|вкл|действует*|разрешить|совпадает|разбан|подключён*|установлен*|установлена*|отправлен*|"время синхронизировано"|автоматически*) printf '%s' "$C_OK" ;;
+        нет|0|—|выключена|"ещё не было"|пусто|"без ограничений") printf '%s' "$C_HINT" ;;
+        выключен*|выкл|"не "*|скоро*|≠*|остановлен*|вручную*) printf '%s' "$C_WARN" ;;
+        заблокирован|ОСТАНОВЛЕН|ПЕРЕЗАПУСКАЕТСЯ|истёк|НЕТ|запретить|отклонить|бан|ошибка*|"нет связи"*) printf '%s' "$C_ERR" ;;
         *) printf '%s' "$2" ;;
     esac
 }
 
 # Таблица с колонками: строки "a<TAB>b<TAB>c", первая - заголовок
 T_ROWS=()
+# Таблицы - в стиле главного экрана: без рамок, колонки ровно, под заголовком
+# тонкая линия. Цвет значений - по смыслу (ui_cell_color).
 t_flush() {
     (( ${#T_ROWS[@]} )) || return 0
-    local -a w cells; local r i c col line sep top bot
+    local -a w cells hdr; local r i c col line n=0 total=0
     for r in "${T_ROWS[@]}"; do
         IFS=$'\t' read -ra cells <<< "$r"
         for i in "${!cells[@]}"; do (( ${#cells[$i]} > ${w[$i]:-0} )) && w[$i]=${#cells[$i]}; done
     done
-    top="╭"; sep="├"; bot="╰"
-    for i in "${!w[@]}"; do
-        line=$(printf '─%.0s' $(seq 1 $(( w[i] + 2 ))))
-        top+=$line; sep+=$line; bot+=$line
-        if (( i < ${#w[@]} - 1 )); then top+="┬"; sep+="┼"; bot+="┴"; fi
-    done
-    top+="╮"; sep+="┤"; bot+="╯"
+    for i in "${!w[@]}"; do total=$(( total + w[i] + 3 )); done
+    IFS=$'\t' read -ra hdr <<< "${T_ROWS[0]}"
     {
-        printf '  %s%s%s\n' "$C_DIM" "$top" "$C_RESET"
-        local n=0; local -a hdr; IFS=$'\t' read -ra hdr <<< "${T_ROWS[0]}"
         for r in "${T_ROWS[@]}"; do
             IFS=$'\t' read -ra cells <<< "$r"
-            line="$C_DIM│$C_RESET"
+            line=""
             for i in "${!w[@]}"; do
                 c=${cells[$i]:-}
                 if (( n == 0 )); then col=$C_LABEL
                 elif [[ ${hdr[$i]:-} == Успешно ]]; then col=$C_OK
                 elif [[ ${hdr[$i]:-} == Внимание ]]; then (( ${c:-0} > 0 )) && col=$C_WARN || col=$C_HINT
                 elif [[ ${hdr[$i]:-} == Ошибки ]]; then (( ${c:-0} > 0 )) && col=$C_ERR || col=$C_HINT
-                elif (( i == 0 )); then col=$C_OK
-                else
-                    col=$(ui_cell_color "$c" "$C_TXT")
-                fi
-                line+=" $col$(pad "$c" "${w[$i]}")$C_RESET $C_DIM│$C_RESET"
+                elif (( i == 0 )); then col=$C_QST
+                else col=$(ui_cell_color "$c" "$C_TXT"); fi
+                line+="$col$(pad "$c" "${w[$i]}")$C_RESET   "
             done
-            printf '  %s\n' "$line"
-            (( n == 0 )) && printf '  %s%s%s\n' "$C_DIM" "$sep" "$C_RESET"
+            printf '    %s\n' "$line"
+            (( n == 0 )) && printf '    %s%s%s\n' "$C_DIM" "$(printf '─%.0s' $(seq 1 $(( total - 3 ))))" "$C_RESET"
             n=$((n + 1))
         done
-        printf '  %s%s%s\n' "$C_DIM" "$bot" "$C_RESET"
     } >"$TTY"
     T_ROWS=()
 }
 
+# Пары «подпись — значение»: как статус на главном экране - одна и та же точка,
+# цвет по смыслу значения (зелёная - хорошо, жёлтая - внимание, красная - плохо,
+# приглушённая - просто сведения)
 g_flush() {
     G_NOTE_OPEN=0
     t_flush
     (( ${#G_ROWS[@]} )) || return 0
-    local r k v kw=0 vw=0 hk hv
-    for r in "${G_ROWS[@]}"; do
-        k=${r%%$'\t'*}; v=${r#*$'\t'}
-        (( ${#k} > kw )) && kw=${#k}; (( ${#v} > vw )) && vw=${#v}
-    done
-    hk=$(printf '─%.0s' $(seq 1 $((kw + 2)))); hv=$(printf '─%.0s' $(seq 1 $((vw + 2))))
+    local r k v kw=0 col dot vc
+    for r in "${G_ROWS[@]}"; do k=${r%%$'\t'*}; (( ${#k} > kw )) && kw=${#k}; done
+    vc=$(( kw + 8 )); (( vc < 18 )) && vc=18
     {
-        printf '  %s╭%s┬%s╮%s\n' "$C_DIM" "$hk" "$hv" "$C_RESET"
         for r in "${G_ROWS[@]}"; do
             k=${r%%$'\t'*}; v=${r#*$'\t'}
-            printf '  %s│%s %s%s%s %s│%s %s%s%s %s│%s\n' "$C_DIM" "$C_RESET" "$C_LABEL" "$(pad "$k" "$kw")" "$C_RESET" \
-                "$C_DIM" "$C_RESET" "$(ui_cell_color "$v" "$C_OK")" "$(pad "$v" "$vw")" "$C_RESET" "$C_DIM" "$C_RESET"
+            col=$(ui_cell_color "$v" "")
+            # под плашкой «Настроено» значения не действуют - всё приглушённым
+            (( ${UI_DIM_KV:-0} )) && col=$C_HINT
+            case $col in
+                "$C_OK")   dot="$C_OK●$C_RESET" ;;
+                "$C_WARN") dot="$C_WARN●$C_RESET" ;;
+                "$C_ERR")  dot="$C_ERR●$C_RESET" ;;
+                "$C_HINT") dot="$C_DIM●$C_RESET" ;;
+                *)         dot="$C_DIM●$C_RESET"; col=$C_QST ;;
+            esac
+            printf '  %s %s%s%s\e[%dG%s%s%s\n' "$dot" "$C_TXT" "$k" "$C_RESET" "$vc" "$col" "$v" "$C_RESET"
         done
-        printf '  %s╰%s┴%s╯%s\n' "$C_DIM" "$hk" "$hv" "$C_RESET"
     } >"$TTY"
-    G_ROWS=()
+    G_ROWS=(); UI_DIM_KV=0
 }
 # Блок для копирования (stdin): между линиями, без рамки по бокам - чтобы копировался чисто
 g_code() { g_flush; { ui_rule; printf '%s' "$C_TXT"; sed 's/^/    /'; printf '%s' "$C_RESET"; ui_rule; } >"$TTY"; }
@@ -4773,22 +5159,45 @@ g_code_kv() { # подпись значение [подпись значение
     } >"$TTY"
 }
 # Доп. параметры XHTTP для хоста: клиентская часть extra из inbound профиля
+# Клиентские значения xmux отличаются от серверных: соединение живёт дольше
+# (300-600 с, 300-500 запросов) и переиспользуется без ограничения по числу раз
 node_xhttp_extra_json() {
     cat <<'EOF'
 {
   "xmux": {
-    "cMaxReuseTimes": "50-100",
+    "cMaxReuseTimes": 0,
     "maxConcurrency": "4-8",
     "maxConnections": 0,
     "hKeepAlivePeriod": 0,
-    "hMaxRequestTimes": "200-400",
-    "hMaxReusableSecs": "20-40"
+    "hMaxRequestTimes": "300-500",
+    "hMaxReusableSecs": "300-600"
   },
   "headers": {},
   "noGRPCHeader": false,
   "xPaddingBytes": "100-1000",
   "scMaxEachPostBytes": 262144,
-  "scMinPostsIntervalMs": 50
+  "scMinPostsIntervalMs": 50,
+  "scStreamUpServerSecs": "10-40"
+}
+EOF
+}
+
+# Final mask хоста: TLS ClientHello клиента режется на 3-6 кусков по 100-300 байт
+# с паузой 10-20 мс - DPI не видит SNI целиком. Одинаковый у всех хостов ноды.
+node_final_mask_json() {
+    cat <<'EOF'
+{
+  "tcp": [
+    {
+      "type": "fragment",
+      "settings": {
+        "delays": ["10-20"],
+        "lengths": ["100-300"],
+        "packets": "tlshello",
+        "maxSplit": "3-6"
+      }
+    }
+  ]
 }
 EOF
 }
@@ -5142,6 +5551,7 @@ node_guide() { # домен порт схема [wizard]
                     g_kv "Отпечаток" "firefox" ;;
                 XHTTP)
                     g_kv "Путь" "$NODE_XHTTP_PATH"
+                    g_kv "Host" "$domain"
                     g_kv "SNI" "$domain"
                     g_kv "Отпечаток" "firefox"
                     # XHTTP ходит поверх HTTP/2, и без ALPN клиент договаривается
@@ -5164,6 +5574,9 @@ node_guide() { # домен порт схема [wizard]
                     g_kv "Отпечаток" "firefox"
                     g_kv "Шаблон Xray JSON" "balancer-$name" ;;
             esac
+            g_kv "Final mask" "вставьте целиком JSON ниже"
+            g_gap
+            node_final_mask_json | g_code
             g_gap
             g_steps "Сохраните хост"
             if [[ $h == WS ]]; then
@@ -5221,7 +5634,9 @@ WZ_NODE_DOMAIN=""; WZ_NODE_PORT=""; WZ_NODE_TPL=""
 
 wz_asked() { (( WZ_ON )); }   # «вопрос уже задан мастером» - использовать как: wz_asked || ui_yesno ...
 wz_reset() {
-    WZ_ON=0
+    # вместе с ответами - и их строки над экраном (UI_CTX), иначе после
+    # прерванного мастера «Домен панели ✓ …» висят в обычных меню
+    WZ_ON=0; UI_CTX=""
     WZ_PANEL_DOMAIN=""; WZ_SUB_DOMAIN=""; WZ_PROX_DOMS=""
     WZ_NODE_DOMAIN=""; WZ_NODE_PORT=""; WZ_NODE_TPL=""
 }
@@ -5279,6 +5694,7 @@ ncert_choice_ru() {
     case $NCERT_METHOD in
         reuse) echo "готовый ($NCERT_NAME)" ;;
         http)  echo "HTTP-01" ;;
+        zerossl) echo "HTTP-01 · ZeroSSL" ;;
         cf)    echo "Cloudflare DNS: $NCERT_BASE и *.$NCERT_BASE" ;;
     esac
 }
@@ -5300,8 +5716,8 @@ node_cert_from_panel() { # домен ноды
     local d=$1 z
     NCERT_METHOD=""; NCERT_NAME=""; NCERT_BASE=""; NCERT_TOKEN=""; NCERT_EMAIL=""
     case $CERT_METHOD in
-        http)
-            NCERT_METHOD=http; NCERT_NAME=$d; NCERT_EMAIL=$CERT_EMAIL ;;
+        http|zerossl)
+            NCERT_METHOD=$CERT_METHOD; NCERT_NAME=$d; NCERT_EMAIL=$CERT_EMAIL ;;
         cf)
             NCERT_METHOD=cf; NCERT_TOKEN=$CERT_TOKEN; NCERT_EMAIL=$CERT_EMAIL
             for z in "${CERT_ZONES[@]}"; do
@@ -5359,16 +5775,18 @@ node_cert_ask() { # домен [подпись в сводке]
     done
 
     if [[ -z $NCERT_METHOD ]]; then
-        NCERT_METHOD=$(ui_choose "SSL-сертификат" "Как выпустить сертификат Let's Encrypt для $domain?" \
-            http "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
-            cf   "Cloudflare DNS — wildcard *.домен (нужен API-токен)") || return 1
+        NCERT_METHOD=$(ui_choose "SSL-сертификат" "Как выпустить сертификат для $domain?" \
+            http    "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
+            cf      "Cloudflare DNS — wildcard *.домен (нужен API-токен)" \
+            zerossl "ZeroSSL — тоже через 80 порт, если у Let's Encrypt кончился лимит") || return 1
     fi
     case $NCERT_METHOD in
         reuse) ui_ctx_add "$label" "существующий ($NCERT_NAME)" ;;
         http)  ui_ctx_add "$label" "HTTP-01" ;;
+        zerossl) ui_ctx_add "$label" "HTTP-01 · ZeroSSL" ;;
         cf)    ui_ctx_add "$label" "Cloudflare DNS" ;;
     esac
-    if [[ $NCERT_METHOD == http ]]; then
+    if [[ $NCERT_METHOD == http || $NCERT_METHOD == zerossl ]]; then
         busy=$(port_listeners 80)
         if [[ -n $busy ]]; then
             ui_msg "Порт 80 занят" "HTTP-01 не сработает — порт 80 занят:
@@ -5420,10 +5838,18 @@ n — ввести токен заново.
     fi
     if [[ $NCERT_METHOD != reuse ]]; then
         while :; do
-            NCERT_EMAIL=$(ui_input "Email для Let's Encrypt" "На него придёт предупреждение, если сертификат не продлится.
+            if [[ $NCERT_METHOD == zerossl ]]; then
+                NCERT_EMAIL=$(ui_input "Email для ZeroSSL" "ZeroSSL выдаёт ключи доступа по email — без него не выпустит.
+На него же придёт предупреждение, если сертификат не продлится.
+
+Email (обязательно):") || return 1
+            else
+                NCERT_EMAIL=$(ui_input "Email для Let's Encrypt" "На него придёт предупреждение, если сертификат не продлится.
 
 Email (можно оставить пустым):") || return 1
+            fi
             NCERT_EMAIL=${NCERT_EMAIL//[[:space:]]/}
+            [[ $NCERT_METHOD == zerossl && -z $NCERT_EMAIL ]] && { ui_msg "Нужен email" "Для ZeroSSL email обязателен."; continue; }
             [[ -z $NCERT_EMAIL || $NCERT_EMAIL =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
             ui_msg "Ошибка" "Некорректный email: «$NCERT_EMAIL»"
         done
@@ -5433,7 +5859,7 @@ Email (можно оставить пустым):") || return 1
 }
 
 # ---- Установка ----
-node_install() { UI_CTX=""; _node_install; local rc=$?; UI_CTX=""; return $rc; }
+node_install() { local UI_GUARD=1; UI_CTX=""; _node_install; local rc=$?; UI_CTX=""; return $rc; }
 
 _node_install() {
     local domain panel_ip port secret method="" base="" token="" email="" tpl cert_name="" name d busy
@@ -5702,9 +6128,17 @@ $warn" || return
 $(cert_fail_reason || echo "Подробности выше и в /var/log/letsencrypt/letsencrypt.log")"; return; }
         else
             cert_name=$domain
-            cert_issue_http "$email" "$domain" || { node_fail "Certbot не смог выпустить сертификат.
+            CERT_CA=""; [[ $method == zerossl ]] && CERT_CA=zerossl
+            if ! cert_issue_http "$email" "$domain"; then
+                if cert_retry_zerossl email "$domain"; then
+                    method=zerossl
+                else
+                    node_fail "Certbot не смог выпустить сертификат.
 
-$(cert_fail_reason || echo "Проверьте A-запись и доступность 80 порта, подробности в /var/log/letsencrypt/letsencrypt.log")"; return; }
+$( [[ -n $ZS_ERR ]] && echo "$ZS_ERR" || cert_fail_reason || echo "Проверьте A-запись и доступность 80 порта, подробности в /var/log/letsencrypt/letsencrypt.log")"
+                    return
+                fi
+            fi
         fi
     else
         cert_write_hooks
@@ -5877,7 +6311,7 @@ diag_bad()  { DIAG+="  ✗ $*"$'\n'; DIAG_PROBLEMS="  ✗ $*"$'\n'"$DIAG_PROBLEM
 # Итог таблицей, сверху - всё, что требует внимания, ниже - проверки по разделам
 diag_show() { # заголовок [дополнение]
     local out
-    out="Успешно"$'\t'"Внимание"$'\t'"Ошибки"$'\n'"$DIAG_OK"$'\t'"$DIAG_WARN"$'\t'"$DIAG_BAD"
+    out="⟦summary⟧ $DIAG_OK $DIAG_WARN $DIAG_BAD"
     [[ -n $DIAG_PROBLEMS ]] && out+=$'\n\n'"── Требует внимания"$'\n'"${DIAG_PROBLEMS%$'\n'}"
     out+=$'\n'"${DIAG%$'\n'}"
     [[ -n ${2:-} ]] && out+=$'\n\n'"$2"
@@ -6237,7 +6671,7 @@ Let's Encrypt ограничивает число выпусков (5 в нед�
     command -v certbot >/dev/null 2>&1 || { ui_msg "Ошибка" "certbot не установлен."; return; }
     cert_write_hooks; cert_ensure_renew
     clear
-    [[ $(cert_method_ru "$NODE_CERT_NAME") == HTTP-01 ]] && "$ACME_OPEN" force
+    [[ $(cert_method_ru "$NODE_CERT_NAME") == HTTP-01* ]] && "$ACME_OPEN" force
     if [[ $c == test ]]; then
         certbot renew --dry-run --no-random-sleep-on-renew --cert-name "$NODE_CERT_NAME"; rc=$?
     else
@@ -7159,11 +7593,12 @@ panel_create_steal_host() { # uuid-профиля uuid-инбаунда доме
     [[ -n $inb ]] || { PANEL_HOST_ERR="в профиле не нашёлся инбаунд $(node_tag "$domain" steal)"; return 1; }
     remark=$(node_tag "$domain" steal)
     # Поля - ровно те, что мастер просил заполнить в UI: примечание, адрес, порт,
-    # SNI и отпечаток. Остальное панель проставит по умолчанию.
+    # SNI, отпечаток и Final mask. Остальное панель проставит по умолчанию.
     body=$(jq -cn --arg p "$prof" --arg i "$inb" --arg r "$remark" --arg d "$domain" \
+        --argjson fm "$(node_final_mask_json)" \
         '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$r,
           address:$d,port:443,sni:$d,fingerprint:"firefox",
-          securityLayer:"DEFAULT",isDisabled:false}') || {
+          securityLayer:"DEFAULT",isDisabled:false,finalMask:$fm}') || {
         PANEL_HOST_ERR="не удалось собрать запрос (jq)"; return 1; }
     panel_api_post "/hosts" "$body" >/dev/null || {
         PANEL_HOST_ERR="панель не приняла хост: $PANEL_API_ERR"; return 1; }
@@ -7197,8 +7632,9 @@ panel_squad_add_inbound() { # uuid-инбаунда
 
 # ==== Шаблон Xray JSON «RU-Routing» ====
 # Клиентский конфиг с раздельным роутингом: .ru, .su, .рф, госсайты, банки и
-# российские сервисы идут напрямую, Telegram - через прокси, IPv6 и QUIC на 443
-# закрыты. Панель отдаёт его клиентам Xray JSON вместо шаблона по умолчанию,
+# российские сервисы идут напрямую и резолвятся через DNS Яндекса (77.88.8.88),
+# остальное - DoH Cloudflare/Google через прокси. Telegram - через прокси,
+# торренты, IPv6 и QUIC на 443 закрыты, прокси выбирается балансиром по пингу. Панель отдаёт его клиентам Xray JSON вместо шаблона по умолчанию,
 # но только если шаблон выбран у хоста - сам по себе он ничего не меняет.
 # Заводится при установке панели и пересоздаётся пунктом меню.
 PANEL_RU_TPL="RU-Routing"
@@ -7231,34 +7667,596 @@ panel_ru_template_ensure() {
     return 0
 }
 
-panel_ru_routing_json() {
+# Российские домены: одним списком, а в шаблон он попадает дважды - в DNS через
+# Яндекс (77.88.8.88) и в правило «напрямую». Править список - только здесь.
+panel_ru_domains() {
+cat <<'SKIPIT_RU_DOMAINS_EOF'
+domain:ru
+domain:su
+domain:xn--p1ai
+domain:ipify.org
+domain:checkip.amazonaws.com
+domain:ifconfig.me
+domain:ipapi.is
+domain:iplocate.io
+domain:ip.sb
+domain:2ip.ru
+domain:mangalib.me
+domain:animego.me
+domain:showip.net
+domain:avtoto.ru
+domain:tilda.cc
+domain:kinescope.io
+domain:kinescopecdn.net
+domain:redheadsound.studio
+domain:vtbglobalperspectives.com
+domain:vtb-direct.com
+domain:sber.world
+domain:sber.ws
+domain:sbercoin.com
+domain:ssb.msk.ru
+domain:vlb100.ru
+domain:slavbank.ru
+domain:prvbank.ru
+domain:pvubank.com
+domain:vtb-grants.fut.ru
+domain:selkombank.ru
+domain:ankb.ru
+domain:bank-arzamas.ru
+domain:bankermak.ru
+domain:alefbank.com
+domain:forshtadt.ru
+domain:bfa.ru
+domain:rkbank.ru
+domain:mvs-bank.ru
+domain:bank-credit-suisse-moscow.ru
+domain:ziraatbank.ru
+domain:jpmorgan.ru
+domain:noosferabank.ru
+domain:westernunion.ru
+domain:tagbank.ru
+domain:korona.com
+domain:credit-zenit.ru
+domain:zenit-card.ru
+domain:autobahn.db.com
+domain:commerzbank.ru
+domain:mizuhogroup.com
+domain:ibamoscow.ru
+domain:ubs.com
+domain:smbcr-bank.ru
+domain:yoobusiness.ru
+domain:ru.ccb.com
+domain:bank131.com
+domain:asia-pay.ru
+domain:rncoluminis.ru
+domain:government.ru
+domain:gov.ru
+domain:gosuslugi.ru
+domain:gu-st.ru
+domain:emias.info
+domain:mgfoms.ru
+domain:edu.ru
+domain:cbr.ru
+domain:cikrf.ru
+domain:ebs.ru
+domain:goskey.ru
+domain:grfc.ru
+domain:izbirkom.ru
+domain:kremlin.ru
+domain:mil.ru
+domain:nalog.ru
+domain:xn--80ajghhoc2aj1c8b.xn--p1ai
+domain:mos.ru
+domain:mosreg.ru
+domain:spb.ru
+domain:sevastopol.ru
+domain:sev.ru
+domain:adygeya.ru
+domain:bashkiria.ru
+domain:buryatia.ru
+domain:chuvashia.ru
+domain:crimea.ru
+domain:dagestan.ru
+domain:grozny.ru
+domain:i-ola.ru
+domain:izhevsk.ru
+domain:kalmykia.ru
+domain:karelia.ru
+domain:kazan.ru
+domain:kchr.ru
+domain:khakassia.ru
+domain:mari-el.ru
+domain:mari.ru
+domain:mordovia.ru
+domain:nalchik.ru
+domain:ptz.ru
+domain:rkomi.ru
+domain:tatarstan.ru
+domain:tuva.ru
+domain:udm.ru
+domain:udmurtia.ru
+domain:ulan-ude.ru
+domain:vladikavkaz.ru
+domain:yakutia.ru
+domain:altai.ru
+domain:chita.ru
+domain:kamchatka.ru
+domain:khabarovsk.ru
+domain:khv.ru
+domain:krasnodar.su
+domain:krasnoyarsk.ru
+domain:kuban.ru
+domain:marine.ru
+domain:perm.ru
+domain:stavropol.ru
+domain:stv.ru
+domain:vl.ru
+domain:vladivostok.ru
+domain:amur.ru
+domain:arkhangelsk.ru
+domain:astrakhan.ru
+domain:belgorod.ru
+domain:bir.ru
+domain:bryansk.ru
+domain:cbg.ru
+domain:chel.ru
+domain:chelyabinsk.ru
+domain:ekburg.ru
+domain:xn--80acgfbsl1azdqr.xn--p1ai
+domain:irk.ru
+domain:irkutsk.ru
+domain:ivanovo.ru
+domain:jar.ru
+domain:kaluga.ru
+domain:kemerovo.ru
+domain:kirov.ru
+domain:koenig.ru
+domain:kostroma.ru
+domain:kurgan.ru
+domain:kursk.ru
+domain:lipetsk.ru
+domain:magadan.ru
+domain:murmansk.ru
+domain:nn.ru
+domain:nov.ru
+domain:novosibirsk.ru
+domain:nsk.ru
+domain:omsk.ru
+domain:orb.ru
+domain:oryol.ru
+domain:penza.ru
+domain:psk
+domain:psk.ru
+domain:pskov.ru
+domain:rnd.ru
+domain:ryazan.ru
+domain:sakhalin.ru
+domain:samara.ru
+domain:saratov.ru
+domain:simbirsk.ru
+domain:smolensk.ru
+domain:tambov.ru
+domain:tom.ru
+domain:tomsk.ru
+domain:tsaritsyn.ru
+domain:tsk.ru
+domain:tula.ru
+domain:tver.ru
+domain:tyumen.ru
+domain:vladimir.ru
+domain:vlg.ru
+domain:volgograd.ru
+domain:vologda.ru
+domain:voronezh.ru
+domain:vrn.ru
+domain:vyatka.ru
+domain:yaroslavl.ru
+domain:yuzhno-sakhalinsk.ru
+domain:chukotka.ru
+domain:jamal.ru
+domain:surgut.ru
+domain:yamal.ru
+domain:zdrav10.ru
+domain:1c-bitrix.ru
+domain:1c.ru
+domain:1cfresh.com
+domain:1cloud.ru
+domain:1internet.tv
+domain:2gis.ae
+domain:2gis.am
+domain:2gis.az
+domain:2gis.by
+domain:2gis.com
+domain:2gis.com.cy
+domain:2gis.cz
+domain:2gis.ge
+domain:2gis.kg
+domain:2gis.kz
+domain:2gis.ru
+domain:2gis.tj
+domain:2gis.ua
+domain:2gis.uz
+domain:47news.ru
+domain:4meeting.me
+domain:5ka.ru
+domain:5post.market
+domain:abr.ru
+domain:aclub.ru
+domain:adfox.ru
+domain:admetrica.ru
+domain:aeroflot.ru
+domain:alfa-bank.com
+domain:alfa-bank.ru
+domain:alfa-finance.com
+domain:alfa-fx.com
+domain:alfa-pc.com
+domain:alfa-usa.com
+domain:alfabank.com
+domain:alfabank.ru
+domain:alfafinance.biz
+domain:alfafinance.ru
+domain:alfafuture.com
+domain:alfafuture.ru
+domain:alfafx.com
+domain:alfaleasing.ru
+domain:alfaprivate.com
+domain:alformacap.com
+domain:alformacapital.com
+domain:auth-nsdi.ru
+domain:auto.ru
+domain:av.ru
+domain:avito.ru
+domain:avito.st
+domain:baltbank.ru
+domain:banka-ui.dev
+domain:banki.ru
+domain:bankline.ru
+domain:beeline.ru
+domain:beta-bank.com
+domain:bitrix24.ru
+domain:bronevik.com
+domain:cdn-tinkoff.ru
+domain:cdn-vk.ru
+domain:chizhik.club
+domain:citydrive.ru
+domain:clstorage.net
+domain:credistory.ru
+domain:csat.ru
+domain:cscampus.ru
+domain:dbo-dengi.online
+domain:dellin.ru
+domain:dixy.ru
+domain:dnevnik.ru
+domain:dns-shop.ru
+domain:dodopizza.ru
+domain:dom.ru
+domain:domclick.ru
+domain:donationalerts.com
+domain:drweb.ru
+domain:dzen.ru
+domain:dzeninfra.ru
+domain:e5.ru
+domain:edadeal.io
+domain:edadeal.ru
+domain:fastvps.ru
+domain:finuslugi.ru
+domain:fivepost.ru
+domain:fix-price.com
+domain:gazeta.ru
+domain:gazprombank.ru
+domain:gazprombank.tech
+domain:gazprompay.ru
+domain:gorodpay.ru
+domain:gpb.ru
+domain:gpmdi.ru
+domain:hh.ru
+domain:idx5.ru
+domain:imgsmail.ru
+domain:investalfabank.com
+domain:iz.ru
+domain:jivo.ru
+domain:jivochat.com
+domain:jivosite.com
+domain:jx5.ru
+domain:kaspersky.com
+domain:kaspersky.ru
+domain:kazanexpress.ru
+domain:kinopoisk-ru.clstorage.net
+domain:kinopoisk.ru
+domain:kommersant.ru
+domain:kp.ru
+domain:krasyar.ru
+domain:krd.ru
+domain:kuper.ru
+domain:lead-pro2023.online
+domain:lemanapro.ru
+domain:lenta.com
+domain:lenta.ru
+domain:lmru.tech
+domain:magnit.ru
+domain:mail.ru
+domain:max.ru
+domain:megafon.ru
+domain:megamarket.ru
+domain:megamarket.tech
+domain:memealerts.com
+domain:mirpayonline.ru
+domain:miya-news.online
+domain:mm.ru
+domain:mnogolososya.ru
+domain:moex.com
+domain:mradx.net
+domain:mts.ru
+domain:mtsdengi.ru
+domain:mvk.com
+domain:myapelsin.ru
+domain:mycdn.me
+domain:mymts.ru
+domain:naydex.net
+domain:nbki.ru
+domain:netmonet.co
+domain:nspk.ru
+domain:ok.ru
+domain:okcdn.ru
+domain:okko.sport
+domain:okko.tv
+domain:okolo.app
+domain:oneme.ru
+domain:ozon.ru
+domain:ozone.ru
+domain:ozonusercontent.com
+domain:perekrestok.ru
+domain:pochta.ru
+domain:psbank.ru
+domain:psblog.ru
+domain:qms.ru
+domain:rambler.ru
+domain:rbc.ru
+domain:res-nsdi.ru
+domain:rostaxi.org
+domain:rostelecom.ru
+domain:rshb.ru
+domain:rt.ru
+domain:rtbcdn.ru
+domain:russiacalling.com
+domain:rutube.ru
+domain:rutubelist.ru
+domain:rzd-bonus.ru
+domain:rzd.ru
+domain:sbermarket.ru
+domain:sbermegamarket.ru
+domain:sbpgpb.ru
+domain:sistema-capital.com
+domain:spvb.ru
+domain:static-storage.net
+domain:svoy.academy
+domain:t2.ru
+domain:tamtam.chat
+domain:taximaxim.ru
+domain:taxsee.com
+domain:tbank-online.com
+domain:tele2.ru
+domain:timeweb.cloud
+domain:timeweb.com
+domain:tips.tips
+domain:tnt-online.ru
+domain:tochka-tech.com
+domain:tochka.com
+domain:topdelivery.ru
+domain:trbcdn.net
+domain:tsx.x5static.net
+domain:tu-tu.ru
+domain:turbopages.org
+domain:tutu.ru
+domain:usedesk.ru
+domain:userapi.com
+domain:uxfeedback.ru
+domain:vgtrk.ru
+domain:victoria-group.ru
+domain:vk-analytics.ru
+domain:vk-apps.com
+domain:vk-apps.ru
+domain:vk-cdn.me
+domain:vk-cdn.net
+domain:vk-portal.net
+domain:vk.cc
+domain:vk.com
+domain:vk.company
+domain:vk.design
+domain:vk.link
+domain:vk.me
+domain:vk.ru
+domain:vk.team
+domain:vkcache.com
+domain:vkcloud-static.ru
+domain:vkgo.app
+domain:vklive.app
+domain:vkmessenger.app
+domain:vkmessenger.com
+domain:vkontakte.ru
+domain:vkuser.net
+domain:vkuseraudio.com
+domain:vkuseraudio.net
+domain:vkuseraudio.ru
+domain:vkusercdn.ru
+domain:vkuserlive.net
+domain:vkuserphoto.ru
+domain:vkuservideo.com
+domain:vkuservideo.net
+domain:vkuservideo.ru
+domain:vkusnoitochka.ru
+domain:vkusvill.ru
+domain:vkvideo.ru
+domain:vtb-liga.fut.ru
+domain:vtb-russia.com
+domain:vtb.bank.in
+domain:vtb.com
+domain:vtb.corp.ru
+domain:vtb.digital
+domain:vtb.fut.ru
+domain:vtb.promo
+domain:vtb.ru
+domain:vtb24.com
+domain:vtb24.ru
+domain:vtbcareer.com
+domain:vtbfamily.ru
+domain:vtbindia.com
+domain:vtbkep.site
+domain:vtbpartners.com
+domain:vtbrussia.com
+domain:vtbrussia.ru
+domain:vtbstrana.ru
+domain:wb.ru
+domain:webvisor.com
+domain:webvisor.org
+domain:whoosh.bike
+domain:wildberries.ru
+domain:wink.ru
+domain:x5.ru
+domain:x5.tech
+domain:x5club.ru
+domain:x5id.ru
+domain:x5l.ru
+domain:x5paket.ru
+domain:x5q.ru
+domain:xn----7sb7akeedqd.xn--p1ai
+domain:xn--80aacoonefzg3am8b1fsb.xn--p1ai
+domain:xn--90ab2c.xn--p1ai
+domain:xn--90aifd0aza.site
+domain:xn--b1aew.xn--p1ai
+domain:xn--d1acpjx3f.xn--p1ai
+domain:ya.ru
+domain:yads.tech
+domain:yandex
+domain:yandex-bank.net
+domain:yandex-images.clstorage.net
+domain:yandex-team.ru
+domain:yandex.aero
+domain:yandex.az
+domain:yandex.by
+domain:yandex.cloud
+domain:yandex.co.il
+domain:yandex.com
+domain:yandex.com.am
+domain:yandex.com.ge
+domain:yandex.com.ru
+domain:yandex.com.tr
+domain:yandex.com.ua
+domain:yandex.de
+domain:yandex.ee
+domain:yandex.eu
+domain:yandex.fi
+domain:yandex.fr
+domain:yandex.jobs
+domain:yandex.kg
+domain:yandex.kz
+domain:yandex.lt
+domain:yandex.lv
+domain:yandex.md
+domain:yandex.net
+domain:yandex.org
+domain:yandex.pl
+domain:yandex.ru
+domain:yandex.st
+domain:yandex.sx
+domain:yandex.tj
+domain:yandex.tm
+domain:yandex.tr
+domain:yandex.ua
+domain:yandex.uz
+domain:yandexadexchange.net
+domain:yandexcloud.net
+domain:yandexcom.net
+domain:yandexmetrica.com
+domain:yandexwebcache.net
+domain:yandexwebcache.org
+domain:yastat.net
+domain:yastatic-net.ru
+domain:yastatic.net
+domain:yota.ru
+domain:youla-web-static.mrgcdn.ru
+domain:youla.io
+domain:youla.ru
+domain:zentotem.net
+domain:hematonix.ru
+domain:medtrum.ru
+domain:medtrum.eu
+domain:anytimeru.com
+domain:lumiflex.ru
+domain:ican-sinocare.ru
+domain:freestylediabetes.ru
+domain:rsscenter.cloud
+domain:dbankcloud.ru
+SKIPIT_RU_DOMAINS_EOF
+}
+
+# Каркас шаблона: на месте "__RU__" jq подставляет список выше
+panel_ru_routing_skeleton() {
 cat <<'SKIPIT_RU_ROUTING_EOF'
 {
   "dns": {
+    "tag": "dns-internal",
     "servers": [
-      "1.1.1.1",
-      "8.8.8.8"
+      {
+        "address": "77.88.8.88",
+        "domains": "__RU__",
+        "skipFallback": true
+      },
+      {
+        "address": "https://1.1.1.1/dns-query",
+        "timeoutMs": 2500
+      },
+      "https://8.8.8.8/dns-query",
+      "https://1.0.0.1/dns-query"
     ],
+    "serveStale": true,
     "queryStrategy": "UseIPv4"
+  },
+  "log": {
+    "access": "none",
+    "dnsLog": false,
+    "loglevel": "warning"
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 60,
+        "handshake": 4,
+        "uplinkOnly": 1,
+        "downlinkOnly": 2
+      }
+    }
   },
   "routing": {
     "rules": [
+      {
+        "ip": ["77.88.8.88", "77.88.8.2"],
+        "type": "field",
+        "inboundTag": ["dns-internal"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["dns-internal"],
+        "balancerTag": "PROXY"
+      },
       {
         "port": 53,
         "type": "field",
         "outboundTag": "dns-out"
       },
       {
+        "ip": ["77.88.8.88", "77.88.8.2"],
         "type": "field",
-        "protocol": [
-          "bittorrent"
-        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "protocol": ["bittorrent"],
         "outboundTag": "block"
       },
       {
-        "ip": [
-          "::/0"
-        ],
+        "ip": ["::/0"],
         "type": "field",
         "outboundTag": "block"
       },
@@ -7285,524 +8283,7 @@ cat <<'SKIPIT_RU_ROUTING_EOF'
       },
       {
         "type": "field",
-        "domain": [
-          "regexp:[.]ru$",
-          "regexp:[.]su$",
-          "regexp:[.]xn--p1ai$",
-          "domain:ipify.org",
-          "domain:checkip.amazonaws.com",
-          "domain:ifconfig.me",
-          "domain:ipapi.is",
-          "domain:iplocate.io",
-          "domain:ip.sb",
-          "domain:2ip.ru",
-          "domain:mangalib.me",
-          "domain:animego.me",
-          "domain:showip.net",
-          "domain:avtoto.ru",
-          "domain:tilda.cc",
-          "domain:kinescope.io",
-          "domain:kinescopecdn.net",
-          "domain:redheadsound.studio",
-          "domain:vtbglobalperspectives.com",
-          "domain:vtb-direct.com",
-          "domain:sber.world",
-          "domain:sber.ws",
-          "domain:sbercoin.com",
-          "domain:ssb.msk.ru",
-          "domain:vlb100.ru",
-          "domain:slavbank.ru",
-          "domain:prvbank.ru",
-          "domain:pvubank.com",
-          "domain:vtb-grants.fut.ru",
-          "domain:selkombank.ru",
-          "domain:ankb.ru",
-          "domain:bank-arzamas.ru",
-          "domain:bankermak.ru",
-          "domain:alefbank.com",
-          "domain:forshtadt.ru",
-          "domain:bfa.ru",
-          "domain:rkbank.ru",
-          "domain:mvs-bank.ru",
-          "domain:bank-credit-suisse-moscow.ru",
-          "domain:ziraatbank.ru",
-          "domain:jpmorgan.ru",
-          "domain:noosferabank.ru",
-          "domain:westernunion.ru",
-          "domain:tagbank.ru",
-          "domain:korona.com",
-          "domain:credit-zenit.ru",
-          "domain:zenit-card.ru",
-          "domain:autobahn.db.com",
-          "domain:commerzbank.ru",
-          "domain:mizuhogroup.com",
-          "domain:ibamoscow.ru",
-          "domain:ubs.com",
-          "domain:smbcr-bank.ru",
-          "domain:yoobusiness.ru",
-          "domain:ru.ccb.com",
-          "domain:bank131.com",
-          "domain:asia-pay.ru",
-          "domain:rncoluminis.ru",
-          "domain:government.ru",
-          "domain:gov.ru",
-          "domain:gosuslugi.ru",
-          "domain:gu-st.ru",
-          "domain:emias.info",
-          "domain:mgfoms.ru",
-          "domain:edu.ru",
-          "domain:cbr.ru",
-          "domain:cikrf.ru",
-          "domain:ebs.ru",
-          "domain:goskey.ru",
-          "domain:grfc.ru",
-          "domain:izbirkom.ru",
-          "domain:kremlin.ru",
-          "domain:mil.ru",
-          "domain:nalog.ru",
-          "domain:xn--80ajghhoc2aj1c8b.xn--p1ai",
-          "domain:mos.ru",
-          "domain:mosreg.ru",
-          "domain:spb.ru",
-          "domain:sevastopol.ru",
-          "domain:sev.ru",
-          "domain:adygeya.ru",
-          "domain:bashkiria.ru",
-          "domain:buryatia.ru",
-          "domain:chuvashia.ru",
-          "domain:crimea.ru",
-          "domain:dagestan.ru",
-          "domain:grozny.ru",
-          "domain:i-ola.ru",
-          "domain:izhevsk.ru",
-          "domain:kalmykia.ru",
-          "domain:karelia.ru",
-          "domain:kazan.ru",
-          "domain:kchr.ru",
-          "domain:khakassia.ru",
-          "domain:mari-el.ru",
-          "domain:mari.ru",
-          "domain:mordovia.ru",
-          "domain:nalchik.ru",
-          "domain:ptz.ru",
-          "domain:rkomi.ru",
-          "domain:tatarstan.ru",
-          "domain:tuva.ru",
-          "domain:udm.ru",
-          "domain:udmurtia.ru",
-          "domain:ulan-ude.ru",
-          "domain:vladikavkaz.ru",
-          "domain:yakutia.ru",
-          "domain:altai.ru",
-          "domain:chita.ru",
-          "domain:kamchatka.ru",
-          "domain:khabarovsk.ru",
-          "domain:khv.ru",
-          "domain:krasnodar.su",
-          "domain:krasnoyarsk.ru",
-          "domain:kuban.ru",
-          "domain:marine.ru",
-          "domain:perm.ru",
-          "domain:stavropol.ru",
-          "domain:stv.ru",
-          "domain:vl.ru",
-          "domain:vladivostok.ru",
-          "domain:amur.ru",
-          "domain:arkhangelsk.ru",
-          "domain:astrakhan.ru",
-          "domain:belgorod.ru",
-          "domain:bir.ru",
-          "domain:bryansk.ru",
-          "domain:cbg.ru",
-          "domain:chel.ru",
-          "domain:chelyabinsk.ru",
-          "domain:ekburg.ru",
-          "domain:xn--80acgfbsl1azdqr.xn--p1ai",
-          "domain:irk.ru",
-          "domain:irkutsk.ru",
-          "domain:ivanovo.ru",
-          "domain:jar.ru",
-          "domain:kaluga.ru",
-          "domain:kemerovo.ru",
-          "domain:kirov.ru",
-          "domain:koenig.ru",
-          "domain:kostroma.ru",
-          "domain:kurgan.ru",
-          "domain:kursk.ru",
-          "domain:lipetsk.ru",
-          "domain:magadan.ru",
-          "domain:murmansk.ru",
-          "domain:nn.ru",
-          "domain:nov.ru",
-          "domain:novosibirsk.ru",
-          "domain:nsk.ru",
-          "domain:omsk.ru",
-          "domain:orb.ru",
-          "domain:oryol.ru",
-          "domain:penza.ru",
-          "domain:psk",
-          "domain:psk.ru",
-          "domain:pskov.ru",
-          "domain:rnd.ru",
-          "domain:ryazan.ru",
-          "domain:sakhalin.ru",
-          "domain:samara.ru",
-          "domain:saratov.ru",
-          "domain:simbirsk.ru",
-          "domain:smolensk.ru",
-          "domain:tambov.ru",
-          "domain:tom.ru",
-          "domain:tomsk.ru",
-          "domain:tsaritsyn.ru",
-          "domain:tsk.ru",
-          "domain:tula.ru",
-          "domain:tver.ru",
-          "domain:tyumen.ru",
-          "domain:vladimir.ru",
-          "domain:vlg.ru",
-          "domain:volgograd.ru",
-          "domain:vologda.ru",
-          "domain:voronezh.ru",
-          "domain:vrn.ru",
-          "domain:vyatka.ru",
-          "domain:yaroslavl.ru",
-          "domain:yuzhno-sakhalinsk.ru",
-          "domain:chukotka.ru",
-          "domain:jamal.ru",
-          "domain:surgut.ru",
-          "domain:yamal.ru",
-          "domain:zdrav10.ru",
-          "domain:1c-bitrix.ru",
-          "domain:1c.ru",
-          "domain:1cfresh.com",
-          "domain:1cloud.ru",
-          "domain:1internet.tv",
-          "domain:2gis.ae",
-          "domain:2gis.am",
-          "domain:2gis.az",
-          "domain:2gis.by",
-          "domain:2gis.com",
-          "domain:2gis.com.cy",
-          "domain:2gis.cz",
-          "domain:2gis.ge",
-          "domain:2gis.kg",
-          "domain:2gis.kz",
-          "domain:2gis.ru",
-          "domain:2gis.tj",
-          "domain:2gis.ua",
-          "domain:2gis.uz",
-          "domain:47news.ru",
-          "domain:4meeting.me",
-          "domain:5ka.ru",
-          "domain:5post.market",
-          "domain:abr.ru",
-          "domain:aclub.ru",
-          "domain:adfox.ru",
-          "domain:admetrica.ru",
-          "domain:aeroflot.ru",
-          "domain:alfa-bank.com",
-          "domain:alfa-bank.ru",
-          "domain:alfa-finance.com",
-          "domain:alfa-fx.com",
-          "domain:alfa-pc.com",
-          "domain:alfa-usa.com",
-          "domain:alfabank.com",
-          "domain:alfabank.ru",
-          "domain:alfafinance.biz",
-          "domain:alfafinance.ru",
-          "domain:alfafuture.com",
-          "domain:alfafuture.ru",
-          "domain:alfafx.com",
-          "domain:alfaleasing.ru",
-          "domain:alfaprivate.com",
-          "domain:alformacap.com",
-          "domain:alformacapital.com",
-          "domain:auth-nsdi.ru",
-          "domain:auto.ru",
-          "domain:av.ru",
-          "domain:avito.ru",
-          "domain:avito.st",
-          "domain:baltbank.ru",
-          "domain:banka-ui.dev",
-          "domain:banki.ru",
-          "domain:bankline.ru",
-          "domain:beeline.ru",
-          "domain:beta-bank.com",
-          "domain:bitrix24.ru",
-          "domain:bronevik.com",
-          "domain:cdn-tinkoff.ru",
-          "domain:cdn-vk.ru",
-          "domain:chizhik.club",
-          "domain:citydrive.ru",
-          "domain:clstorage.net",
-          "domain:credistory.ru",
-          "domain:csat.ru",
-          "domain:cscampus.ru",
-          "domain:dbo-dengi.online",
-          "domain:dellin.ru",
-          "domain:dixy.ru",
-          "domain:dnevnik.ru",
-          "domain:dns-shop.ru",
-          "domain:dodopizza.ru",
-          "domain:dom.ru",
-          "domain:domclick.ru",
-          "domain:donationalerts.com",
-          "domain:drweb.ru",
-          "domain:dzen.ru",
-          "domain:dzeninfra.ru",
-          "domain:e5.ru",
-          "domain:edadeal.io",
-          "domain:edadeal.ru",
-          "domain:fastvps.ru",
-          "domain:finuslugi.ru",
-          "domain:fivepost.ru",
-          "domain:fix-price.com",
-          "domain:gazeta.ru",
-          "domain:gazprombank.ru",
-          "domain:gazprombank.tech",
-          "domain:gazprompay.ru",
-          "domain:gorodpay.ru",
-          "domain:gpb.ru",
-          "domain:gpmdi.ru",
-          "domain:hh.ru",
-          "domain:idx5.ru",
-          "domain:imgsmail.ru",
-          "domain:investalfabank.com",
-          "domain:iz.ru",
-          "domain:jivo.ru",
-          "domain:jivochat.com",
-          "domain:jivosite.com",
-          "domain:jx5.ru",
-          "domain:kaspersky.com",
-          "domain:kaspersky.ru",
-          "domain:kazanexpress.ru",
-          "domain:kinopoisk-ru.clstorage.net",
-          "domain:kinopoisk.ru",
-          "domain:kommersant.ru",
-          "domain:kp.ru",
-          "domain:krasyar.ru",
-          "domain:krd.ru",
-          "domain:kuper.ru",
-          "domain:lead-pro2023.online",
-          "domain:lemanapro.ru",
-          "domain:lenta.com",
-          "domain:lenta.ru",
-          "domain:lmru.tech",
-          "domain:magnit.ru",
-          "domain:mail.ru",
-          "domain:max.ru",
-          "domain:megafon.ru",
-          "domain:megamarket.ru",
-          "domain:megamarket.tech",
-          "domain:memealerts.com",
-          "domain:mirpayonline.ru",
-          "domain:miya-news.online",
-          "domain:mm.ru",
-          "domain:mnogolososya.ru",
-          "domain:moex.com",
-          "domain:mradx.net",
-          "domain:mts.ru",
-          "domain:mtsdengi.ru",
-          "domain:mvk.com",
-          "domain:myapelsin.ru",
-          "domain:mycdn.me",
-          "domain:mymts.ru",
-          "domain:naydex.net",
-          "domain:nbki.ru",
-          "domain:netmonet.co",
-          "domain:nspk.ru",
-          "domain:ok.ru",
-          "domain:okcdn.ru",
-          "domain:okko.sport",
-          "domain:okko.tv",
-          "domain:okolo.app",
-          "domain:oneme.ru",
-          "domain:ozon.ru",
-          "domain:ozone.ru",
-          "domain:ozonusercontent.com",
-          "domain:perekrestok.ru",
-          "domain:pochta.ru",
-          "domain:psbank.ru",
-          "domain:psblog.ru",
-          "domain:qms.ru",
-          "domain:rambler.ru",
-          "domain:rbc.ru",
-          "domain:res-nsdi.ru",
-          "domain:rostaxi.org",
-          "domain:rostelecom.ru",
-          "domain:rshb.ru",
-          "domain:rt.ru",
-          "domain:rtbcdn.ru",
-          "domain:russiacalling.com",
-          "domain:rutube.ru",
-          "domain:rutubelist.ru",
-          "domain:rzd-bonus.ru",
-          "domain:rzd.ru",
-          "domain:sbermarket.ru",
-          "domain:sbermegamarket.ru",
-          "domain:sbpgpb.ru",
-          "domain:sistema-capital.com",
-          "domain:spvb.ru",
-          "domain:static-storage.net",
-          "domain:svoy.academy",
-          "domain:t2.ru",
-          "domain:tamtam.chat",
-          "domain:taximaxim.ru",
-          "domain:taxsee.com",
-          "domain:tbank-online.com",
-          "domain:tele2.ru",
-          "domain:timeweb.cloud",
-          "domain:timeweb.com",
-          "domain:tips.tips",
-          "domain:tnt-online.ru",
-          "domain:tochka-tech.com",
-          "domain:tochka.com",
-          "domain:topdelivery.ru",
-          "domain:trbcdn.net",
-          "domain:tsx.x5static.net",
-          "domain:tu-tu.ru",
-          "domain:turbopages.org",
-          "domain:tutu.ru",
-          "domain:usedesk.ru",
-          "domain:userapi.com",
-          "domain:uxfeedback.ru",
-          "domain:vgtrk.ru",
-          "domain:victoria-group.ru",
-          "domain:vk-analytics.ru",
-          "domain:vk-apps.com",
-          "domain:vk-apps.ru",
-          "domain:vk-cdn.me",
-          "domain:vk-cdn.net",
-          "domain:vk-portal.net",
-          "domain:vk.cc",
-          "domain:vk.com",
-          "domain:vk.company",
-          "domain:vk.design",
-          "domain:vk.link",
-          "domain:vk.me",
-          "domain:vk.ru",
-          "domain:vk.team",
-          "domain:vkcache.com",
-          "domain:vkcloud-static.ru",
-          "domain:vkgo.app",
-          "domain:vklive.app",
-          "domain:vkmessenger.app",
-          "domain:vkmessenger.com",
-          "domain:vkontakte.ru",
-          "domain:vkuser.net",
-          "domain:vkuseraudio.com",
-          "domain:vkuseraudio.net",
-          "domain:vkuseraudio.ru",
-          "domain:vkusercdn.ru",
-          "domain:vkuserlive.net",
-          "domain:vkuserphoto.ru",
-          "domain:vkuservideo.com",
-          "domain:vkuservideo.net",
-          "domain:vkuservideo.ru",
-          "domain:vkusnoitochka.ru",
-          "domain:vkusvill.ru",
-          "domain:vkvideo.ru",
-          "domain:vtb-liga.fut.ru",
-          "domain:vtb-russia.com",
-          "domain:vtb.bank.in",
-          "domain:vtb.com",
-          "domain:vtb.corp.ru",
-          "domain:vtb.digital",
-          "domain:vtb.fut.ru",
-          "domain:vtb.promo",
-          "domain:vtb.ru",
-          "domain:vtb24.com",
-          "domain:vtb24.ru",
-          "domain:vtbcareer.com",
-          "domain:vtbfamily.ru",
-          "domain:vtbindia.com",
-          "domain:vtbkep.site",
-          "domain:vtbpartners.com",
-          "domain:vtbrussia.com",
-          "domain:vtbrussia.ru",
-          "domain:vtbstrana.ru",
-          "domain:wb.ru",
-          "domain:webvisor.com",
-          "domain:webvisor.org",
-          "domain:whoosh.bike",
-          "domain:wildberries.ru",
-          "domain:wink.ru",
-          "domain:x5.ru",
-          "domain:x5.tech",
-          "domain:x5club.ru",
-          "domain:x5id.ru",
-          "domain:x5l.ru",
-          "domain:x5paket.ru",
-          "domain:x5q.ru",
-          "domain:xn----7sb7akeedqd.xn--p1ai",
-          "domain:xn--80aacoonefzg3am8b1fsb.xn--p1ai",
-          "domain:xn--90ab2c.xn--p1ai",
-          "domain:xn--90aifd0aza.site",
-          "domain:xn--b1aew.xn--p1ai",
-          "domain:xn--d1acpjx3f.xn--p1ai",
-          "domain:ya.ru",
-          "domain:yads.tech",
-          "domain:yandex",
-          "domain:yandex-bank.net",
-          "domain:yandex-images.clstorage.net",
-          "domain:yandex-team.ru",
-          "domain:yandex.aero",
-          "domain:yandex.az",
-          "domain:yandex.by",
-          "domain:yandex.cloud",
-          "domain:yandex.co.il",
-          "domain:yandex.com",
-          "domain:yandex.com.am",
-          "domain:yandex.com.ge",
-          "domain:yandex.com.ru",
-          "domain:yandex.com.tr",
-          "domain:yandex.com.ua",
-          "domain:yandex.de",
-          "domain:yandex.ee",
-          "domain:yandex.eu",
-          "domain:yandex.fi",
-          "domain:yandex.fr",
-          "domain:yandex.jobs",
-          "domain:yandex.kg",
-          "domain:yandex.kz",
-          "domain:yandex.lt",
-          "domain:yandex.lv",
-          "domain:yandex.md",
-          "domain:yandex.net",
-          "domain:yandex.org",
-          "domain:yandex.pl",
-          "domain:yandex.ru",
-          "domain:yandex.st",
-          "domain:yandex.sx",
-          "domain:yandex.tj",
-          "domain:yandex.tm",
-          "domain:yandex.tr",
-          "domain:yandex.ua",
-          "domain:yandex.uz",
-          "domain:yandexadexchange.net",
-          "domain:yandexcloud.net",
-          "domain:yandexcom.net",
-          "domain:yandexmetrica.com",
-          "domain:yandexwebcache.net",
-          "domain:yandexwebcache.org",
-          "domain:yastat.net",
-          "domain:yastatic-net.ru",
-          "domain:yastatic.net",
-          "domain:yota.ru",
-          "domain:youla-web-static.mrgcdn.ru",
-          "domain:youla.io",
-          "domain:youla.ru",
-          "domain:zentotem.net",
-          "domain:hematonix.ru",
-          "domain:medtrum.ru",
-          "domain:medtrum.eu",
-          "domain:anytimeru.com",
-          "domain:lumiflex.ru",
-          "domain:ican-sinocare.ru",
-          "domain:freestylediabetes.ru",
-          "domain:rsscenter.cloud",
-          "domain:dbankcloud.ru"
-        ],
+        "domain": "__RU__",
         "outboundTag": "direct"
       },
       {
@@ -7839,9 +8320,7 @@ cat <<'SKIPIT_RU_ROUTING_EOF'
     "balancers": [
       {
         "tag": "PROXY",
-        "selector": [
-          "proxy"
-        ],
+        "selector": ["proxy"],
         "strategy": {
           "type": "leastPing"
         },
@@ -7863,11 +8342,7 @@ cat <<'SKIPIT_RU_ROUTING_EOF'
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
+        "destOverride": ["http", "tls", "quic"]
       }
     }
   ],
@@ -7878,26 +8353,40 @@ cat <<'SKIPIT_RU_ROUTING_EOF'
     },
     {
       "tag": "direct",
-      "protocol": "freedom"
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
     },
     {
       "tag": "block",
-      "protocol": "blackhole"
+      "protocol": "blackhole",
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      }
     }
   ],
   "burstObservatory": {
     "pingConfig": {
-      "timeout": "2s",
-      "interval": "10s",
+      "timeout": "3s",
+      "interval": "1m",
       "sampling": 2,
       "destination": "http://www.gstatic.com/generate_204"
     },
-    "subjectSelector": [
-      "proxy"
-    ]
+    "subjectSelector": ["proxy"]
   }
 }
 SKIPIT_RU_ROUTING_EOF
+}
+
+panel_ru_routing_json() {
+    local d
+    d=$(panel_ru_domains | jq -R . | jq -sc .) || return 1
+    panel_ru_routing_skeleton | jq --argjson d "$d" '
+        (.dns.servers[] | objects | select(.domains == "__RU__") | .domains) |= $d
+        | (.routing.rules[] | select(.domain == "__RU__") | .domain) |= $d'
 }
 
 
@@ -8139,18 +8628,20 @@ cert_ask() { # "домен [домен...]" заголовок ["домен-за
 ${note:+
 $note
 }
-Как выпустить сертификат Let's Encrypt $subj?" \
-            cf   "Cloudflare DNS — работает при любых настройках прокси (нужен API-токен)" \
-            http "HTTP-01 — через 80 порт, без токенов") || return 1
+Как выпустить сертификат $subj?" \
+            cf      "Cloudflare DNS — работает при любых настройках прокси (нужен API-токен)" \
+            http    "HTTP-01 — через 80 порт, без токенов" \
+            zerossl "ZeroSSL — тоже через 80 порт, если у Let's Encrypt кончился лимит") || return 1
     else
         CERT_METHOD=$(ui_choose "$title · сертификат" "${note:+$note
 
-}Как выпустить сертификат Let's Encrypt $subj?" \
-            http "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
-            cf   "Cloudflare DNS — wildcard *.домен (нужен API-токен)") || return 1
+}Как выпустить сертификат $subj?" \
+            http    "HTTP-01 — просто, без токенов (80 порт откроется на время проверки)" \
+            cf      "Cloudflare DNS — wildcard *.домен (нужен API-токен)" \
+            zerossl "ZeroSSL — тоже через 80 порт, если у Let's Encrypt кончился лимит") || return 1
     fi
 
-    if [[ $CERT_METHOD == http ]]; then
+    if [[ $CERT_METHOD == http || $CERT_METHOD == zerossl ]]; then
         busy=$(port_listeners 80)
         if [[ -n $busy ]]; then
             ui_msg "Порт 80 занят" "HTTP-01 не сработает — порт 80 занят:
@@ -8208,10 +8699,18 @@ n — ввести токен заново.
     fi
 
     while :; do
-        CERT_EMAIL=$(ui_input "$title · email" "На него придёт предупреждение, если сертификат не продлится.
+        if [[ $CERT_METHOD == zerossl ]]; then
+            CERT_EMAIL=$(ui_input "$title · email" "ZeroSSL выдаёт ключи доступа по email — без него не выпустит.
+На него же придёт предупреждение, если сертификат не продлится.
+
+Email (обязательно):" "$CERT_EMAIL") || return 1
+        else
+            CERT_EMAIL=$(ui_input "$title · email" "На него придёт предупреждение, если сертификат не продлится.
 
 Email (можно оставить пустым):") || return 1
+        fi
         CERT_EMAIL=${CERT_EMAIL//[[:space:]]/}
+        [[ $CERT_METHOD == zerossl && -z $CERT_EMAIL ]] && { ui_msg "Нужен email" "Для ZeroSSL email обязателен."; continue; }
         [[ -z $CERT_EMAIL || $CERT_EMAIL =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
         ui_msg "Ошибка" "Некорректный email: «$CERT_EMAIL»"
     done
@@ -8223,6 +8722,7 @@ cert_choice_short() {
     case $CERT_METHOD in
         reuse) echo "готовый ($CERT_NAME)" ;;
         http)  echo "HTTP-01" ;;
+        zerossl) echo "HTTP-01 · ZeroSSL" ;;
         cf)    echo "Cloudflare DNS: $(cert_list_ru "${CERT_ZONES[@]}")" ;;
     esac
 }
@@ -8233,6 +8733,7 @@ cert_choice_ru() {
     case $CERT_METHOD in
         reuse) echo "готовый ($CERT_NAME)" ;;
         http)  echo "HTTP-01 для $(cert_list_ru "${CERT_DOMS[@]}") — выпустим при установке" ;;
+        zerossl) echo "ZeroSSL (HTTP-01) для $(cert_list_ru "${CERT_DOMS[@]}") — выпустим при установке" ;;
         cf)    for z in "${CERT_ZONES[@]}"; do zl+="$z и *.$z, "; done
                echo "Cloudflare DNS: ${zl%, }" ;;
     esac
@@ -8273,11 +8774,18 @@ cert_issue() { # [домен...]
 
 $(cert_fail_reason || echo "Подробности выше и в /var/log/letsencrypt/letsencrypt.log")"; return 1; }
     else
-        n_say "Выпускаю сертификат для $list (проверка по 80 порту)..."
-        cert_issue_http "$CERT_EMAIL" "${doms[@]}" ||
-            { node_fail "Certbot не смог выпустить сертификат.
+        CERT_CA=""; [[ $CERT_METHOD == zerossl ]] && CERT_CA=zerossl
+        n_say "Выпускаю сертификат $(cert_ca_ru) для $list (проверка по 80 порту)..."
+        if ! cert_issue_http "$CERT_EMAIL" "${doms[@]}"; then
+            if cert_retry_zerossl CERT_EMAIL "${doms[@]}"; then
+                CERT_METHOD=zerossl
+            else
+                node_fail "Certbot не смог выпустить сертификат.
 
-$(cert_fail_reason || echo "Проверьте A-записи и доступность 80 порта, подробности в /var/log/letsencrypt/letsencrypt.log")"; return 1; }
+$( [[ -n $ZS_ERR ]] && echo "$ZS_ERR" || cert_fail_reason || echo "Проверьте A-записи и доступность 80 порта, подробности в /var/log/letsencrypt/letsencrypt.log")"
+                return 1
+            fi
+        fi
     fi
     cert_ensure_renew
     for d in "${doms[@]}"; do
@@ -8592,7 +9100,7 @@ ${safety:+
 }
 
 # ---- Установка панели ----
-panel_install() { UI_CTX=""; _panel_install "$@"; local rc=$?; UI_CTX=""; return $rc; }
+panel_install() { local UI_GUARD=1; UI_CTX=""; _panel_install "$@"; local rc=$?; UI_CTX=""; return $rc; }
 
 # Всё на один сервер. Отдельной копии логики не пишем: ставим панель со
 # страницей подписки обычным мастером, а следом мастер ноды сам видит панель
@@ -8600,6 +9108,7 @@ panel_install() { UI_CTX=""; _panel_install "$@"; local rc=$?; UI_CTX=""; return
 # Всё на один сервер. Сначала мастер спрашивает всё, что нужно и панели, и ноде,
 # и только потом ставит: между панелью и нодой вопросов больше не будет.
 bundle_all_install() {
+    local UI_GUARD=1
     wz_reset
     bundle_all_ask || { wz_reset; return; }
 
@@ -9553,6 +10062,7 @@ nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · об
         c=$(ui_menu "Панель Remnawave" "$hdr" \
             ""        "Доступ" \
             url       "Адрес входа в панель" \
+            newpath   "Сменить адрес входа" \
             apikey    "Ключ для сабпейджа на другом сервере" \
             ""        "Управление" \
             logs      "Логи" \
@@ -9564,7 +10074,6 @@ nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · об
             restore   "Восстановить из бэкапа" \
             cron      "$(panel_backup_cron_on && echo "Выключить автобэкап" || echo "Включить автобэкап")" \
             ""        "Настройки" \
-            newpath   "Сменить адрес входа" \
             nginxgen  "Пересоздать nginx.conf по шаблону SkipIt Tool" \
             rutpl     "Шаблон Xray JSON «$PANEL_RU_TPL»" \
             cert      "Сертификат: статус и перевыпуск" \
@@ -9675,7 +10184,7 @@ Let's Encrypt ограничивает число выпусков (5 в нед�
     command -v certbot >/dev/null 2>&1 || { ui_msg "Ошибка" "certbot не установлен."; return; }
     cert_write_hooks; cert_ensure_renew
     clear
-    [[ $(cert_method_ru "$PANEL_CERT_NAME") == HTTP-01 ]] && "$ACME_OPEN" force
+    [[ $(cert_method_ru "$PANEL_CERT_NAME") == HTTP-01* ]] && "$ACME_OPEN" force
     if [[ $c == test ]]; then
         certbot renew --dry-run --no-random-sleep-on-renew --cert-name "$PANEL_CERT_NAME"; rc=$?
     else
@@ -9929,7 +10438,7 @@ sub_ufw_apply() {
 }
 
 # ---- Установка сабпейджа ----
-sub_install() { UI_CTX=""; _sub_install; local rc=$?; UI_CTX=""; return $rc; }
+sub_install() { local UI_GUARD=1; UI_CTX=""; _sub_install; local rc=$?; UI_CTX=""; return $rc; }
 
 _sub_install() {
     local domain panel_url token prefix skipit_key="" busy rc reinstall=0
@@ -10311,7 +10820,7 @@ sub_cert() {
     command -v certbot >/dev/null 2>&1 || { ui_msg "Ошибка" "certbot не установлен."; return; }
     cert_write_hooks; cert_ensure_renew
     clear
-    [[ $(cert_method_ru "$SUB_CERT_NAME") == HTTP-01 ]] && "$ACME_OPEN" force
+    [[ $(cert_method_ru "$SUB_CERT_NAME") == HTTP-01* ]] && "$ACME_OPEN" force
     if [[ $c == test ]]; then
         certbot renew --dry-run --no-random-sleep-on-renew --cert-name "$SUB_CERT_NAME"; rc=$?
     else
@@ -10488,6 +10997,7 @@ menu_remnawave() {
     local c hdr p n s
     local -a items on off
     while :; do
+        UI_CTX=""   # ответы мастеров здесь не показываем - это обычное меню
         # состояние читаем один раз: эти вызовы заодно наполняют *_DOMAIN
         panel_installed 2>/dev/null && p=1 || p=0
         node_installed  2>/dev/null && n=1 || n=0
@@ -10585,11 +11095,11 @@ ru_plural() { # число одна две много
     else echo "$4"; fi
 }
 
-sys_bar() { # процент [ширина] → «▰▰▰▱▱▱ 42%»
+sys_bar() { # процент [ширина] → «━━━─── 42%» (▰▱ в части шрифтов двойной ширины)
     local p=${1:-0} w=${2:-12} f i s=""
     (( p < 0 )) && p=0; (( p > 100 )) && p=100
     f=$(( (p * w + 50) / 100 ))
-    for (( i = 0; i < w; i++ )); do if (( i < f )); then s+="▰"; else s+="▱"; fi; done
+    for (( i = 0; i < w; i++ )); do if (( i < f )); then s+="━"; else s+="─"; fi; done
     printf '%s %s%%' "$s" "$p"
 }
 
@@ -10597,7 +11107,7 @@ sys_cpu_line() { # загрузка CPU по двум замерам /proc/stat
     local -a a b
     local dt di p=0 cores
     read -ra a < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat)
-    sleep 0.3
+    sleep 0.2
     read -ra b < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat)
     dt=$(( b[0] - a[0] )); di=$(( b[1] - a[1] ))
     (( dt > 0 )) && p=$(( 100 * (dt - di) / dt ))
@@ -10835,7 +11345,7 @@ f2b_jails_table() {
     done
 }
 
-f2b_install() { local saved_ctx=$UI_CTX; UI_CTX=""; _f2b_install; local rc=$?; UI_CTX=$saved_ctx; return $rc; }
+f2b_install() { local UI_GUARD=1 saved_ctx=$UI_CTX; UI_CTX=""; _f2b_install; local rc=$?; UI_CTX=$saved_ctx; return $rc; }
 
 # Мастер установки: каждый параметр - отдельный шаг, рекомендация считается по этому серверу
 _f2b_install() {
@@ -12060,7 +12570,11 @@ self_remove_tool() {
 Удалить SkipIt Tool?" no || return
 
     clear; say "Удаляю SkipIt Tool..."
-    rm -f "$PANEL_BACKUP_CRON"
+    rm -f "$PANEL_BACKUP_CRON" "$TG_CRON"
+    # щит: правила, автостарт и параметры ядра
+    systemctl disable --now skipit-shield.service >/dev/null 2>&1
+    shield_flush
+    rm -f "$SHIELD_UNIT" "$SHIELD_SYSCTL"; systemctl daemon-reload 2>/dev/null
     rm -rf "$SKIPIT_ETC"
     rm -f "$SKIPIT_UPDATE_LATEST"
     log "self remove: только инструмент"
@@ -12161,7 +12675,11 @@ Let's Encrypt (5 повторов в неделю на один набор им�
         ufwc --force delete allow 443/tcp >/dev/null 2>&1
     fi
 
-    rm -f "$PANEL_BACKUP_CRON"
+    rm -f "$PANEL_BACKUP_CRON" "$TG_CRON"
+    # щит: правила, автостарт и параметры ядра
+    systemctl disable --now skipit-shield.service >/dev/null 2>&1
+    shield_flush
+    rm -f "$SHIELD_UNIT" "$SHIELD_SYSCTL"; systemctl daemon-reload 2>/dev/null
     rm -rf "$SKIPIT_ETC"
     rm -f "$SKIPIT_UPDATE_LATEST"
     log "self remove: всё (панель=$p нода=$n подписка=$s серты=$del_cert)"
@@ -12195,6 +12713,9 @@ fail2ban: ${F2B_JAIL}
 Сайт:     ${NODE_WEBROOT}
 Настройки ноды:  ${NODE_STATE}
 
+Бэкап в TG:      ${TG_STATE} · ${TG_CRON}
+Щит:             ${SHIELD_STATE} · ${SHIELD_SYSCTL} · ${SHIELD_UNIT}
+
 ── Что использует SkipIt Tool
 Нода:            Remnawave Node — github.com/remnawave
 Веб-сервер:      nginx (${NODE_NGINX_IMAGE})
@@ -12210,75 +12731,1358 @@ Docker:          установщик get.docker.com
     ui_readline _
 }
 
-main_menu() {
-    local c rc ufw_st upd autoupd_st
+# ==== Бэкап в Telegram ====
+# Главное в бэкапе - панель Remnawave: дамп базы (все пользователи, подписки,
+# ноды, хосты, шаблоны), папка панели с .env и docker-compose, страница подписки,
+# сертификаты панели. Режим «весь сервер» добавляет ноду и настройки SkipIt Tool.
+# Архив уходит файлом в Telegram-бота по расписанию: время и интервал задаёт
+# человек. Из такого архива панель восстанавливается здесь же - целиком, только
+# база или только файлы (как в distillium/remnawave-backup-restore).
+# Токен лежит только в /etc/skipit/tgbackup.conf (600), в cron его нет.
+TG_STATE="${SKIPIT_ETC}/tgbackup.conf"
+TG_CRON="/etc/cron.d/skipit-tg-backup"
+TG_MAX_MB=49                       # лимит Bot API на отправку файла - 50 МБ
+TG_DL_MAX_MB=20                    # и на скачивание файла ботом - 20 МБ
+TG_KEYS=(TG_TOKEN TG_CHAT TG_TIME TG_EVERY TG_SCOPE TG_CERTS TG_KEEP TG_KEEP_SET TG_LAST TG_LAST_RES)
+
+tg_state_load() {
+    # TG_KEEP=0 - на сервере не хранить: копия в Telegram, а архив рядом с панелью
+    # при взломе отдал бы ещё и старые базы с токенами, а при потере сервера пропал бы с ним
+    TG_TOKEN=""; TG_CHAT=""; TG_TIME="04:00"; TG_EVERY=24; TG_SCOPE=panel; TG_CERTS=1; TG_KEEP=0; TG_KEEP_SET=0
+    TG_LAST=""; TG_LAST_RES=""
+    [[ -f $TG_STATE ]] || return 1
+    local k v
+    while IFS='=' read -r k v; do
+        [[ " ${TG_KEYS[*]} " == *" $k "* ]] || continue
+        v=${v#\'}; v=${v%\'}
+        printf -v "$k" '%s' "$v"
+    done < "$TG_STATE"
+    [[ $TG_SCOPE == full ]] || TG_SCOPE=panel
+    # число не выбирали сами - значит, это старое значение по умолчанию
+    [[ $TG_KEEP_SET == 1 && $TG_KEEP =~ ^[0-9]+$ ]] || TG_KEEP=0
+    return 0
+}
+
+tg_state_save() {
+    local k
+    ( umask 077
+      { echo "# SkipIt Tool — бэкап в Telegram"
+        for k in "${TG_KEYS[@]}"; do printf "%s='%s'\n" "$k" "${!k//\'/}"; done
+      } > "$TG_STATE" )
+    chmod 600 "$TG_STATE" 2>/dev/null
+}
+
+tg_ready()   { [[ -n $TG_TOKEN && -n $TG_CHAT ]]; }
+tg_cron_on() { [[ -f $TG_CRON ]]; }
+tg_api()     { printf 'https://api.telegram.org/bot%s/%s' "$TG_TOKEN" "$1"; }
+tg_mask()    { local t=$1; (( ${#t} > 12 )) && printf '%s…%s' "${t:0:6}" "${t: -4}" || printf '%s' "${t:-—}"; }
+tg_valid_token() { [[ $1 =~ ^[0-9]{5,}:[A-Za-z0-9_-]{30,}$ ]]; }
+tg_valid_time()  { [[ $1 =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+tg_scope_ru()    { [[ $1 == full ]] && echo "панель + весь сервер" || echo "панель Remnawave"; }
+
+tg_every_ru() {
+    case $1 in
+        1) echo "каждый час" ;; 24) echo "раз в сутки" ;; 168) echo "раз в неделю" ;;
+        *) if (( $1 % 24 == 0 )); then echo "раз в $(( $1 / 24 )) $(ru_plural $(( $1 / 24 )) день дня дней)"
+           else echo "каждые $1 $(ru_plural "$1" час часа часов)"; fi ;;
+    esac
+}
+
+tg_sched_ru() {
+    tg_cron_on || { echo "выключено"; return; }
+    if (( TG_EVERY < 24 )); then echo "$(tg_every_ru "$TG_EVERY"), начиная с $TG_TIME"
+    else echo "$(tg_every_ru "$TG_EVERY") в $TG_TIME"; fi
+}
+
+# Строка cron из времени и интервала. Интервалы до суток делят 24 нацело,
+# поэтому часы просто перечисляем. Несколько суток - день месяца через */N,
+# неделя - сегодняшний день недели.
+tg_cron_line() {
+    local h=$((10#${TG_TIME%%:*})) m=$((10#${TG_TIME##*:})) hrs="" i
+    if (( TG_EVERY < 24 )); then
+        for (( i = 0; i < 24; i += TG_EVERY )); do hrs+="$(( (h + i) % 24 )),"; done
+        hrs=$(tr ',' '\n' <<< "${hrs%,}" | sort -n | paste -sd,)
+        printf '%d %s * * *' "$m" "$hrs"
+    elif (( TG_EVERY == 24 )); then printf '%d %d * * *' "$m" "$h"
+    elif (( TG_EVERY == 168 )); then printf '%d %d * * %d' "$m" "$h" "$(date +%w)"
+    else printf '%d %d */%d * *' "$m" "$h" $(( TG_EVERY / 24 )); fi
+}
+
+tg_cron_write() {
+    printf '# SkipIt Tool — бэкап в Telegram (%s · %s)\n%s root %s tg-backup >/dev/null 2>&1\n' \
+        "$(tg_every_ru "$TG_EVERY")" "$TG_TIME" "$(tg_cron_line)" "$SKIPIT_BIN" > "$TG_CRON"
+    chmod 644 "$TG_CRON"
+}
+
+# Сертификаты по имени: live, archive и renewal - без renewal certbot их не продлит
+tg_cert_paths() { # имя...
+    local n d
+    for n in "$@"; do
+        [[ -n $n ]] || continue
+        for d in live archive; do [[ -d /etc/letsencrypt/$d/$n ]] && echo "/etc/letsencrypt/$d/$n"; done
+        [[ -f /etc/letsencrypt/renewal/$n.conf ]] && echo "/etc/letsencrypt/renewal/$n.conf"
+    done
+}
+
+# Что попадает в архив (только существующие пути)
+tg_paths() {
+    local p
+    {
+        # панель и страница подписки + их состояние в SkipIt Tool
+        echo "$PANEL_DIR"; echo "$SUB_DIR"; echo "$PANEL_STATE"; echo "$SUB_STATE"
+        [[ -f $CF_CREDS ]] && echo "$CF_CREDS"
+        if (( TG_CERTS )); then
+            [[ -d /etc/letsencrypt/accounts ]] && echo /etc/letsencrypt/accounts
+            ( panel_state_load 2>/dev/null; tg_cert_paths "${PANEL_CERT_NAME:-}" "${PANEL_SUB_CERT:-}" )
+            ( sub_state_load 2>/dev/null; tg_cert_paths "${SUB_CERT_NAME:-}" )
+        fi
+        if [[ $TG_SCOPE == full ]]; then
+            echo "$NODE_DIR"; echo "$SKIPIT_ETC"; echo "$SSHD_DROPIN"; echo "$SYSCTL_FILE"; echo "$SHIELD_SYSCTL"
+            echo /etc/ufw; echo /etc/fail2ban/jail.d; echo "$NODE_WEBROOT"
+            (( TG_CERTS )) && echo /etc/letsencrypt
+        fi
+    } | while IFS= read -r p; do [[ -n $p && -e $p ]] && printf '%s\n' "$p"; done | sort -u
+}
+
+tg_panel_count() { # таблица → число или «?»
+    local n
+    n=$(docker exec remnawave-db sh -c "psql -tA -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -c 'SELECT count(*) FROM $1'" 2>/dev/null | tr -d '[:space:]')
+    [[ $n =~ ^[0-9]+$ ]] && echo "$n" || echo "?"
+}
+
+tg_fsize() { hsize "$(stat -c %s "$1" 2>/dev/null || echo 0)"; }
+
+# Собрать архив → stdout: путь. Сведения о содержимом - в TG_INFO_*.
+tg_make_archive() {
+    local tmp out name have_panel=0
+    TG_INFO_PANEL=""; TG_INFO_USERS=""; TG_INFO_NODES=""; TG_INFO_DB=0
+    tmp=$(mktemp -d) || return 1
+    panel_installed 2>/dev/null && have_panel=1
+    # имя файла говорит, что внутри: panel - есть панель, full - ещё и сервер, config - только настройки
+    local kind=config
+    (( have_panel )) && kind=panel
+    [[ $TG_SCOPE == full ]] && kind=full
+    name="skipit-$(hostname -s 2>/dev/null || hostname)-$kind-$(date +%Y%m%d-%H%M)"
+    out="$SKIPIT_BACKUPS/$name.tar.gz"
+    if (( have_panel )) && [[ $(ctr_status remnawave-db) == running ]]; then
+        if panel_dump_db "$tmp/remnawave-db.sql.gz"; then
+            TG_INFO_DB=1
+            TG_INFO_USERS=$(tg_panel_count users); TG_INFO_NODES=$(tg_panel_count nodes)
+        fi
+        TG_INFO_PANEL=$(panel_version 2>/dev/null)
+    fi
+    cat > "$tmp/backup_meta.info" <<EOF
+SKIPIT_VERSION="$SKIPIT_VERSION"
+PANEL_VERSION="${TG_INFO_PANEL:-}"
+HOST="$(hostname)"
+CREATED="$(date '+%F %T %Z')"
+SCOPE="$TG_SCOPE"
+HAS_DB="$TG_INFO_DB"
+USERS="${TG_INFO_USERS:-}"
+NODES="${TG_INFO_NODES:-}"
+EOF
+    cat > "$tmp/README.txt" <<EOF
+SkipIt Tool v$SKIPIT_VERSION · бэкап $(hostname) · $(date '+%F %T %Z')
+
+Восстановить проще всего из SkipIt Tool: Бэкап в Telegram → Восстановить панель.
+Вручную:
+  1. файлы: tar -xzf архив -C /   (папки opt/, etc/ лягут на свои места)
+  2. база:  cd /opt/remnawave && docker compose up -d remnawave-db
+            gzip -dc remnawave-db.sql.gz | docker exec -i remnawave-db sh -c 'psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB"'
+  3. запуск: docker compose up -d
+EOF
+    local -a P
+    mapfile -t P < <(tg_paths)
+    ( umask 077
+      tar -czf "$out" --ignore-failed-read --warning=no-file-changed \
+          --exclude="$NODE_DIR/run" --exclude='*.sock' --exclude='*/node_modules' \
+          -C "$tmp" README.txt backup_meta.info $( (( TG_INFO_DB )) && echo remnawave-db.sql.gz ) \
+          -C / "${P[@]#/}" 2>/dev/null )
+    rm -rf "$tmp"
+    [[ -s $out ]] || { rm -f "$out"; return 1; }
+    (( TG_KEEP > 0 )) && ls -1t "$SKIPIT_BACKUPS"/skipit-*.tar.gz 2>/dev/null | tail -n +$(( TG_KEEP + 1 )) | xargs -r rm -f
+    printf '%s' "$out"
+}
+
+# Сообщения уходят в разметке HTML: жирные подписи, хэштеги, как у бэкап-ботов
+tg_esc() { local t=${1//&/&amp;}; t=${t//</&lt;}; printf '%s' "${t//>/&gt;}"; }
+# Фирменный вид SkipIt: знак ❯▌, заголовок, сведения веткой ┌ ├ └, хэштег внизу
+tg_card() { # заголовок строка...  → html
+    local head=$1 i n out; shift
+    out="<b>❯▌ SkipIt</b> · $head"$'\n'
+    n=$#; i=0
+    for line in "$@"; do
+        i=$((i + 1))
+        if (( n == 1 )); then out+="<code>─</code> $line"
+        elif (( i == 1 )); then out+="<code>┌</code> $line"
+        elif (( i == n )); then out+="<code>└</code> $line"
+        else out+="<code>├</code> $line"; fi
+        out+=$'\n'
+    done
+    printf '%s' "${out%$'\n'}"
+}
+tg_send_msg() { # html-текст
+    curl -fsS --max-time 20 -o /dev/null "$(tg_api sendMessage)" --data-urlencode "chat_id=$TG_CHAT" \
+        --data-urlencode "parse_mode=HTML" --data-urlencode "disable_web_page_preview=true" --data-urlencode "text=$1" 2>/dev/null
+}
+tg_host_line() { printf '<b>%s</b> · <code>%s</code>' "$(tg_esc "$(hostname -s 2>/dev/null || hostname)")" "${SERVER_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"; }
+tg_when()      { printf '%s · %s' "$(date '+%d.%m %H:%M')" "$(tz_current)"; }
+tg_fail_msg() { # причина
+    tg_send_msg "$(tg_card "<b>бэкап не получился</b> 🔴" \
+        "$(tg_host_line)" \
+        "$(tg_esc "$1")" \
+        "$(tg_when)")
+
+#skipit #ошибка"
+}
+
+# Сделать и отправить. Результат пишем в состояние - его видно в меню.
+tg_backup_run() {
+    local f mb resp ok=0 cap size
+    tg_state_load && tg_ready || { log "tg backup: не настроен"; return 1; }
+    local tf; tf=$(mktemp)
+    # без подпроцесса: TG_INFO_* (версия панели, число пользователей) нужны ниже
+    tg_make_archive > "$tf"; f=$(<"$tf"); rm -f "$tf"
+    if [[ -z $f || ! -s $f ]]; then
+        TG_LAST=$(date '+%d.%m %H:%M'); TG_LAST_RES="не удалось собрать архив"; tg_state_save
+        tg_fail_msg "не удалось собрать архив"
+        log "tg backup: archive FAIL"; return 1
+    fi
+    size=$(tg_fsize "$f")
+    mb=$(( ($(stat -c %s "$f") + 1048575) / 1048576 ))
+    if (( mb > TG_MAX_MB )); then
+        TG_LAST=$(date '+%d.%m %H:%M'); TG_LAST_RES="архив $size — больше лимита Telegram"; tg_state_save
+        tg_fail_msg "архив $size больше лимита Telegram (50 МБ). Лежит на сервере: $f"
+        return 1
+    fi
+    local -a L=("$(tg_host_line)")
+    if (( TG_INFO_DB )); then
+        L+=("Remnawave <b>${TG_INFO_PANEL:-?}</b> — <b>${TG_INFO_USERS:-?}</b> польз. · <b>${TG_INFO_NODES:-?}</b> нод"
+            "база с подписчиками + файлы панели")
+    elif panel_installed 2>/dev/null; then
+        L+=("⚠️ база панели не ответила — только файлы")
+    else
+        L+=("<i>панели нет — только настройки сервера</i>")
+    fi
+    # режим пишем, только когда он что-то добавляет к сказанному выше
+    if [[ $TG_SCOPE == full ]]; then L+=("$size · + нода и настройки сервера")
+    else L+=("$size"); fi
+    L+=("$(tg_when)")
+    cap="$(tg_card "<b>бэкап готов</b> 🟢" "${L[@]}")
+
+#skipit #бэкап"
+    resp=$(curl -sS --max-time 300 "$(tg_api sendDocument)" -F "chat_id=$TG_CHAT" \
+        -F "document=@$f" --form-string "caption=$cap" --form-string "parse_mode=HTML" 2>/dev/null)
+    [[ $resp == *'"ok":true'* ]] && ok=1
+    TG_LAST=$(date '+%d.%m %H:%M')
+    if (( ok )); then
+        TG_LAST_RES="отправлен · $size$( (( TG_INFO_DB )) && echo " · ${TG_INFO_USERS:-?} польз.")"
+    else
+        TG_LAST_RES="ошибка Telegram: $(grep -o '"description":"[^"]*"' <<< "$resp" | cut -d'"' -f4)"
+        [[ $TG_LAST_RES == 'ошибка Telegram: ' ]] && TG_LAST_RES="нет связи с api.telegram.org"
+    fi
+    tg_state_save
+    log "tg backup: $TG_LAST_RES"
+    # Не хранить на сервере: отправленный архив удаляем, неотправленный оставляем -
+    # иначе бэкап пропал бы совсем. Старые неотправленные - тоже прочь, кроме этого.
+    if (( ok && TG_KEEP == 0 )); then
+        rm -f "$f"
+        ls -1 "$SKIPIT_BACKUPS"/skipit-*.tar.gz 2>/dev/null | xargs -r rm -f
+    fi
+    # Новая версия SkipIt Tool - отдельным сообщением, как у бэкап-ботов
+    local upd; upd=$(update_available)
+    if (( ok )) && [[ -n $upd ]]; then
+        tg_send_msg "$(tg_card "<b>вышла новая версия</b> 🆙" \
+            "сейчас <code>v$SKIPIT_VERSION</code> → новая <code>v$upd</code>" \
+            "обновить: <code>skipit</code> → «Обновить SkipIt»")
+
+#skipit #обновление"
+    fi
+    (( ok ))
+}
+
+tg_setup_bot() {
+    local tok chat resp err=""
+    tg_state_load
     while :; do
-        if ! autoupd_supported; then autoupd_st=""
-        elif autoupd_on; then autoupd_st=""; else autoupd_st="выключены"; fi
-        if ! command -v ufw >/dev/null 2>&1; then ufw_st="не установлен"
-        elif ufw_active; then ufw_st="включён"; else ufw_st="выключен"; fi
-        upd=$(update_available)
-        UI_CANCEL="Выход"; UI_BANNER=1
-        UI_FOOTER=$'\n'"  ${C_HINT}запуск в любой момент: ${C_ACC}${SKIPIT_CMD}${C_RESET}"
-        [[ -n $upd ]] && UI_FOOTER+=$'\n'"  ${C_WARN}доступна новая версия SkipIt Tool: v${upd}${C_RESET} ${C_HINT}— пункт «Обновить SkipIt Tool»${C_RESET}"
-        c=$(ui_menu "" "сервер:     $(hostname) · $SERVER_IP
-система:    $OS_NAME · $VIRT
-сеть:       IPv6 $(ipv6_state_ru) · TCP $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-remnawave:  $(remna_hdr)
+        tok=$(ui_input "Бэкап в Telegram · бот" "1. Откройте @BotFather в Telegram → /newbot
+2. Придумайте имя — BotFather пришлёт токен вида 123456:ABC-DEF…${err:+
 
-SSH:        порт $(ssh_ports)$([[ $(sshd_eff permitrootlogin) == yes ]] && echo " · root по паролю")
-UFW:        $ufw_st
-fail2ban:   $(f2b_state_ru)
-патчи:      $(autoupd_supported && { autoupd_on && echo "автоматически" || echo "вручную"; } || echo "вручную")$(reboot_required && echo " · сервер ждёт перезагрузки")
+✗ $err}
 
-процессор:  $(sys_cpu_line)
-память:     $(sys_mem_line)
-диск:       $(sys_disk_line)
-нагрузка:   $(sys_load_line)" \
-            ""      "Remnawave" \
-            remna   "Компоненты Remnawave" \
-            rdiag   "Диагностика" \
-            ""      "Защита" \
-            users   "SSH и пользователи" \
-            ufw     "Фаервол UFW" \
-            f2b     "fail2ban" \
-            ""      "Сервер" \
-            kernel  "Ядро Linux — sysctl, BBR" \
-            ipv6    "IPv6 — включить, выключить, основной протокол" \
-            tz      "Часовой пояс — $(tz_current) · $(date '+%H:%M')" \
-            upgrade "Обновление сервера — пакеты системы" \
-            autoupd "Автообновления безопасности${autoupd_st:+ — $autoupd_st}" \
-            monitor "Монитор ресурсов (btop)" \
-            ""      "Сервис" \
-            regions "Проверка IP по регионам (ipregion)" \
-            speed   "Тест скорости канала" \
-            clean   "Очистка диска" \
-            ""      "SkipIt Tool" \
-            update  "Обновить SkipIt Tool${upd:+ — доступна v$upd}" \
-            selfrm  "Удаление SkipIt Tool" \
-            about   "О программе")
-        rc=$?
-        UI_CANCEL="Назад"; UI_FOOTER=""; UI_BANNER=0
-        (( rc != 0 )) && return
+Токен бота:" "$TG_TOKEN") || return 1
+        tok=${tok//[[:space:]]/}
+        tg_valid_token "$tok" || { err="это не похоже на токен бота"; continue; }
+        ui_loading "Проверяю токен…"
+        resp=$(curl -sS --max-time 10 "https://api.telegram.org/bot$tok/getMe" 2>/dev/null)
+        [[ $resp == *'"ok":true'* ]] && break
+        err="Telegram не принял токен (или нет связи с api.telegram.org)"
+    done
+    TG_TOKEN=$tok
+    local bot; bot=$(grep -o '"username":"[^"]*"' <<< "$resp" | head -1 | cut -d'"' -f4)
+    ui_msg "Бэкап в Telegram · бот" "✓ Бот найден: @$bot
+
+1. Откройте @$bot в Telegram и нажмите «Запустить» (или отправьте любое сообщение)
+2. Для группы — добавьте бота в неё и напишите там что-нибудь
+3. Вернитесь сюда и нажмите Enter — chat ID найдётся сам"
+    ui_loading "Ищу ваш чат…"
+    resp=$(curl -sS --max-time 10 "$(tg_api getUpdates)" 2>/dev/null)
+    chat=$(grep -o '"chat":{"id":-\?[0-9]*' <<< "$resp" | tail -1 | grep -o -- '-\?[0-9]*$')
+    chat=$(ui_input "Бэкап в Telegram · чат" "$( [[ -n $chat ]] && echo "✓ Нашёл чат автоматически — проверьте и нажмите Enter." || echo "! Сообщений боту не нашлось. Узнать ID можно у @userinfobot.")
+
+Chat ID (число, у групп со знаком минус):" "${chat:-$TG_CHAT}") || return 1
+    chat=${chat//[[:space:]]/}
+    [[ $chat =~ ^-?[0-9]+$ ]] || { ui_msg "Ошибка" "Chat ID — это число, например 123456789 или -1001234567890."; return 1; }
+    TG_CHAT=$chat
+    ui_loading "Отправляю проверочное сообщение…"
+    if tg_send_msg "$(tg_card "<b>бот подключён</b> 🟢" \
+        "$(tg_host_line)" \
+        "бэкапы будут приходить в этот чат")
+
+#skipit"; then
+        tg_state_save
+        ui_msg "Готово" "✓ Проверочное сообщение отправлено — загляните в Telegram.
+
+Дальше: «Расписание» — когда и как часто присылать бэкап."
+    else
+        ui_msg "Не получилось" "Telegram не дал написать в чат $chat.
+Проверьте, что вы нажали «Запустить» у бота, а для группы — что бот в ней состоит."
+        return 1
+    fi
+}
+
+tg_setup_schedule() {
+    local t e err=""
+    tg_state_load
+    tg_ready || { ui_msg "Бэкап в Telegram" "Сначала подключите бота — пункт «Подключить бота»."; return 1; }
+    while :; do
+        t=$(ui_input "Бэкап в Telegram · время" "Время сервера сейчас: $(date '+%H:%M') · $(tz_current)
+От этого времени считаются все отправки.${err:+
+
+✗ $err}
+
+Время первой отправки (ЧЧ:ММ):" "$TG_TIME") || return 1
+        t=${t//[[:space:]]/}
+        tg_valid_time "$t" && break
+        err="нужно время вида 04:00 или 21:30"
+    done
+    [[ $t =~ ^[0-9]: ]] && t="0$t"
+    e=$(ui_choose "Бэкап в Telegram · интервал" "Первая отправка в $t. Как часто присылать дальше?" \
+        1 "Каждый час" 3 "Каждые 3 часа" 6 "Каждые 6 часов" 12 "Каждые 12 часов" \
+        24 "Раз в сутки" 48 "Раз в 2 дня" 72 "Раз в 3 дня" 168 "Раз в неделю") || return 1
+    TG_TIME=$t; TG_EVERY=$e
+    tg_state_save
+    tg_cron_write
+    log "tg backup cron: $(tg_cron_line)"
+    ui_msg "Готово" "Расписание:  $(tg_sched_ru)
+Cron:        $(tg_cron_line)
+
+ℹ Время — по часовому поясу сервера ($(tz_current))."
+}
+
+tg_contents_screen() {
+    tg_state_load
+    local p list=""
+    while IFS= read -r p; do list+="  $p"$'\n'; done < <(tg_paths)
+    ui_msg "Что входит в бэкап" "Режим:          $(tg_scope_ru "$TG_SCOPE")
+База панели:    $(panel_installed 2>/dev/null && echo "да — дамп PostgreSQL: пользователи, подписки, ноды, хосты, шаблоны" || echo "панели на сервере нет")
+Сертификаты:    $( (( TG_CERTS )) && echo "да" || echo "нет")
+На сервере:     $( (( TG_KEEP )) && echo "последние $TG_KEEP архивов в $SKIPIT_BACKUPS" || echo "не хранится — удаляется после отправки")
+
+── Файлы и папки
+${list:-  (пока нечего — панель и страница подписки не установлены)}
+
+! В архиве ключи, пароли и сертификаты — держите бота и чат закрытыми"
+}
+
+# ---- Восстановление панели из архива ----
+# Откуда взять архив: с сервера, по пути или из Telegram (файл пересылают боту)
+tg_restore_pick() { # → stdout: путь к архиву
+    local items=() f src p resp fid fname url
+    while IFS= read -r f; do
+        [[ -n $f ]] && items+=("$f" "$(basename "$f") · $(tg_fsize "$f")")
+    done < <(ls -1t "$SKIPIT_BACKUPS"/skipit-*.tar.gz 2>/dev/null | head -n 10)
+    src=$(ui_choose "Откуда взять бэкап" "Архив SkipIt Tool (skipit-….tar.gz)." \
+        "" "Способ" \
+        tg "Из Telegram — перешлите файл бэкапа боту" \
+        path "Указать путь к файлу на сервере" \
+        ${items[0]:+"" "На этом сервере"} "${items[@]}") || return 1
+    case $src in
+        path)
+            p=$(ui_input "Путь к бэкапу" "Загрузите архив на сервер (например, scp) и укажите путь.
+
+Путь к файлу:" "/root/") || return 1
+            [[ -f $p ]] || { ui_msg "Ошибка" "Файла $p нет."; return 1; }
+            printf '%s' "$p" ;;
+        tg)
+            tg_state_load; tg_ready || { ui_msg "Ошибка" "Сначала подключите бота."; return 1; }
+            ui_msg "Из Telegram" "1. Откройте чат с ботом
+2. Перешлите ему (или отправьте) нужный файл skipit-….tar.gz
+3. Вернитесь сюда и нажмите Enter
+
+ℹ Telegram даёт боту скачать файл только до $TG_DL_MAX_MB МБ"
+            ui_loading "Ищу файл в сообщениях бота…"
+            resp=$(curl -sS --max-time 15 "$(tg_api getUpdates)" 2>/dev/null)
+            command -v jq >/dev/null 2>&1 || pkg_install jq >/dev/null 2>&1
+            read -r fid fname < <(jq -r '[.result[]? | (.message // .channel_post) | select(.document != null and (.document.file_name | test("\\.tar\\.gz$")))] | last | "\(.document.file_id) \(.document.file_name)"' <<< "$resp" 2>/dev/null)
+            [[ -n $fid && $fid != null ]] || { ui_msg "Не нашёл" "Бот не видит файл .tar.gz. Перешлите его боту ещё раз и повторите."; return 1; }
+            resp=$(curl -sS --max-time 15 "$(tg_api getFile)" --data-urlencode "file_id=$fid" 2>/dev/null)
+            p=$(jq -r '.result.file_path // empty' <<< "$resp" 2>/dev/null)
+            [[ -n $p ]] || { ui_msg "Ошибка" "Telegram не отдал файл: $(jq -r '.description // "нет связи"' <<< "$resp" 2>/dev/null)
+Файлы больше $TG_DL_MAX_MB МБ так не скачать — загрузите их на сервер сами."; return 1; }
+            ui_loading "Скачиваю $fname…"
+            f="$SKIPIT_BACKUPS/${fname//\//_}"
+            ( umask 077; curl -fsS --max-time 300 -o "$f" "https://api.telegram.org/file/bot$TG_TOKEN/$p" ) || {
+                rm -f "$f"; ui_msg "Ошибка" "Не удалось скачать файл из Telegram."; return 1; }
+            printf '%s' "$f" ;;
+        *) printf '%s' "$src" ;;
+    esac
+}
+
+tg_db_wait_healthy() { # секунд
+    local i=0
+    while (( i < ${1:-90} )); do
+        [[ $(docker inspect -f '{{.State.Health.Status}}' remnawave-db 2>/dev/null) == healthy ]] && return 0
+        sleep 2; i=$((i + 2)); ui_loading "Жду базу данных… ${i} с"
+    done
+    return 1
+}
+
+tg_restore() {
+    local f tmp scope meta="" safety="" dirbak="" have_db have_files rc=0
+    f=$(tg_restore_pick) || return
+    tmp=$(mktemp -d) || return
+    ui_loading "Распаковываю архив…"
+    if ! tar -xzf "$f" -C "$tmp" 2>/dev/null; then
+        rm -rf "$tmp"; ui_msg "Ошибка" "Архив повреждён или это не tar.gz: $(basename "$f")"; return
+    fi
+    [[ -f $tmp/remnawave-db.sql.gz ]] && have_db=1 || have_db=0
+    [[ -d $tmp${PANEL_DIR} ]] && have_files=1 || have_files=0
+    if (( ! have_db && ! have_files )); then
+        rm -rf "$tmp"; ui_msg "Нечего восстанавливать" "В архиве нет ни базы, ни файлов панели Remnawave."; return
+    fi
+    [[ -f $tmp/backup_meta.info ]] && meta=$(sed -n 's/^\(HOST\|CREATED\|PANEL_VERSION\|USERS\|NODES\)="\(.*\)"$/\1=\2/p' "$tmp/backup_meta.info")
+    local -a opts=()
+    (( have_db && have_files )) && opts+=(all "Всё — файлы панели и база (на новый сервер или полный откат)")
+    (( have_db )) && opts+=(db "Только база — пользователи, подписки, ноды; файлы панели не трогать")
+    (( have_files )) && opts+=(files "Только файлы — .env, docker-compose, nginx, сертификаты; база не меняется")
+    scope=$(ui_choose "Восстановить панель" "Архив:   $(basename "$f") · $(tg_fsize "$f")
+$(sed 's/^HOST=/Сервер:  /; s/^CREATED=/Создан:  /; s/^PANEL_VERSION=/Панель:  v/; s/^USERS=/Пользователей:  /; s/^NODES=/Нод:  /' <<< "$meta")
+
+Что восстановить?" "${opts[@]}") || { rm -rf "$tmp"; return; }
+    if [[ $scope == db ]] && ! [[ -f $PANEL_COMPOSE ]]; then
+        rm -rf "$tmp"; ui_msg "Сначала файлы" "На сервере нет панели ($PANEL_COMPOSE). Восстановите «Всё» или сначала «Только файлы»."; return
+    fi
+    ui_yesno "Подтверждение" "Режим:   $(case $scope in all) echo "всё" ;; db) echo "только база" ;; files) echo "только файлы" ;; esac)
+
+! Текущие $( [[ $scope == files ]] && echo "файлы панели" || echo "данные панели") будут заменены содержимым бэкапа
+! Панель будет остановлена на время восстановления
+ℹ Перед этим SkipIt Tool сохранит текущую базу и папку панели — откатиться можно
+
+Восстановить?" no || { rm -rf "$tmp"; return; }
+
+    clear
+    # 1. страховочные копии того, что есть сейчас
+    if [[ $(ctr_status remnawave-db) == running ]]; then
+        say "Сохраняю текущую базу..."
+        safety=$(panel_backup_make) || safety=""
+    fi
+    if [[ -d $PANEL_DIR && $scope != db ]]; then
+        dirbak="$SKIPIT_BACKUPS/remnawave-dir-$(date +%Y%m%d-%H%M%S).tar.gz"
+        # без копии текущих файлов не трогаем ничего: удалить папку панели
+        # и не суметь вернуть её - хуже, чем не восстановить
+        if ! ( umask 077; tar -czf "$dirbak" -C / "${PANEL_DIR#/}" 2>/dev/null ) || [[ ! -s $dirbak ]]; then
+            rm -f "$dirbak"; rm -rf "$tmp"
+            ui_msg "Не получилось" "Не удалось сохранить текущую папку панели ($PANEL_DIR) в $SKIPIT_BACKUPS —
+возможно, кончилось место на диске. Восстановление отменено, ничего не изменено."
+            return
+        fi
+    fi
+    # 2. остановить панель (и страницу подписки, если её восстанавливаем)
+    say "Останавливаю панель..."
+    [[ -f $PANEL_COMPOSE ]] && panel_compose_run down >/dev/null 2>&1
+    # 3. файлы
+    if [[ $scope != db ]]; then
+        say "Восстанавливаю файлы..."
+        rm -rf "${PANEL_DIR:?}"; mkdir -p "$PANEL_DIR"
+        cp -a "$tmp$PANEL_DIR/." "$PANEL_DIR/"
+        if [[ -d $tmp$SUB_DIR ]]; then
+            [[ -f $SUB_DIR/docker-compose.yml ]] && sub_compose_run down >/dev/null 2>&1
+            mkdir -p "$SUB_DIR"; cp -a "$tmp$SUB_DIR/." "$SUB_DIR/"
+        fi
+        local x
+        for x in "$PANEL_STATE" "$SUB_STATE" "$CF_CREDS"; do
+            [[ -f $tmp$x ]] && { mkdir -p "${x%/*}"; cp -a "$tmp$x" "$x"; }
+        done
+        # сертификаты: только те, которых на сервере нет - свежие не затираем
+        if [[ -d $tmp/etc/letsencrypt ]]; then
+            ( cd "$tmp/etc/letsencrypt" && find . -mindepth 1 -maxdepth 2 | while IFS= read -r x; do
+                [[ -e /etc/letsencrypt/$x ]] || { mkdir -p "/etc/letsencrypt/$(dirname "$x")"; cp -a "$x" "/etc/letsencrypt/$x"; }
+              done )
+        fi
+        node_ensure_docker >/dev/null 2>&1
+        panel_state_load 2>/dev/null   # домен и сертификат - уже из бэкапа
+    fi
+    # 4. база - в чистый том, как в официальной инструкции
+    if [[ $scope != files ]]; then
+        # Чистый том - как в официальной инструкции. Но только если текущую базу
+        # удалось сохранить или её нет совсем; иначе заливаем поверх - дамп
+        # сделан с --clean и сам удаляет старые таблицы
+        if [[ -n $safety ]] || ! docker volume inspect remnawave-db-data >/dev/null 2>&1; then
+            say "Пересоздаю базу данных..."
+            docker volume rm remnawave-db-data >/dev/null 2>&1
+        else
+            say "Текущую базу сохранить не вышло — заливаю бэкап поверх, без удаления тома..."
+        fi
+        panel_compose_run up -d remnawave-db >/dev/null 2>&1
+        if ! tg_db_wait_healthy 120; then
+            rc=1
+        else
+            say "Заливаю дамп базы..."
+            gzip -dc "$tmp/remnawave-db.sql.gz" | docker exec -i remnawave-db sh -c \
+                'psql -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>"$tmp/restore.err" || rc=1
+        fi
+    fi
+    # 5. запуск
+    say "Запускаю панель..."
+    panel_compose_run up -d >/dev/null 2>&1 || rc=1
+    [[ -d $tmp$SUB_DIR && $scope != db && -f $SUB_DIR/docker-compose.yml ]] && sub_compose_run up -d >/dev/null 2>&1
+    panel_cache_drop
+    local err=""; [[ -s $tmp/restore.err ]] && err=$(grep -i 'error' "$tmp/restore.err" | head -3)
+    rm -rf "$tmp"
+    log "tg restore ($scope): $f rc=$rc"
+    tg_state_load
+    (( TG_KEEP == 0 )) && [[ $f == "$SKIPIT_BACKUPS"/* ]] && rm -f "$f"
+    if (( rc == 0 )) && panel_wait_healthy 120; then
+        ui_msg "Готово" "✓ Панель восстановлена из $(basename "$f") и работает
+${err:+
+! Предупреждения psql: $err
+}${safety:+
+Прежняя база:   $safety}${dirbak:+
+Прежние файлы:  $dirbak}
+
+ℹ Если сервер новый — направьте домен панели на его IP и проверьте UFW (порт 443)"
+    else
+        ui_msg "Внимание" "Восстановление закончилось с ошибкой или панель не поднялась за 2 минуты.
+${err:+
+psql: $err
+}
+▸ Панель → Логи — посмотреть, что не так${safety:+
+Прежняя база:   $safety}${dirbak:+
+Прежние файлы:  $dirbak}"
+    fi
+}
+
+menu_tgbackup() {
+    local c items v
+    while :; do
+        tg_state_load
+        items=("" "Настройка" bot "$(tg_ready && echo "Сменить бота или чат" || echo "Подключить бота")")
+        if tg_ready; then
+            items+=(sched "Расписание — время и интервал")
+            tg_cron_on && items+=(off "Выключить отправку по расписанию")
+            items+=(scope "Что бэкапить — $(tg_scope_ru "$TG_SCOPE")"
+                    certs "Сертификаты в архиве — $( (( TG_CERTS )) && echo вкл || echo выкл)"
+                    keep "Хранить на сервере — $( (( TG_KEEP )) && echo "последние $TG_KEEP" || echo "только в Telegram")"
+                    "" "Действия" now "Отправить бэкап сейчас" what "Что входит в бэкап")
+        fi
+        items+=("" "Восстановление" restore "Восстановить панель из бэкапа")
+        c=$(ui_menu "Бэкап в Telegram" "Бот:           $(tg_ready && echo "подключён · $(tg_mask "$TG_TOKEN")" || echo "не подключён")
+Чат:           ${TG_CHAT:-—}
+Что бэкапим:   $(tg_scope_ru "$TG_SCOPE")
+Панель:        $(panel_installed 2>/dev/null && echo "установлена — в архив пойдёт база со всеми подписчиками" || echo "не установлена — в архиве будут только настройки")
+Расписание:    $(tg_sched_ru)
+Последний:     ${TG_LAST:-ещё не было}${TG_LAST_RES:+ · $TG_LAST_RES}" "${items[@]}") || return
         case $c in
-            remna)  menu_remnawave ;;
-            rdiag)  menu_remna_diag ;;
-            users)  menu_users ;;
-            ufw)    menu_ufw ;;
-            f2b)    menu_fail2ban ;;
-            kernel) menu_kernel ;;
-            ipv6)   menu_ipv6 ;;
-            tz)     menu_timezone ;;
-            upgrade) menu_sys_upgrade ;;
-            autoupd) menu_autoupd ;;
-            monitor) sys_btop ;;
-            regions) region_check ;;
-            speed)   sys_speedtest ;;
-            clean)   sys_disk_clean ;;
-            update) menu_update ;;
-            about)  menu_about ;;
-            selfrm) menu_self_remove ;;
+            bot)   tg_setup_bot ;;
+            sched) tg_setup_schedule ;;
+            off)   ui_yesno "Бэкап в Telegram" "Выключить отправку по расписанию?
+Бот и чат останутся — включить можно снова в «Расписание»." no && { rm -f "$TG_CRON"; log "tg backup cron: off"; } ;;
+            scope)
+                v=$(ui_choose "Что бэкапить" "Панель Remnawave — то, что нужно, чтобы поднять панель на новом сервере." \
+                    panel "Панель Remnawave — база с подписчиками, .env, compose, страница подписки" \
+                    full  "Панель + весь сервер — ещё нода, сайт-заглушка, UFW, fail2ban, SSH, SkipIt") || continue
+                TG_SCOPE=$v; tg_state_save ;;
+            certs) TG_CERTS=$(( 1 - TG_CERTS )); tg_state_save ;;
+            keep)
+                v=$(ui_choose "Хранить на сервере" "В архиве база с подписчиками, .env и ключи. Если сервер взломают, лежащие
+рядом копии отдадут ещё и старые данные, а если сервер пропадёт — пропадут вместе с ним.
+
+ℹ Архив, который не удалось отправить, остаётся на сервере в любом режиме" \
+                    0 "Не хранить — удалять сразу после отправки (рекомендуется)" \
+                    3 "Последние 3" 7 "Последние 7" 14 "Последние 14") || continue
+                TG_KEEP=$v; TG_KEEP_SET=1; tg_state_save
+                (( TG_KEEP == 0 )) && ls -1 "$SKIPIT_BACKUPS"/skipit-*.tar.gz 2>/dev/null | xargs -r rm -f ;;
+            now)
+                ui_loading "Собираю архив и отправляю в Telegram…"
+                if tg_backup_run; then tg_state_load; ui_msg "Готово" "✓ Бэкап отправлен — $TG_LAST_RES"
+                else tg_state_load; ui_msg "Не получилось" "✗ $TG_LAST_RES"; fi ;;
+            what)    tg_contents_screen ;;
+            restore) local UI_GUARD=1; tg_restore ;;
         esac
+    done
+}
+
+# ==== Щит: защита от DDoS и взлома ====
+# Всё настраивает сам человек: каждая защита включается отдельно, у каждой свой
+# порог, есть белый список адресов и список портов. Готовые уровни - только
+# быстрый способ заполнить пороги, дальше их можно менять по одному.
+#  - фильтр пакетов: своя цепочка SKIPIT_SHIELD в таблице mangle, раньше UFW и Docker;
+#  - ядро: /etc/sysctl.d/98-skipit-shield.conf (профиль 99-xray-node главнее).
+# Уже открытые соединения (и текущая SSH-сессия) фильтр не трогает.
+SHIELD_STATE="${SKIPIT_ETC}/shield.conf"
+SHIELD_SYSCTL="/etc/sysctl.d/98-skipit-shield.conf"
+SHIELD_UNIT="/etc/systemd/system/skipit-shield.service"
+SHIELD_CHAIN="SKIPIT_SHIELD"
+SH_KEYS=(SH_ON SH_INVALID SH_FRAG SH_SYN SH_SYN_BURST SH_UDP SH_PING SH_CONN SH_KERNEL SH_PORTS SH_WHITE)
+
+shield_state_load() {
+    # по умолчанию всё выключено - включает человек
+    SH_ON=0; SH_INVALID=1; SH_FRAG=1; SH_SYN=80; SH_SYN_BURST=160; SH_UDP=0; SH_PING=5
+    SH_CONN=0; SH_KERNEL=1; SH_PORTS=""; SH_WHITE=""
+    [[ -f $SHIELD_STATE ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [[ " ${SH_KEYS[*]} " == *" $k "* ]] || continue
+        v=${v#\'}; v=${v%\'}
+        [[ $v =~ ^[0-9A-Za-z.,:/\ -]*$ ]] && printf -v "$k" '%s' "$v"
+    done < "$SHIELD_STATE"
+}
+
+shield_state_save() {
+    local k
+    { echo "# SkipIt Tool — щит"; for k in "${SH_KEYS[@]}"; do printf "%s='%s'\n" "$k" "${!k}"; done; } > "$SHIELD_STATE"
+    chmod 600 "$SHIELD_STATE"
+}
+
+shield_on() { iptables -t mangle -S "$SHIELD_CHAIN" >/dev/null 2>&1; }
+sh_onoff()  { (( $1 )) && echo "вкл" || echo "выкл"; }
+sh_rate_ru(){ (( $1 )) && echo "$1/с с одного IP${2:+ · всплеск $2}" || echo "выкл"; }
+
+shield_flush() {
+    local ipt
+    for ipt in iptables ip6tables; do
+        command -v $ipt >/dev/null 2>&1 || continue
+        while $ipt -t mangle -D PREROUTING ! -i lo -j "$SHIELD_CHAIN" 2>/dev/null; do :; done
+        $ipt -t mangle -F "$SHIELD_CHAIN" 2>/dev/null
+        $ipt -t mangle -X "$SHIELD_CHAIN" 2>/dev/null
+    done
+    return 0
+}
+
+shield_rules() { # iptables|ip6tables
+    local t=$1 C=$SHIELD_CHAIN ip pm=()
+    $t -t mangle -N "$C" || return 1
+    # белый список: эти адреса фильтр пропускает без проверок
+    for ip in ${SH_WHITE//,/ }; do
+        if [[ $t == iptables && $ip != *:* ]] || [[ $t == ip6tables && $ip == *:* ]]; then
+            $t -t mangle -A "$C" -s "$ip" -j RETURN || return 1
+        fi
+    done
+    if (( SH_INVALID )); then
+        $t -t mangle -A "$C" -m conntrack --ctstate INVALID -j DROP
+        $t -t mangle -A "$C" -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags ALL NONE -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags ALL ALL -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags FIN,ACK FIN -j DROP
+        $t -t mangle -A "$C" -p tcp --tcp-flags ACK,URG URG -j DROP
+    fi
+    [[ $t == iptables ]] && (( SH_FRAG )) && $t -t mangle -A "$C" -f -j DROP
+    if (( SH_PING )); then
+        if [[ $t == iptables ]]; then
+            $t -t mangle -A "$C" -p icmp --icmp-type echo-request -m limit --limit "${SH_PING}/s" --limit-burst $(( SH_PING * 2 )) -j RETURN
+            $t -t mangle -A "$C" -p icmp --icmp-type echo-request -j DROP
+        else
+            $t -t mangle -A "$C" -p ipv6-icmp --icmpv6-type echo-request -m limit --limit "${SH_PING}/s" --limit-burst $(( SH_PING * 2 )) -j RETURN
+            $t -t mangle -A "$C" -p ipv6-icmp --icmpv6-type echo-request -j DROP
+        fi
+    fi
+    # лимиты - на все порты или только на выбранные
+    [[ -n $SH_PORTS ]] && pm=(-m multiport --dports "${SH_PORTS// /}")
+    (( SH_SYN )) && $t -t mangle -A "$C" -p tcp --syn "${pm[@]}" -m hashlimit --hashlimit-above "${SH_SYN}/sec" \
+        --hashlimit-burst "$SH_SYN_BURST" --hashlimit-mode srcip --hashlimit-name "skp_syn_${t:0:4}" -j DROP
+    (( SH_UDP )) && $t -t mangle -A "$C" -p udp "${pm[@]}" -m conntrack --ctstate NEW -m hashlimit --hashlimit-above "${SH_UDP}/sec" \
+        --hashlimit-burst $(( SH_UDP * 2 )) --hashlimit-mode srcip --hashlimit-name "skp_udp_${t:0:4}" -j DROP
+    (( SH_CONN )) && $t -t mangle -A "$C" -p tcp --syn "${pm[@]}" -m connlimit --connlimit-above "$SH_CONN" -j DROP
+    $t -t mangle -I PREROUTING 1 ! -i lo -j "$C"
+}
+
+shield_apply() {
+    shield_state_load
+    shield_flush
+    (( SH_ON )) || return 0
+    command -v iptables >/dev/null 2>&1 || return 1
+    modprobe xt_hashlimit 2>/dev/null; modprobe xt_connlimit 2>/dev/null; modprobe xt_multiport 2>/dev/null
+    if ! shield_rules iptables 2>/dev/null; then shield_flush; return 1; fi
+    if ipv6_supported && ! ipv6_off && command -v ip6tables >/dev/null 2>&1; then
+        shield_rules ip6tables 2>/dev/null || { ip6tables -t mangle -D PREROUTING ! -i lo -j "$SHIELD_CHAIN" 2>/dev/null
+            ip6tables -t mangle -F "$SHIELD_CHAIN" 2>/dev/null; ip6tables -t mangle -X "$SHIELD_CHAIN" 2>/dev/null; }
+    fi
+    return 0
+}
+
+shield_sysctl_write() {
+    if ! (( SH_KERNEL )); then
+        [[ -f $SHIELD_SYSCTL ]] && { rm -f "$SHIELD_SYSCTL"; sysctl -q --system >/dev/null 2>&1; }
+        return 0
+    fi
+    cat > "$SHIELD_SYSCTL" <<'EOF'
+# SkipIt Tool — щит: защита ядра от подмены адресов и флуда
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_rfc1337 = 1
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+EOF
+    sysctl -q -p "$SHIELD_SYSCTL" >/dev/null 2>&1
+    [[ -f $SYSCTL_FILE ]] && sysctl -q -p "$SYSCTL_FILE" >/dev/null 2>&1
+    true
+}
+
+shield_unit_write() {
+    cat > "$SHIELD_UNIT" <<EOF
+[Unit]
+Description=SkipIt Tool — щит от DDoS (фильтр пакетов)
+After=network-pre.target docker.service ufw.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SKIPIT_BIN shield-apply
+ExecStop=$SKIPIT_BIN shield-flush
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable skipit-shield.service >/dev/null 2>&1
+}
+
+# Сохранить и, если щит включён, сразу применить. Ошибка - откат к прошлым настройкам.
+shield_commit() { # [тихо]
+    local bak; bak=$(cat "$SHIELD_STATE" 2>/dev/null)
+    shield_state_save
+    if (( SH_ON )); then
+        ensure_pkg iptables iptables || { SH_ON=0; shield_state_save; return 1; }
+        ui_loading "Применяю правила щита…"
+        if ! shield_apply; then
+            [[ -n $bak ]] && printf '%s\n' "$bak" > "$SHIELD_STATE"
+            shield_apply
+            ui_msg "Не получилось" "✗ Ядро не приняло правила (нет модулей hashlimit/conntrack — бывает на OpenVZ/LXC)
+  или в списке портов / белом списке ошибка. Вернул прошлые настройки."
+            return 1
+        fi
+        shield_sysctl_write
+        shield_unit_write
+    fi
+    log "shield: on=$SH_ON syn=$SH_SYN udp=$SH_UDP ping=$SH_PING conn=$SH_CONN ports=$SH_PORTS"
+    [[ -n ${1:-} ]] || ui_msg "Готово" "✓ Настройки щита сохранены$( (( SH_ON )) && echo " и применены" || echo " — применятся, когда включите щит")
+✓ Текущие подключения, в том числе SSH, не затронуты"
+}
+
+shield_toggle() {
+    shield_state_load
+    if (( SH_ON )); then
+        ui_yesno "Выключить щит" "Фильтр пакетов и защита ядра будут сняты, настройки сохранятся.
+UFW и fail2ban продолжат работать.
+
+Выключить щит?" no || return
+        SH_ON=0; shield_state_save
+        systemctl disable --now skipit-shield.service >/dev/null 2>&1
+        shield_flush
+        rm -f "$SHIELD_UNIT" "$SHIELD_SYSCTL"; systemctl daemon-reload 2>/dev/null
+        sysctl -q --system >/dev/null 2>&1
+        log "shield: off"
+        ui_msg "Готово" "Щит выключен. Настройки сохранены — включить можно в любой момент."
+    else
+        ui_yesno "Включить щит" "Будет применено:
+Битые пакеты:   $(sh_onoff "$SH_INVALID")
+Фрагменты:      $(sh_onoff "$SH_FRAG")
+SYN-флуд:       $(sh_rate_ru "$SH_SYN" "$SH_SYN_BURST")
+UDP-флуд:       $(sh_rate_ru "$SH_UDP")
+Ping:           $( (( SH_PING )) && echo "$SH_PING/с" || echo "без ограничений")
+Соединений:     $( (( SH_CONN )) && echo "не больше $SH_CONN с одного IP" || echo "без ограничений")
+Порты:          ${SH_PORTS:-все}
+Белый список:   ${SH_WHITE:-—}
+Ядро:           $(sh_onoff "$SH_KERNEL")
+
+ℹ Пороги меняются в «Настройки щита» — до или после включения
+
+Включить щит?" || return
+        SH_ON=1; shield_commit
+    fi
+}
+
+# Ввод числа с проверкой. 0 - выключить.
+sh_ask_num() { # заголовок пояснение текущее мин макс → stdout
+    local v err=""
+    while :; do
+        v=$(ui_input "$1" "$2${err:+
+
+✗ $err}
+
+Значение (0 — выключить, $4–$5):" "$3") || return 1
+        v=${v//[[:space:]]/}
+        [[ $v =~ ^[0-9]+$ ]] && { (( v == 0 || (v >= $4 && v <= $5) )) && { printf '%s' "$v"; return 0; }; }
+        err="нужно число от $4 до $5 или 0"
+    done
+}
+
+shield_preset() {
+    local p
+    p=$(ui_choose "Шаблон настроек" "Заполнит пороги готовыми значениями. Белый список и порты не тронет.
+Дальше любое значение можно поменять отдельно." \
+        soft   "Мягкий — SYN 150/с, UDP 300/с, без лимита соединений (большие VPN, CGNAT)" \
+        normal "Обычный — SYN 80/с, UDP 160/с, без лимита соединений" \
+        strict "Строгий — SYN 40/с, UDP 80/с, не больше 150 соединений с IP") || return
+    case $p in
+        soft)   SH_SYN=150; SH_SYN_BURST=300; SH_UDP=300; SH_CONN=0 ;;
+        normal) SH_SYN=80;  SH_SYN_BURST=160; SH_UDP=160; SH_CONN=0 ;;
+        strict) SH_SYN=40;  SH_SYN_BURST=80;  SH_UDP=80;  SH_CONN=150 ;;
+    esac
+    SH_INVALID=1; SH_FRAG=1; SH_PING=5
+    shield_commit
+}
+
+menu_shield_settings() {
+    local c v
+    while :; do
+        shield_state_load
+        c=$(ui_menu "Настройки щита" "ℹ Каждую защиту можно включить, выключить или поменять порог отдельно.
+   Изменения применяются сразу, если щит включён." \
+            ""      "Фильтр пакетов" \
+            invalid "Битые и поддельные TCP-пакеты — $(sh_onoff "$SH_INVALID")" \
+            frag    "Фрагментированные пакеты — $(sh_onoff "$SH_FRAG")" \
+            syn     "SYN-флуд: новых TCP-соединений — $(sh_rate_ru "$SH_SYN" "$SH_SYN_BURST")" \
+            udp     "UDP-флуд: новых UDP-потоков — $(sh_rate_ru "$SH_UDP")" \
+            ping    "Ping — $( (( SH_PING )) && echo "не больше $SH_PING/с" || echo "без ограничений")" \
+            conn    "Одновременных соединений с IP — $( (( SH_CONN )) && echo "$SH_CONN" || echo "без ограничений")" \
+            ""      "Область действия" \
+            ports   "Порты для лимитов — ${SH_PORTS:-все}" \
+            white   "Белый список IP — ${SH_WHITE:-пусто}" \
+            ""      "Ядро" \
+            kernel  "Защита ядра (sysctl) — $(sh_onoff "$SH_KERNEL")" \
+            ""      "Быстро" \
+            preset  "Заполнить по шаблону — мягкий / обычный / строгий") || return
+        case $c in
+            invalid) SH_INVALID=$(( 1 - SH_INVALID )); shield_commit q ;;
+            frag)    SH_FRAG=$(( 1 - SH_FRAG )); shield_commit q ;;
+            kernel)  SH_KERNEL=$(( 1 - SH_KERNEL )); shield_commit q ;;
+            syn)
+                v=$(sh_ask_num "SYN-флуд" "Сколько новых TCP-соединений в секунду разрешено с одного IP.
+Больше — лишние отбрасываются. Клиенту VPN обычно хватает 20–40." "$SH_SYN" 5 10000) || continue
+                SH_SYN=$v
+                if (( v )); then
+                    v=$(sh_ask_num "SYN-флуд · всплеск" "Короткий всплеск сверх лимита — например, когда клиент
+переподключается и открывает много соединений сразу." "$(( SH_SYN_BURST ? SH_SYN_BURST : SH_SYN * 2 ))" 5 20000) || continue
+                    (( v )) || v=$(( SH_SYN * 2 )); SH_SYN_BURST=$v
+                fi
+                shield_commit ;;
+            udp)
+                v=$(sh_ask_num "UDP-флуд" "Сколько новых UDP-потоков в секунду разрешено с одного IP.
+Нужно, если на сервере есть Hysteria, WireGuard или QUIC." "$SH_UDP" 5 20000) || continue
+                SH_UDP=$v; shield_commit ;;
+            ping)
+                v=$(sh_ask_num "Ping" "Сколько пингов в секунду принимать со всех адресов вместе." "$SH_PING" 1 1000) || continue
+                SH_PING=$v; shield_commit ;;
+            conn)
+                v=$(sh_ask_num "Одновременные соединения" "Потолок открытых TCP-соединений с одного IP.
+! Осторожно с CGNAT: у мобильных операторов за одним IP сидят сотни людей." "$SH_CONN" 20 100000) || continue
+                SH_CONN=$v; shield_commit ;;
+            ports)
+                v=$(ui_input "Порты для лимитов" "Лимиты SYN, UDP и соединений будут работать только на этих портах.
+Пусто — на всех портах. До 15 портов или диапазонов через запятую: 443,8443,2000:2100" "$SH_PORTS") || continue
+                v=${v//[[:space:]]/}
+                if [[ -n $v && ! $v =~ ^[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?){0,14}$ ]]; then
+                    ui_msg "Ошибка" "Не понял список портов «$v». Пример: 443,8443,2000:2100"; continue
+                fi
+                SH_PORTS=$v; shield_commit ;;
+            white)
+                v=$(ui_input "Белый список IP" "Эти адреса и подсети щит пропускает без проверок — ваш домашний IP,
+сервер панели, мониторинг. Через запятую: 1.2.3.4,10.0.0.0/8,2a01::/32
+Пусто — очистить список." "$SH_WHITE") || continue
+                v=${v//[[:space:]]/}
+                local ip okw=1
+                for ip in ${v//,/ }; do valid_ip_spec "$ip" || okw=0; done
+                (( okw )) || { ui_msg "Ошибка" "В списке есть неверный адрес. Пример: 1.2.3.4,10.0.0.0/8"; continue; }
+                SH_WHITE=$v; shield_commit ;;
+            preset) shield_preset ;;
+        esac
+    done
+}
+
+shield_stats() {
+    shield_on || { ui_msg "Статистика щита" "Щит выключен."; return; }
+    local out
+    out=$(iptables -t mangle -L "$SHIELD_CHAIN" -v -n -x 2>/dev/null | awk 'NR>2 && $3=="DROP" {
+        r=""; for(i=10;i<=NF;i++) r=r" "$i; printf "%s\t%s\n", $1, r }')
+    ui_msg "Статистика щита" "Отброшено${TAB:-$'\t'}Правило
+${out:-0$'\t'—}
+
+ℹ Счётчики обнуляются при перезагрузке и при изменении настроек"
+}
+
+# ---- Проверка защиты: оценка и советы ----
+# Проверка защиты: оценка сверху, что в порядке - короткими строками, а каждая
+# проблема - пунктом меню, который открывает место, где она исправляется.
+# После возврата всё пересчитывается.
+audit_screen() {
+    local s m ok_txt root pass port f2b open pct grade c
+    local -a bad warn
+    a_ok()   { s=$((s + $1)); m=$((m + $1)); ok_txt+="✓ $2"$'\n'; }
+    a_bad()  { m=$((m + $1)); bad+=("$2" "$3"); }     # вес тег «действие — что сейчас»
+    a_warn() { m=$((m + $1)); warn+=("$2" "$3"); }
+    while :; do
+        s=0; m=0; ok_txt=""; bad=(); warn=()
+        ui_loading "Проверяю защиту сервера…"
+        root=$(norm_sshd_val "$(sshd_eff permitrootlogin)"); pass=$(sshd_eff passwordauthentication)
+        port=$(ssh_ports)
+        [[ $root != yes ]] && a_ok 15 "root не входит по паролю" \
+            || a_bad 15 root "Запретить вход root по паролю — сейчас главная цель подбора"
+        [[ $pass == no ]] && a_ok 10 "вход только по ключам" \
+            || a_warn 10 pass "Выключить вход по паролю — сначала добавьте SSH-ключ"
+        [[ " $port " != *" 22 "* ]] && a_ok 5 "SSH не на 22 порту" \
+            || a_warn 5 port "Сменить порт SSH — 22-й сканируют боты"
+        command -v ufw >/dev/null 2>&1 && ufw_active && a_ok 15 "фаервол UFW включён" \
+            || a_bad 15 ufw "Включить фаервол UFW — сейчас открыто всё"
+        f2b=$(f2b_state_ru)
+        [[ $f2b == работает ]] && a_ok 15 "fail2ban банит подбор паролей" \
+            || a_bad 15 f2b "$( [[ $f2b == "не установлен" ]] && echo "Установить fail2ban" || echo "Запустить fail2ban") — сейчас $f2b"
+        shield_on && a_ok 15 "щит от DDoS включён — фильтр флуда работает" \
+            || a_warn 15 shield "Включить щит от DDoS"
+        [[ $(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null) == 1 ]] && a_ok 5 "SYN cookies включены — настройка ядра, работает и без щита" \
+            || a_warn 5 syn "Включить SYN cookies — в настройках щита"
+        autoupd_supported && autoupd_on && a_ok 10 "патчи безопасности ставятся сами" \
+            || a_warn 10 autoupd "Включить автообновления безопасности"
+        reboot_required && a_warn 5 reboot "Перезагрузить сервер — новое ядро ещё не применено" \
+            || a_ok 5 "перезагрузка не нужна — ядро и библиотеки свежие"
+        open=$(ss -Htln 2>/dev/null | awk '$4 !~ /^(127\.|\[::1\])/' | wc -l)
+        (( open <= 6 )) && a_ok 5 "наружу открыто $open $(ru_plural "$open" порт порта портов) — лишнего не слушает" \
+            || a_warn 5 ports "Показать открытые порты — наружу слушают $open"
+        pct=$(( s * 100 / m ))
+
+        local -a items=()
+        (( ${#bad[@]} ))  && items+=("" "Нужно исправить" "${bad[@]}")
+        (( ${#warn[@]} )) && items+=("" "Стоит улучшить" "${warn[@]}")
+        if (( ${#items[@]} == 0 )); then
+            ui_msg "Проверка защиты" "⟦score⟧ $pct
+
+── Уже в порядке
+${ok_txt%$'\n'}"
+            return
+        fi
+        c=$(ui_menu "Проверка защиты" "⟦score⟧ $pct
+${ok_txt:+
+── Уже в порядке
+${ok_txt%$'\n'}}" "${items[@]}") || return
+        case $c in
+            root)    ssh_root_login ;;
+            pass)    ssh_password_auth ;;
+            port)    ssh_change_port ;;
+            ufw)     menu_ufw ;;
+            f2b)     menu_fail2ban ;;
+            shield)  shield_toggle ;;
+            syn)     menu_shield_settings ;;
+            autoupd) menu_autoupd ;;
+            reboot)  ui_msg "Перезагрузка" "Перезагрузите сервер в тихое время, когда мало клиентов:
+
+    reboot
+
+ℹ Клиенты VPN переподключатся сами через минуту" ;;
+            ports)   ufw_show_status ;;
+        esac
+    done
+}
+
+menu_shield() {
+    local c st
+    while :; do
+        shield_state_load
+        shield_on && st="включён" || st="выключен"
+        c=$(ui_menu "Щит — DDoS и взлом" "Щит:           $st
+
+$(shield_on && echo "── Действует сейчас" || echo "── Настроено — заработает после включения")
+SYN-флуд:      $(sh_rate_ru "$SH_SYN" "$SH_SYN_BURST")
+UDP-флуд:      $(sh_rate_ru "$SH_UDP")
+Ping:          $( (( SH_PING )) && echo "до $SH_PING/с" || echo "без ограничений")
+Соединений:    $( (( SH_CONN )) && echo "до $SH_CONN с IP" || echo "без ограничений")
+Порты:         ${SH_PORTS:-все} · белый список: ${SH_WHITE:-пусто}
+
+ℹ Щит гасит флуд с отдельных адресов. Атаку, которая забивает весь канал,
+   может остановить только хостер — спросите у него про анти-DDoS защиту" \
+            ""       "Щит" \
+            toggle   "$(shield_on && echo "Выключить щит" || echo "Включить щит")" \
+            settings "Настройки щита — пороги, порты, белый список" \
+            stats    "Статистика — сколько отброшено" \
+            ""       "Проверка" \
+            audit    "Проверить защиту сервера — оценка и советы" \
+            ""       "Связанные разделы" \
+            ssh      "SSH и пользователи" \
+            ufw      "Фаервол UFW" \
+            f2b      "fail2ban") || return
+        case $c in
+            toggle)   shield_toggle ;;
+            settings) menu_shield_settings ;;
+            stats)    shield_stats ;;
+            audit)    audit_screen ;;
+            ssh)      menu_users ;;
+            ufw)      menu_ufw ;;
+            f2b)      menu_fail2ban ;;
+        esac
+    done
+}
+
+# ==== Главный экран ====
+# Логотип, состояние сервера цветными точками и все разделы сеткой.
+# Иконки - эмодзи шириной в две клетки. Колонки ставим escape-кодом «перейти в
+# столбец N» (\e[NG): так ширина эмодзи в конкретном терминале сетку не ломает.
+
+HOME_LOGO=(
+'███████╗██╗  ██╗██╗██████╗ ██╗████████╗'
+'██╔════╝██║ ██╔╝██║██╔══██╗██║╚══██╔══╝'
+'███████╗█████╔╝ ██║██████╔╝██║   ██║   '
+'╚════██║██╔═██╗ ██║██╔═══╝ ██║   ██║   '
+'███████║██║  ██╗██║██║     ██║   ██║   '
+'╚══════╝╚═╝  ╚═╝╚═╝╚═╝     ╚═╝   ╚═╝   '
+)
+if [[ $C_BRAND == *'38;5;'* ]]; then
+    HOME_GRAD=($'\e[1;38;5;51m' $'\e[1;38;5;45m' $'\e[1;38;5;39m' $'\e[1;38;5;33m' $'\e[1;38;5;27m' $'\e[38;5;26m')
+else
+    HOME_GRAD=("$C_ACC" "$C_ACC" "$C_BRAND" "$C_BRAND" "$C_BRAND" "$C_DIM")
+fi
+
+home_col() { printf '\e[%dG' "$1"; }   # курсор в столбец N (с 1)
+
+home_rule() {
+    local w=$(( UI_W - 2 )); (( w > 84 )) && w=84
+    printf '  %s%s%s\n' "$C_DIM" "$(printf '━%.0s' $(seq 1 "$w"))" "$C_RESET"
+}
+
+# Цветная точка: ok - зелёная, warn - жёлтая, bad - красная, off - серая
+home_dot() {
+    case $1 in
+        ok)   printf '%s●%s' "$C_OK"   "$C_RESET" ;;
+        warn) printf '%s●%s' "$C_WARN" "$C_RESET" ;;
+        bad)  printf '%s●%s' "$C_ERR"  "$C_RESET" ;;
+        *)    printf '%s●%s' "$C_DIM"  "$C_RESET" ;;
+    esac
+}
+
+# Короткая полоска с цветом по уровню: «CPU ▰▰▱▱▱▱▱▱ 12%»
+home_meter() { # подпись процент
+    local p=${2:-0} c=$C_OK w=8 f i s=""
+    (( p < 0 )) && p=0; (( p > 100 )) && p=100
+    (( p >= 70 )) && c=$C_WARN; (( p >= 90 )) && c=$C_ERR
+    f=$(( (p * w + 50) / 100 ))
+    # Полоска из линий ━ и ─: ▰▱ в части шрифтов рисуются двойной ширины,
+    # строка вылезает за край окна и переносится
+    local e=""
+    for (( i = 0; i < w; i++ )); do if (( i < f )); then s+="━"; else e+="─"; fi; done
+    printf '%s%s%s %s%s%s%s%s%s %s%3d%%%s' "$C_LABEL" "$1" "$C_RESET" "$c" "$s" "$C_RESET" "$C_DIM" "$e" "$C_RESET" "$C_TXT" "$p" "$C_RESET"
+}
+
+# Загрузка CPU - средняя с прошлой отрисовки главного экрана (сколько вы были в
+# разделах), а при первом показе - за полсекунды. Замер за 0,2 с - это 20 тиков
+# ядра: шаг 5%, и простаивающий сервер почти всегда показывал 0.
+# Результат - в HOME_CPU и HOME_STEAL (доля, которую забирает хостер), без подпроцесса.
+HOME_CPU_PREV=""
+home_cpu_snap() { awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6, $9; exit}' /proc/stat; }
+home_cpu_calc() {
+    local -a a b; local dt di ds
+    read -ra b < <(home_cpu_snap)
+    [[ -n $HOME_CPU_PREV ]] && read -ra a <<< "$HOME_CPU_PREV"
+    if [[ -z $HOME_CPU_PREV ]] || (( b[0] - a[0] < 50 )); then
+        read -ra a < <(home_cpu_snap); sleep 0.5; read -ra b < <(home_cpu_snap)
+    fi
+    HOME_CPU_PREV="${b[*]}"
+    dt=$(( b[0] - a[0] )); di=$(( b[1] - a[1] )); ds=$(( b[2] - a[2] ))
+    HOME_CPU=0; HOME_STEAL=0
+    (( dt > 0 )) || return 0
+    HOME_CPU=$(( (200 * (dt - di) / dt + 1) / 2 ))     # с округлением
+    HOME_STEAL=$(( (200 * ds / dt + 1) / 2 ))
+}
+home_mem_pct()  { awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "%d\n", (t>0 ? (t-a)*100/t : 0)}' /proc/meminfo; }
+home_disk_pct() { df -P / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5+0}'; }
+
+# Строка состояния: точка, подпись, значение
+home_stat() { # уровень подпись значение
+    printf '  %s %s%s%s' "$(home_dot "$1")" "$C_TXT" "$2" "$C_RESET"
+    home_col 18
+    printf '%b\n' "$3"
+}
+
+# Шапка: логотип слева, сведения справа (или под ним, если окно узкое)
+home_header() {
+    local cols=$1 i side=() inf=48
+    side=(
+        "${C_BRAND}${SKIPIT_MARK} SkipIt Tool${C_RESET}  ${C_DIM}v${SKIPIT_VERSION}${C_RESET}"
+        "${C_HINT}VPS Control Center · Remnawave${C_RESET}"
+        ""
+        "${C_LABEL}сервер${C_RESET}  ${C_QST}$(hostname)${C_RESET}"
+        "${C_LABEL}адрес ${C_RESET}  ${C_OK}${SERVER_IP}${C_RESET}"
+        "${C_LABEL}время ${C_RESET}  ${C_TXT}$(date '+%H:%M')${C_RESET} ${C_HINT}· $(tz_current) · $(tz_off "$(date '+%z')")${C_RESET}"
+    )
+    echo
+    if (( cols >= 86 )); then
+        for i in "${!HOME_LOGO[@]}"; do
+            printf '  %s%s%s' "${HOME_GRAD[$i]}" "${HOME_LOGO[$i]}" "$C_RESET"
+            home_col "$inf"
+            printf '%s\n' "${side[$i]}"
+        done
+    elif (( cols >= 46 )); then
+        for i in "${!HOME_LOGO[@]}"; do
+            printf '  %s%s%s\n' "${HOME_GRAD[$i]}" "${HOME_LOGO[$i]}" "$C_RESET"
+        done
+        echo
+        printf '  %s  %s\n' "${side[0]}" "${side[1]}"
+        printf '  %s%s%s %s·%s %s%s%s %s·%s %s%s%s\n' "$C_QST" "$(hostname)" "$C_RESET" "$C_HINT" "$C_RESET" \
+            "$C_OK" "$SERVER_IP" "$C_RESET" "$C_HINT" "$C_RESET" "$C_TXT" "$(date '+%H:%M') $(tz_current)" "$C_RESET"
+    else
+        for i in 0 1 3 4 5; do printf '  %s\n' "${side[$i]}"; done
+    fi
+    echo
+}
+
+home_status() {
+    local lv v root pass ufw f2b tcp rb rem
+    # Remnawave
+    rem=$(remna_installed_list)
+    if [[ -n $rem ]]; then home_stat ok "Remnawave" "${C_OK}${rem//, / · }${C_RESET}"
+    else home_stat off "Remnawave" "${C_HINT}не установлена — раздел «Компоненты Remnawave»${C_RESET}"; fi
+    # SSH
+    root=$(norm_sshd_val "$(sshd_eff permitrootlogin)"); pass=$(sshd_eff passwordauthentication)
+    v="${C_TXT}порт ${C_OK}$(ssh_ports)${C_RESET}"
+    lv=ok
+    case $root in
+        yes) v+="${C_HINT} · ${C_WARN}root по паролю${C_RESET}"; lv=warn ;;
+        no)  v+="${C_HINT} · root запрещён${C_RESET}" ;;
+        *)   v+="${C_HINT} · root только по ключу${C_RESET}" ;;
+    esac
+    [[ $pass == no ]] && v+="${C_HINT} · пароли выключены${C_RESET}"
+    home_stat "$lv" "SSH" "$v"
+    # Защита
+    if ! command -v ufw >/dev/null 2>&1; then ufw="не установлен"
+    elif ufw_active; then ufw="включён"; else ufw="выключен"; fi
+    f2b=$(f2b_state_ru)
+    if [[ $ufw == включён && $f2b == работает ]]; then lv=ok
+    elif [[ $ufw == включён || $f2b == работает ]]; then lv=warn
+    else lv=bad; fi
+    v="${C_TXT}UFW $( [[ $ufw == включён ]] && printf '%s' "$C_OK" || printf '%s' "$C_WARN" )${ufw}${C_RESET}"
+    v+="${C_HINT} · ${C_TXT}fail2ban $( [[ $f2b == работает ]] && printf '%s' "$C_OK" || printf '%s' "$C_WARN" )${f2b}${C_RESET}"
+    if shield_on; then v+="${C_HINT} · ${C_TXT}щит ${C_OK}вкл${C_RESET}"
+    else v+="${C_HINT} · ${C_TXT}щит ${C_WARN}выкл${C_RESET}"; [[ $lv == ok ]] && lv=warn; fi
+    home_stat "$lv" "Защита" "$v"
+    # Сеть
+    tcp=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    [[ $tcp == bbr* ]] && lv=ok || lv=warn
+    home_stat "$lv" "Сеть" "${C_TXT}TCP $( [[ $lv == ok ]] && printf '%s' "$C_OK" || printf '%s' "$C_WARN" )${tcp:-?}${C_RESET}${C_HINT} · ${C_TXT}IPv6 ${C_RESET}${C_HINT}$(ipv6_state_ru)${C_RESET}"
+    # Система
+    lv=ok; v="${C_TXT}${OS_NAME}${C_RESET}${C_HINT} · ${VIRT}${C_RESET}"
+    if autoupd_supported && autoupd_on; then v+="${C_HINT} · патчи ${C_OK}сами${C_RESET}"
+    else v+="${C_HINT} · патчи ${C_WARN}вручную${C_RESET}"; lv=warn; fi
+    if reboot_required; then v+="${C_HINT} · ${C_WARN}ждёт перезагрузки${C_RESET}"; lv=warn; fi
+    home_stat "$lv" "Система" "$v"
+    # Нагрузка
+    local l1 l2 l3 up d h m
+    read -r l1 l2 l3 _ < /proc/loadavg
+    up=$(cut -d. -f1 /proc/uptime); d=$(( up / 86400 )); h=$(( up % 86400 / 3600 )); m=$(( up % 3600 / 60 ))
+    if (( d > 0 )); then up="$d дн $h ч"; elif (( h > 0 )); then up="$h ч $m мин"; else up="$m мин"; fi
+    printf '    %sРесурсы%s' "$C_TXT" "$C_RESET"; home_col 18
+    home_cpu_calc
+    printf '%s   %s   %s\n' "$(home_meter CPU "$HOME_CPU")" "$(home_meter RAM "$(home_mem_pct)")" "$(home_meter Диск "$(home_disk_pct)")"
+    home_col 18; printf '%sнагрузка %s %s %s · работает %s · %s %s%s' "$C_HINT" "$l1" "$l2" "$l3" "$up" \
+        "$(nproc 2>/dev/null || echo 1)" "$(ru_plural "$(nproc 2>/dev/null || echo 1)" ядро ядра ядер)" "$C_RESET"
+    # steal - процессор, который хостер отдал соседям; от 10% VPN заметно тормозит
+    if (( HOME_STEAL >= 10 )); then printf ' %s· хостер забирает %s%% CPU%s' "$C_WARN" "$HOME_STEAL" "$C_RESET"
+    elif (( HOME_STEAL >= 3 )); then printf ' %s· steal %s%%%s' "$C_HINT" "$HOME_STEAL" "$C_RESET"; fi
+    echo
+}
+
+# Разделы. Группа: «@Название», пункт: «тег|иконка|подпись|пометка».
+# Группы идут парами - левая и правая колонка.
+HOME_TAGS=()
+home_items() { # → глобальный HOME_SPEC
+    local upd=$1 au="" tgb="" shd=""
+    autoupd_supported && ! autoupd_on && au="выкл"
+    tg_cron_on && { tg_state_load; tgb=$(tg_every_ru "$TG_EVERY"); }
+    shield_on || shd="выкл"
+    HOME_SPEC=(
+        "@Remnawave"
+        "remna|📦|Компоненты Remnawave|"
+        "rdiag|🔍|Диагностика|"
+        "regions|🌍|IP по регионам|"
+        "tgbak|💾|Бэкап в Telegram|$tgb"
+        "@Защита"
+        "shield|🏰|Щит — DDoS и взлом|$shd"
+        "users|🔐|SSH и пользователи|"
+        "ufw|🧱|Фаервол UFW|"
+        "f2b|🚨|fail2ban|"
+        "autoupd|🔁|Автообновления|$au"
+        "@Сеть и ядро"
+        "kernel|🚀|Ядро — BBR, sysctl|"
+        "ipv6|🌐|IPv6|"
+        "speed|📶|Тест скорости|"
+        "@Система"
+        "upgrade|🔄|Обновить пакеты|"
+        "tz|🕒|Часовой пояс|$(date '+%H:%M')"
+        "monitor|📊|Монитор btop|"
+        "clean|🧹|Очистка диска|"
+        "@SkipIt Tool"
+        "update|🆙|Обновить SkipIt|${upd:+новая v$upd}"
+        "about|📖|О программе|"
+        "selfrm|❌|Удалить SkipIt|"
+    )
+}
+
+# Печать одного пункта с текущей позиции курсора (колонка уже выставлена)
+home_item() { # номер ширина-номера иконка подпись пометка
+    printf '%s%*s%s %s %s%s%s' "$C_ACC" "$2" "[$1]" "$C_RESET" "$3" "$C_TXT" "$4" "$C_RESET"
+    if [[ -n $5 ]]; then
+        if [[ $5 == новая* || $5 == выкл ]]; then printf ' %s%s%s' "$C_WARN" "$5" "$C_RESET"
+        else printf ' %s%s%s' "$C_HINT" "$5" "$C_RESET"; fi
+    fi
+}
+
+home_menu() { # ширина-окна
+    local cols=$1 n=0 nw=4 x tag ic lb mk
+    local -a groups=() cur=()
+    HOME_TAGS=()
+    # Разбор на группы: каждая группа - строка с элементами через \x1f
+    for x in "${HOME_SPEC[@]}"; do
+        if [[ $x == @* ]]; then
+            (( ${#cur[@]} )) && groups+=("$(IFS=$'\x1f'; echo "${cur[*]}")")
+            cur=("$x")
+        else
+            cur+=("$x")
+        fi
+    done
+    (( ${#cur[@]} )) && groups+=("$(IFS=$'\x1f'; echo "${cur[*]}")")
+
+    # Номера сквозные: сначала левая колонка пары, потом правая
+    local -a L R; local gi=0 two=0 rows r right=46
+    (( cols >= 78 )) && two=1
+    (( cols < 92 )) && right=40
+    while (( gi < ${#groups[@]} )); do
+        IFS=$'\x1f' read -ra L <<< "${groups[$gi]}"
+        R=()
+        if (( two && gi + 1 < ${#groups[@]} )); then
+            IFS=$'\x1f' read -ra R <<< "${groups[$((gi + 1))]}"
+            gi=$((gi + 2))
+        else
+            gi=$((gi + 1))
+        fi
+        # заголовки групп
+        printf '  %s %s %s' "$C_SECTION" "${L[0]#@}" "$C_RESET"
+        (( ${#R[@]} )) && { home_col $((right + 1)); printf '%s %s %s' "$C_SECTION" "${R[0]#@}" "$C_RESET"; }
+        echo
+        rows=$(( ${#L[@]} > ${#R[@]} ? ${#L[@]} : ${#R[@]} ))
+        local -a nl=() nr=()
+        for (( r = 1; r < ${#L[@]}; r++ )); do n=$((n + 1)); nl[$r]=$n; HOME_TAGS+=("${L[$r]%%|*}"); done
+        for (( r = 1; r < ${#R[@]}; r++ )); do n=$((n + 1)); nr[$r]=$n; HOME_TAGS+=("${R[$r]%%|*}"); done
+        for (( r = 1; r < rows; r++ )); do
+            if (( r < ${#L[@]} )); then
+                IFS='|' read -r tag ic lb mk <<< "${L[$r]}"
+                printf '  '; home_item "${nl[$r]}" "$nw" "$ic" "$lb" "$mk"
+            fi
+            if (( r < ${#R[@]} )); then
+                IFS='|' read -r tag ic lb mk <<< "${R[$r]}"
+                home_col $((right + 1)); home_item "${nr[$r]}" "$nw" "$ic" "$lb" "$mk"
+            fi
+            echo
+        done
+        echo
+    done
+    printf '  %s%*s%s %s %s%s%s\n' "$C_LABEL" "$nw" "[0]" "$C_RESET" "🚪" "$C_HINT" "Выход" "$C_RESET"
+}
+
+main_menu() {
+    local c a n err upd cols keys
+    while :; do
+        UI_CTX=""
+        ui_dims
+        cols=$(tput cols 2>/dev/null); [[ $cols =~ ^[0-9]+$ ]] || cols=80
+        upd=$(update_available)
+        home_items "$upd"
+        clear >"$TTY"
+        {
+            home_header "$cols"
+            home_rule
+            home_status
+            home_rule
+            echo
+            home_menu "$cols"
+            echo
+            home_rule
+            printf '  %s%s%s %sзапуск в любой момент:%s %s%s%s' "$C_BRAND" "$SKIPIT_MARK" "$C_RESET" "$C_HINT" "$C_RESET" "$C_ACC" "$SKIPIT_CMD" "$C_RESET"
+            [[ -n $upd ]] && printf '   %s⬆ доступна v%s — пункт «Обновить SkipIt»%s' "$C_WARN" "$upd" "$C_RESET"
+            echo
+        } >"$TTY"
+        n=${#HOME_TAGS[@]}; err=""
+        keys="1-$n — раздел · 0 — выход"
+        ui_ask_open
+        while :; do
+            ui_ask "$keys" "$err"
+            ui_readline a || return
+            a=${a//[[:space:]]/}
+            [[ $a == 0 || $a == q || $a == й ]] && return
+            if [[ $a =~ ^[0-9]+$ ]] && (( a >= 1 && a <= n )); then
+                c=${HOME_TAGS[$((a - 1))]}; break
+            fi
+            [[ -z $a ]] && { err=""; ui_ask_retry; continue; }
+            err="нет такого пункта: «$a»"; ui_ask_retry
+        done
+        { printf '\r\e[J'; } >"$TTY"
+        ui_loading
+        local spec
+        for spec in "${HOME_SPEC[@]}"; do
+            [[ ${spec%%|*} == "$c" ]] || continue
+            IFS='|' read -r _ ic lb _ <<< "$spec"; UI_SECTION="$ic ${lb%% — *}"
+        done
+        case $c in
+            remna)   menu_remnawave ;;
+            rdiag)   menu_remna_diag ;;
+            regions) region_check ;;
+            tgbak)   menu_tgbackup ;;
+            shield)  menu_shield ;;
+            users)   menu_users ;;
+            ufw)     menu_ufw ;;
+            f2b)     menu_fail2ban ;;
+            autoupd) menu_autoupd ;;
+            kernel)  menu_kernel ;;
+            ipv6)    menu_ipv6 ;;
+            speed)   sys_speedtest ;;
+            upgrade) menu_sys_upgrade ;;
+            tz)      menu_timezone ;;
+            monitor) sys_btop ;;
+            clean)   sys_disk_clean ;;
+            update)  menu_update ;;
+            about)   menu_about ;;
+            selfrm)  menu_self_remove ;;
+        esac
+        UI_SECTION=""
     done
 }
 
@@ -12298,8 +14102,13 @@ lock_take() {
     flock -n 9 && return 0
     exec 9>&-   # чтобы наши подпроцессы не попали в список держателей
     say "SkipIt Tool уже открыт в другом окне — закрываю его..."
-    local pids; pids=$(lock_holders)
-    [[ -n $pids ]] && kill -TERM $pids 2>/dev/null
+    local pids p; pids=$(lock_holders)
+    if [[ -n $pids ]]; then
+        kill -TERM $pids 2>/dev/null
+        # Старая копия обычно ждёт ввода в дочернем процессе, и bash не выполнит
+        # выход, пока тот жив - без этого новая копия висела 5 секунд
+        for p in $pids; do pkill -TERM -P "$p" 2>/dev/null; done
+    fi
     exec 9>>"$SKIPIT_LOCK"
     if ! flock -w 5 9; then
         exec 9>&-
@@ -12308,14 +14117,14 @@ lock_take() {
         exec 9>>"$SKIPIT_LOCK"
         flock -w 3 9 || die "Не удалось закрыть SkipIt Tool в другом окне. Закройте его вручную: kill $(echo $pids)"
     fi
-    sleep 0.3
+    sleep 0.2
 }
 
 main() {
     case ${1:-} in
         version|-v|--version) echo "SkipIt Tool v${SKIPIT_VERSION}"; exit 0 ;;
         help|-h|--help)       usage; exit 0 ;;
-        install|uninstall|update|menu|panel-backup|"") ;;
+        install|uninstall|update|menu|panel-backup|tg-backup|shield-apply|shield-flush|"") ;;
         *) usage; exit 1 ;;
     esac
     require_root "$@"
@@ -12328,6 +14137,12 @@ main() {
         if f=$(panel_backup_make); then log "panel backup (cron): $f"; else log "panel backup (cron): FAIL"; exit 1; fi
         exit 0
     fi
+    # Бэкап в Telegram по расписанию и щит при загрузке - тоже без меню
+    case ${1:-} in
+        tg-backup)    SERVER_IP=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null); tg_backup_run; exit $? ;;
+        shield-apply) shield_apply; exit $? ;;
+        shield-flush) shield_flush; exit 0 ;;
+    esac
     # Команда skipit ещё не установлена - это первый запуск на сервере
     [[ -x $SKIPIT_BIN || ${1:-} == uninstall ]] || sys_upgrade first
 
@@ -12335,6 +14150,12 @@ main() {
         install)
             bootstrap_deps; self_install; tz_first_run
             say "Готово! Запускайте командой: ${C_ACC}${SKIPIT_CMD}${C_RESET}"
+            # Терминал есть - сразу открываем меню, без второй команды
+            if { : >"$TTY"; } 2>/dev/null; then
+                say "Открываю меню…"
+                sleep 1
+                exec "$SKIPIT_BIN" <"$TTY"
+            fi
             exit 0 ;;
         uninstall)
             self_uninstall; exit 0 ;;
