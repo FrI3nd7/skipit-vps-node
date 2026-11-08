@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Skipit: ignore Ctrl+Z
+trap '' TSTP
 # SkipIt Tool - VPS Control Center (текстовое меню)
 #
 # Разделы: нода Remnawave (установка и управление), пользователи и SSH,
@@ -7,7 +9,7 @@
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.2.0"
+SKIPIT_VERSION="1.2.1"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -1024,6 +1026,7 @@ ui_buttons() { # клавиша1 подпись1 цвет1 клавиша2 по�
 ui_item_icon() { # текст
     local t=${1,,}
     case $t in
+        "без final mask"|"fragment"|"sudoku")             printf '📂' ;;
         "http-01"*)                                       printf '🌐' ;;
         "cloudflare dns"*)                                printf '🔐' ;;
         "zerossl"*)                                       printf '🌍' ;;
@@ -1288,7 +1291,7 @@ ui_msg() {   # заголовок текст
     ui_readline _
 }
 
-ui_yesno() { # заголовок текст [no — по умолчанию «нет»]
+ui_yesno() { # заголовок текст [no — по умолчанию «нет»] [цвет кнопки «да»]
     local def=y a err="" q yl nl
     [[ ${3:-} == no ]] && def=n
     ui_head "$1"
@@ -1299,9 +1302,9 @@ ui_yesno() { # заголовок текст [no — по умолчанию «�
     nl="Нет, назад"
     echo >"$TTY"
     if [[ $def == n ]]; then
-        ui_buttons "y" "$yl" "$C_ERR" "n·Enter" "$nl" "$C_DIM" >"$TTY"
+        ui_buttons "y" "$yl" "${4:-$C_ERR}" "n·Enter" "$nl" "$C_DIM" >"$TTY"
     else
-        ui_buttons "y·Enter" "$yl" "$C_OK" "n" "$nl" "$C_DIM" >"$TTY"
+        ui_buttons "y·Enter" "$yl" "${4:-$C_OK}" "n" "$nl" "$C_DIM" >"$TTY"
     fi
     ui_ask_open
     while :; do
@@ -1782,11 +1785,25 @@ $out"
     return 0
 }
 
-# Сколько валидных ключей в authorized_keys пользователя
+# Номера строк с валидными ключами, включая строки с опциями authorized_keys.
+user_key_lines() {
+    local ak=$1 line n=0 tmp
+    [[ -f $ak ]] || return 0
+    tmp=$(mktemp) || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        [[ -z ${line//[[:space:]]/} || $line =~ ^[[:space:]]*# ]] && continue
+        printf '%s\n' "$line" >"$tmp"
+        ssh-keygen -l -f "$tmp" >/dev/null 2>&1 && echo "$n"
+    done <"$ak"
+    rm -f "$tmp"
+}
+
 user_key_count() {
-    local home; home=$(getent passwd "$1" | cut -d: -f6)
-    [[ -f $home/.ssh/authorized_keys ]] || { echo 0; return; }
-    grep -Ec '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$home/.ssh/authorized_keys" 2>/dev/null || true
+    local home lines
+    home=$(getent passwd "$1" | cut -d: -f6)
+    lines=$(user_key_lines "$home/.ssh/authorized_keys") || return 1
+    if [[ -z $lines ]]; then echo 0; else printf '%s\n' "$lines" | wc -l; fi
 }
 
 # ==== Пользователи ====
@@ -1846,6 +1863,14 @@ pick_user() { # заголовок текст → логин
         return 1
     fi
     ui_choose "$1" "$(users_table_text noroot)
+
+$2" "${items[@]}"
+}
+
+pick_user_with_root() {
+    local u items=(root root)
+    for u in $(list_human_users); do items+=("$u" "$u"); done
+    ui_choose "$1" "$(users_table_text)
 
 $2" "${items[@]}"
 }
@@ -2084,6 +2109,61 @@ user_add_key() {
 Всего у $u ключей: $(user_key_count "$u")"
 }
 
+user_remove_key() {
+    local u home ak line n=0 fingerprint selected out tmp snapshot
+    local items=() key_lines
+    u=$(pick_user_with_root "Удаление SSH-ключа" "Выберите пользователя:") || return
+    home=$(getent passwd "$u" | cut -d: -f6); ak="$home/.ssh/authorized_keys"
+    key_lines=$(user_key_lines "$ak") || { ui_msg "Ошибка" "Не удалось прочитать ключи."; return 1; }
+    [[ -n $key_lines ]] || { ui_msg "SSH-ключи" "У $u нет ключей в authorized_keys."; return; }
+    snapshot=$(mktemp) || return 1
+    if ! cp -- "$ak" "$snapshot"; then rm -f "$snapshot"; return 1; fi
+    tmp=$(mktemp) || { rm -f "$snapshot"; return 1; }
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        printf '%s\n' "$line" >"$tmp"
+        if fingerprint=$(ssh-keygen -l -f "$tmp" 2>/dev/null); then
+            items+=("$n" "$fingerprint")
+        fi
+    done <"$snapshot"
+    rm -f "$tmp"
+    selected=$(ui_choose "SSH-ключи: $u" "Какой ключ удалить?" "${items[@]}") || { rm -f "$snapshot"; return; }
+    [[ $selected =~ ^[0-9]+$ ]] || { rm -f "$snapshot"; return 1; }
+    ui_yesno "Удаление SSH-ключа" "Удалить выбранный ключ у $u?
+Если это последний способ входа, новое SSH-подключение станет невозможно.
+Текущие подключения сохранятся." no || { rm -f "$snapshot"; return; }
+    if ! cmp -s -- "$snapshot" "$ak"; then
+        rm -f "$snapshot"; ui_msg "Ошибка" "Файл ключей изменился. Откройте список заново."; return 1
+    fi
+    if ! backup_file "$ak" >/dev/null; then
+        rm -f "$snapshot"; ui_msg "Ошибка" "Не удалось сохранить резервную копию ключей."; return 1
+    fi
+    tmp=$(mktemp "${ak}.skipit.XXXXXX") || { rm -f "$snapshot"; return 1; }
+    if ! cp -p -- "$ak" "$tmp" || ! awk -v n="$selected" 'NR != n' "$snapshot" >"$tmp" || ! mv -f -- "$tmp" "$ak"; then
+        rm -f "$tmp" "$snapshot"; ui_msg "Ошибка" "Не удалось удалить ключ."; return 1
+    fi
+    rm -f "$snapshot"
+    log "user removekey: $u line=$selected"
+    ui_msg "Готово" "SSH-ключ пользователя $u удалён."
+}
+
+user_remove_password() {
+    local u out
+    u=$(pick_user_with_root "Удаление пароля" "У кого удалить пароль?") || return
+    ui_yesno "Удаление пароля" "Удалить пароль пользователя $u?
+Хеш пароля будет удалён. Вход с пустым паролем запрещён.
+SSH-ключи сохранятся; sudo с паролем и вход по паролю работать не будут.
+Если ключей нет, сначала настройте другой способ доступа." no || return
+    # '*' заменяет хеш, а не сохраняет его с префиксом '!'.
+    # В отличие от passwd -d, не создаёт учётную запись с пустым паролем.
+    if ! out=$(usermod -p '*' "$u" 2>&1); then
+        ui_msg "Ошибка" "Не удалось удалить пароль:
+$out"; return 1
+    fi
+    log "user remove-password: $u"
+    ui_msg "Готово" "Пароль пользователя $u удалён. SSH-ключи сохранены."
+}
+
 user_passwd() {
     local u x items=(root root)
     for x in $(list_human_users); do items+=("$x" "$x"); done
@@ -2224,6 +2304,7 @@ $(ports_used_table)
 Оставить:  $new
 
 Убедитесь, что подключение через порт $new работает!
+Правила UFW закрываемых портов удалятся автоматически.
 
 Закрыть остальные порты?" no || return
         tx_begin; sshd_comment_everywhere port
@@ -2247,7 +2328,7 @@ $busy"; return
 
 1. SSH сразу начнёт слушать оба порта.
 2. Вы проверите вход через новый порт в новом окне терминала.
-3. Только после этого старый порт закроется.
+3. Только после этого старый порт закроется, его отдельные правила UFW удалятся.
 
 Продолжить?" || return
 
@@ -2283,6 +2364,8 @@ $busy"; return
 
 Откройте новое окно терминала и подключитесь этой командой.
 
+Правила UFW старого порта удалятся автоматически.
+
 Вход работает? Закрыть старый порт ($cur)?" no; then
         tx_begin; sshd_comment_everywhere port
         (( fix_la )) && sshd_comment_everywhere listenaddress
@@ -2299,35 +2382,175 @@ $busy"; return
     fi
 }
 
+# Разбор вывода ufw show added в массив аргументов, без eval и выполнения текста.
+ssh_ufw_rule_args() {
+    local tmp rc
+    SSH_UFW_ARGS=()
+    tmp=$(mktemp -d) || return 1
+    printf '%s\n' "$1" | xargs -r printf '%s\0' >"$tmp/args" 2>"$tmp/error"; rc=$?
+    if (( rc == 0 )); then mapfile -d '' -t SSH_UFW_ARGS <"$tmp/args"; rc=$?
+    else SSH_UFW_MATCH_ERROR=$(cat "$tmp/error"); fi
+    rm -rf -- "$tmp"
+    (( rc == 0 && ${#SSH_UFW_ARGS[@]} > 0 ))
+}
+
+# 0: отдельное входящее правило старого TCP-порта; 1: другое правило;
+# 2: составное правило с этим портом, которое нельзя удалить целиком; 3: ошибка.
+ssh_ufw_rule_matches() { # правило старый-порт
+    local rule=$1 want=$2 token dest="" proto="" i from=0 have_to=0 profile="" info line ports="" spec item a b hit=0 shared=0
+    local -a specs parts
+    ssh_ufw_rule_args "$rule" || return 3
+    [[ ${SSH_UFW_ARGS[0]} == allow || ${SSH_UFW_ARGS[0]} == limit ]] || return 1
+    for ((i=1; i<${#SSH_UFW_ARGS[@]}; i++)); do
+        token=${SSH_UFW_ARGS[$i]}
+        case $token in
+            comment) break ;;
+            out) return 1 ;;
+            in) ;;
+            on) i=$((i + 1)) ;;
+            from) from=1; i=$((i + 1)) ;;
+            to) from=0; have_to=1; i=$((i + 1)) ;;
+            port)
+                # source port не равен destination port: не путать при удалении.
+                (( from )) || dest=${SSH_UFW_ARGS[$((i + 1))]:-}
+                i=$((i + 1)) ;;
+            proto) proto=${SSH_UFW_ARGS[$((i + 1))]:-}; i=$((i + 1)) ;;
+            app)
+                (( from )) || profile=${SSH_UFW_ARGS[$((i + 1))]:-}
+                i=$((i + 1)) ;;
+            *)
+                if (( !from && !have_to )) && [[ -z $dest && -z $profile ]]; then
+                    if [[ $token =~ ^[0-9][0-9:,]*(/(tcp|udp))?$ ]]; then dest=$token
+                    else profile=$token; fi
+                fi ;;
+        esac
+    done
+    [[ -z $proto || $proto == tcp ]] || return 1
+    if [[ -n $profile ]]; then
+        if ! info=$(ufwc app info "$profile" 2>&1); then
+            SSH_UFW_MATCH_ERROR="Не удалось проверить профиль $profile:
+$info"; return 3
+        fi
+        # Прочие поля профиля не принимаем за номера портов.
+        while IFS= read -r line; do
+            line=${line//[[:space:]]/}
+            [[ $line =~ ^[0-9][0-9:,]*(/(tcp|udp))?(\|[0-9][0-9:,]*(/(tcp|udp))?)*$ ]] && ports+="${ports:+|}$line"
+        done <<< "$info"
+        [[ -n $ports ]] || { SSH_UFW_MATCH_ERROR="Не удалось прочитать порты профиля $profile."; return 3; }
+    else
+        [[ -n $dest ]] || return 1
+        ports=$dest
+    fi
+    IFS='|' read -r -a specs <<< "$ports"
+    for spec in "${specs[@]}"; do
+        if [[ $spec == */udp ]]; then shared=1; continue; fi
+        spec=${spec%/tcp}
+        [[ $spec =~ ^[0-9][0-9:,]*$ ]] || return 3
+        IFS=',' read -r -a parts <<< "$spec"
+        for item in "${parts[@]}"; do
+            if [[ $item == *:* ]]; then
+                a=${item%:*}; b=${item#*:}
+                (( 10#$want >= 10#$a && 10#$want <= 10#$b )) && hit=1
+                [[ $a == "$want" && $b == "$want" ]] || shared=1
+            elif [[ $item == "$want" ]]; then hit=1
+            else shared=1; fi
+        done
+    done
+    (( hit )) || return 1
+    (( shared )) && return 2
+    return 0
+}
+
 ssh_after_port_close() { # старые_порты новый
-    local p msg still skipped="" del=""
-    # Конфиг мы переписали, но верить ему нельзя: проверяем, что демон и правда
-    # отпустил старые порты. Правило UFW для порта, который всё ещё слушается,
-    # не трогаем - иначе закроем единственный работающий вход.
+    local p msg still rules raw rule out after live_new rc count=0 errors="" preserved="" skipped="" matched=0
+    local SSH_UFW_MATCH_ERROR=""
+    local -a SSH_UFW_ARGS=()
     still=$(ssh_port_check_live "$2")
     if [[ -n $still ]]; then
-        msg="! sshd всё ещё слушает:  ${still// /, }
+        msg="! sshd всё ещё слушает: ${still// /, }
+Для этих портов правила UFW сохранены.
+Проверьте ListenAddress и сокет-активацию ssh.socket."
+    else msg="SSH теперь работает только на порту $2."; fi
+    if ! command -v ufw >/dev/null 2>&1; then
+        ui_msg "Смена порта SSH" "$msg
+UFW не установлен — удалять правила не требуется."; return 0
+    fi
+    # Даже после ответа пользователя новый слушающий сокет должен существовать.
+    # ss без -p видит и порт, которым владеет systemd при socket activation.
+    if ! live_new=$(ss -Htln "sport = :$2" 2>&1); then
+        ui_msg "Проверка SSH не пройдена" "Правила UFW сохранены: не удалось проверить новый порт $2.
+$live_new"; return 1
+    fi
+    if [[ -z $live_new ]]; then
+        ui_msg "Новый SSH-порт не слушается" "Порт $2 не найден среди слушающих сокетов.
+Правила UFW для старых портов сохранены."; return 1
+    fi
+    if ! rules=$(ufwc show added 2>&1); then
+        ui_msg "Ошибка очистки UFW" "$msg
 
-В конфиге остался только порт $2, но демон занял и другие. Обычно это строки
-ListenAddress с портом или сокет-активация systemd (ssh.socket).
-Посмотреть:  ss -tlnp | grep sshd"
-    else
-        msg="SSH теперь работает только на порту $2."
+Не удалось получить правила UFW:
+$rules"
+        log "ssh ufw cleanup: cannot read rules: $rules"
+        return 1
     fi
-    if ufw_active && ui_yesno "UFW" "Удалить правила UFW для старых портов SSH ($1)?"; then
-        for p in $1; do
-            [[ $p == "$2" ]] && continue
-            [[ " $still " == *" $p "* ]] && { skipped+=" $p"; continue; }
-            ufwc --force delete allow "$p/tcp" >/dev/null 2>&1
-            ufwc --force delete allow "$p/tcp" comment 'SSH (SkipIt)' >/dev/null 2>&1
-            ufwc --force delete allow "$p" >/dev/null 2>&1
-            [[ $p == 22 ]] && ufwc --force delete allow OpenSSH >/dev/null 2>&1
-            del+=" $p"
-        done
-        [[ -n $del ]]     && msg+=$'\n\n'"Правила UFW удалены:  ${del# }"
-        [[ -n $skipped ]] && msg+=$'\n'"Оставлены (sshd их слушает):  ${skipped# }"
+    # Читаем сохранённые правила: работает и при выключенном UFW.
+    for p in $1; do
+        [[ $p == "$2" ]] && continue
+        [[ " $still " == *" $p "* ]] && { skipped+=" $p"; continue; }
+        matched=0
+        while IFS= read -r raw; do
+            [[ $raw == 'ufw '* ]] || continue
+            rule=${raw#ufw }
+            SSH_UFW_MATCH_ERROR=""
+            if ssh_ufw_rule_matches "$rule" "$p"; then rc=0; else rc=$?; fi
+            case $rc in
+                1) continue ;;
+                2) preserved+=$'\n'"• $p: ufw $rule"; matched=1; continue ;;
+                3)
+                    errors+=$'\n'"Не удалось проверить правило: ufw $rule${SSH_UFW_MATCH_ERROR:+
+$SSH_UFW_MATCH_ERROR}"
+                    continue ;;
+            esac
+            matched=1
+            # Массив из проверенного show added. Ни комментарии, ни имена
+            # профилей не интерпретируются как shell-код.
+            if ! out=$(ufwc --force delete "${SSH_UFW_ARGS[@]}" 2>&1); then
+                errors+=$'\n'"Не удалось удалить: ufw $rule
+$out"
+                log "ssh ufw cleanup FAIL: $rule: $out"
+                continue
+            fi
+            # Код 0 у UFW не гарантирует удаления: проверяем оставшиеся правила.
+            if ! after=$(ufwc show added 2>&1); then
+                errors+=$'\n'"Не удалось проверить удаление: ufw $rule
+$after"
+                continue
+            fi
+            if grep -qxF -- "ufw $rule" <<< "$after"; then
+                errors+=$'\n'"Правило осталось: ufw $rule
+$out"
+                log "ssh ufw cleanup FAIL: rule remains: $rule: $out"
+            else
+                count=$((count + 1))
+                log "ssh ufw cleanup deleted: $rule"
+            fi
+        done <<< "$rules"
+        (( matched )) || msg+=$'\n'"Для старого порта $p отдельных правил не найдено."
+    done
+    msg+=$'\n\n'"Правил UFW удалено: $count."
+    [[ -n $skipped ]] && msg+=$'\n'"Сохранены правила для слушающих SSH-портов:${skipped}"
+    [[ -n $preserved ]] && msg+=$'\n\n'"Составные правила сохранены — они разрешают и другие порты/протоколы.
+Уберите из них старый SSH-порт вручную:${preserved}"
+    if [[ -n $errors ]]; then
+        ui_msg "SSH изменён — есть ошибки UFW" "$msg
+
+── Ошибки
+${errors# }"
+        return 1
     fi
-    ui_msg "Готово" "$msg"
+    if [[ -n $preserved || -n $still ]]; then
+        ui_msg "SSH изменён — проверьте правила" "$msg"
+    else ui_msg "Готово" "$msg"; fi
 }
 
 ssh_root_login() {
@@ -2533,6 +2756,8 @@ menu_user_accounts() {
             ""     "Управление" \
             key    "Добавить SSH-ключ" \
             passwd "Сменить пароль" \
+            delkey "Удалить SSH-ключ" \
+            delpass "Удалить пароль" \
             sudo   "Выдать / забрать sudo" \
             lock   "Заблокировать / разблокировать" \
             ""     "Опасные действия" \
@@ -2541,6 +2766,8 @@ menu_user_accounts() {
             create) user_create ;;
             key)    user_add_key ;;
             passwd) user_passwd ;;
+            delkey) user_remove_key ;;
+            delpass) user_remove_password ;;
             sudo)   user_sudo_toggle ;;
             lock)   user_lock_toggle ;;
             delete) user_delete ;;
@@ -3515,8 +3742,9 @@ NODE_LAYOUT="steal"; NODE_WS_PATH=""; NODE_XHTTP_PATH=""
 # Связка: nginx ноды обслуживает ещё и панель со страницей подписки. 443 при этом
 # держит Xray, а панель живёт за тем же unix-сокетом, что и сайт-заглушка.
 NODE_SHARED=0
+NODE_FINAL_MASK="fragment"; NODE_SUDOKU_PASSWORD=""
 NODE_KEYS=(NODE_DOMAIN NODE_PANEL_IP NODE_PORT NODE_CERT_METHOD NODE_CERT_NAME NODE_TEMPLATE NODE_PRIV NODE_PUB NODE_SID
-           NODE_LAYOUT NODE_WS_PATH NODE_XHTTP_PATH NODE_SHARED)
+           NODE_LAYOUT NODE_WS_PATH NODE_XHTTP_PATH NODE_SHARED NODE_FINAL_MASK NODE_SUDOKU_PASSWORD)
 
 # Схемы ноды: steal - шаблонная (selfsteal TCP); balancer - selfsteal TCP + XHTTP + WS через nginx (балансир)
 node_layout_ru() {
@@ -3563,6 +3791,8 @@ node_nginx_ws_path() {
 node_state_load() {
     local k v
     [[ -f $NODE_STATE ]] || return 1
+    # Старые состояния используют прежний Fragment. Значения от другой ноды не наследуем.
+    NODE_FINAL_MASK=fragment; NODE_SUDOKU_PASSWORD=""
     while IFS='=' read -r k v; do
         [[ " ${NODE_KEYS[*]} " == *" $k "* ]] && printf -v "$k" '%s' "$v"
     done < "$NODE_STATE"
@@ -3572,7 +3802,7 @@ node_state_load() {
 node_state_save() {
     local k
     mkdir -p "$SKIPIT_ETC"
-    ( umask 077; for k in "${NODE_KEYS[@]}"; do printf '%s=%s\n' "$k" "${!k}"; done > "$NODE_STATE" )
+    ( umask 077; for k in "${NODE_KEYS[@]}"; do printf '%s=%s\n' "$k" "${!k}"; done > "$NODE_STATE" ) || return 1
     chmod 600 "$NODE_STATE"
 }
 
@@ -4842,12 +5072,18 @@ node_sniffing_json() {
 cat <<'EOF'
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "routeOnly": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
       },
 EOF
 }
 
 node_profile_json() { # домен схема
+    node_mask_validate "$2" || return 1
 cat <<EOF
 {
   "log": {
@@ -4876,6 +5112,7 @@ $(node_sniffing_json)
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
+$(node_stream_mask_json "$2")
 $(node_reality_json "$1" "$2"),
 $(node_sockopt_json)
       }
@@ -4896,6 +5133,7 @@ $(node_sniffing_json)
       "streamSettings": {
         "network": "xhttp",
         "security": "reality",
+$(node_stream_mask_json "$2")
         "xhttpSettings": {
           "mode": "auto",
           "path": "$NODE_XHTTP_PATH",
@@ -5182,9 +5420,34 @@ node_xhttp_extra_json() {
 EOF
 }
 
-# Final mask хоста: TLS ClientHello клиента режется на 3-6 кусков по 100-300 байт
-# с паузой 10-20 мс - DPI не видит SNI целиком. Одинаковый у всех хостов ноды.
-node_final_mask_json() {
+# Маска клиентского хоста; WS через nginx не получает Sudoku.
+node_final_mask_json() { # [схема] [STEAL|XHTTP|WS]
+    local layout=${1:-$NODE_LAYOUT} host=${2:-STEAL} mask=fragment
+    [[ $layout == balancer ]] && mask=$NODE_FINAL_MASK
+    case $mask in
+        none) echo '{}'; return 0 ;;
+        sudoku)
+            [[ $host == WS ]] && { echo '{}'; return 0; }
+            node_mask_validate "$layout" || return 1
+            cat <<EOF
+{
+  "tcp": [
+    {
+      "type": "sudoku",
+      "settings": {
+        "ascii": "prefer_entropy",
+        "password": "$NODE_SUDOKU_PASSWORD",
+        "paddingMax": 15,
+        "paddingMin": 5
+      }
+    }
+  ]
+}
+EOF
+            return 0 ;;
+        fragment) ;;
+        *) return 1 ;;
+    esac
     cat <<'EOF'
 {
   "tcp": [
@@ -5201,6 +5464,109 @@ node_final_mask_json() {
 }
 EOF
 }
+# Final Mask балансира: схема/порты/маршрутизация от выбора не зависят.
+node_mask_ru() {
+    case ${1:-$NODE_FINAL_MASK} in
+        none) echo "Без Final Mask" ;;
+        sudoku) echo "Sudoku" ;;
+        *) echo "Fragment" ;;
+    esac
+}
+
+node_mask_validate() { # схема
+    [[ ${1:-$NODE_LAYOUT} == balancer ]] || return 0
+    case $NODE_FINAL_MASK in
+        none|fragment) return 0 ;;
+        sudoku) [[ $NODE_SUDOKU_PASSWORD =~ ^[A-Za-z0-9_-]{16,128}$ ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+node_mask_ask() { # схема [общий nginx]
+    local layout=$1 shared=${2:-${NODE_SHARED:-0}} choice pass
+    [[ $layout == balancer ]] || return 0
+    while :; do
+        choice=$(ui_choose "Final Mask балансира" "Сохранённый выбор: $(node_mask_ru)
+Остальные настройки балансира одинаковы.
+
+Какой Final Mask использовать?" \
+            none     "Без Final Mask" \
+            fragment "Fragment" \
+            sudoku   "Sudoku") || return 1
+        if [[ $choice == sudoku ]]; then
+            if (( shared )); then
+                ui_msg "Общий порт 443" "Панель и страница подписки работают через nginx ноды.
+Sudoku на TCP :443 нарушит обычный вход через браузер.
+Выберите Fragment или вариант без Final Mask."
+                continue
+            fi
+            ui_yesno "Sudoku" "Маска включится для TCP и XHTTP, WebSocket останется без маски.
+Нужна поддержка Sudoku в Xray сервера и приложениях пользователей.
+При смене маски обновите профиль и хосты в панели Remnawave,
+затем подписки клиентов. Пароль Sudoku будет доступен клиентам.
+
+Продолжить?" "" "$C_OK" || continue
+            if [[ -n $NODE_SUDOKU_PASSWORD ]]; then
+                pass=$(ui_choose "Пароль Sudoku" "Один пароль используется в профиле и Final Mask хостов." \
+                    keep "Оставить текущий" gen "Сгенерировать новый" manual "Ввести свой") || return 1
+            else
+                pass=$(ui_choose "Пароль Sudoku" "Один пароль используется в профиле и Final Mask хостов." \
+                    gen "Сгенерировать" manual "Ввести свой") || return 1
+            fi
+            case $pass in
+                keep) pass=$NODE_SUDOKU_PASSWORD ;;
+                gen) pass=$(openssl rand -hex 32) || return 1 ;;
+                manual)
+                    pass=$(ui_pass "Пароль Sudoku" "16–128 символов: латинские буквы, цифры, дефис, подчёркивание.") || return 1 ;;
+                *) return 1 ;;
+            esac
+            if [[ ! $pass =~ ^[A-Za-z0-9_-]{16,128}$ ]]; then
+                ui_msg "Некорректный пароль" "Нужно 16–128 символов: латинские буквы, цифры, дефис или подчёркивание."
+                continue
+            fi
+            NODE_SUDOKU_PASSWORD=$pass
+        else
+            [[ $choice == none || $choice == fragment ]] || return 1
+            NODE_SUDOKU_PASSWORD=""
+        fi
+        NODE_FINAL_MASK=$choice
+        return 0
+    done
+}
+
+# Только Sudoku требует маску на серверном TCP-потоке.
+# Fragment — прежняя клиентская фрагментация TLS; она не требует серверной пары.
+node_stream_mask_json() { # схема
+    if [[ $1 == balancer && $NODE_FINAL_MASK == sudoku ]]; then
+        node_mask_validate "$1" || return 1
+        printf '        "finalmask": %s,\n' "$(node_final_mask_json "$1" STEAL)"
+    fi
+    return 0
+}
+
+node_change_final_mask() (
+    local old_mask old_password bak
+    node_state_load || return 1
+    [[ $NODE_LAYOUT == balancer ]] || { ui_msg "Final Mask" "Выбор маски доступен в схеме «Балансир»."; return; }
+    old_mask=$NODE_FINAL_MASK; old_password=$NODE_SUDOKU_PASSWORD
+    node_mask_ask balancer || return
+    [[ $old_mask != "$NODE_FINAL_MASK" || $old_password != "$NODE_SUDOKU_PASSWORD" ]] || {
+        ui_msg "Final Mask" "Настройки не изменились."; return;
+    }
+    ui_yesno "Сохранить выбор маски" "Final Mask: $(node_mask_ru)
+Выбор сохранится в SkipIt Tool.
+Рабочий профиль и хосты в Remnawave обновите вручную по инструкции.
+
+Сохранить и открыть инструкцию?" no || return
+    bak=$(backup_file "$NODE_STATE") || { ui_msg "Ошибка" "Не удалось сохранить резервную копию состояния."; return 1; }
+    if ! node_state_save; then
+        cat "$bak" >"$NODE_STATE"
+        ui_msg "Ошибка" "Не удалось сохранить выбор маски."; return 1
+    fi
+    log "node final mask selected: $NODE_FINAL_MASK"
+    node_guide "$NODE_DOMAIN" "$NODE_PORT" "$NODE_LAYOUT"
+)
+
 # Клиентский шаблон Xray JSON для хоста балансира: leastPing между хостами steal-<имя> и xhttp-<имя>
 node_client_template_json() { # имя
     sed "s/__NAME__/$1/g" <<'EOF'
@@ -5458,6 +5824,7 @@ node_guide() { # домен порт схема [wizard]
     fi
     UI_CTX=""
     ui_ctx_add "Схема" "$(node_layout_ru "$layout")"
+    [[ $layout == balancer ]] && ui_ctx_add "Final Mask" "$(node_mask_ru)"
     while :; do
         ui_head "Панель · шаг 1 из $total · Профиль"
         g_steps "Откройте панель Remnawave в браузере" \
@@ -5574,9 +5941,13 @@ node_guide() { # домен порт схема [wizard]
                     g_kv "Отпечаток" "firefox"
                     g_kv "Шаблон Xray JSON" "balancer-$name" ;;
             esac
-            g_kv "Final mask" "вставьте целиком JSON ниже"
-            g_gap
-            node_final_mask_json | g_code
+            if [[ $layout == balancer && ( $NODE_FINAL_MASK == none || ( $NODE_FINAL_MASK == sudoku && $h == WS ) ) ]]; then
+                g_kv "Final mask" "очистить поле — без маски"
+            else
+                g_kv "Final mask" "$( [[ $layout == balancer ]] && node_mask_ru || echo Fragment ) — вставьте JSON ниже"
+                g_gap
+                node_final_mask_json "$layout" "$h" | g_code
+            fi
             g_gap
             g_steps "Сохраните хост"
             if [[ $h == WS ]]; then
@@ -5862,6 +6233,7 @@ Email (можно оставить пустым):") || return 1
 node_install() { local UI_GUARD=1; UI_CTX=""; _node_install; local rc=$?; UI_CTX=""; return $rc; }
 
 _node_install() {
+    local NODE_FINAL_MASK=$NODE_FINAL_MASK NODE_SUDOKU_PASSWORD=$NODE_SUDOKU_PASSWORD
     local domain panel_ip port secret method="" base="" token="" email="" tpl cert_name="" name d busy
     local old_ip="" old_port="" had_state=0 warn=""
     if node_state_load; then
@@ -5934,7 +6306,9 @@ UFW:         порты схемы для всех, порт ноды тольк
             steal    "Шаблонная" \
             balancer "Балансир") || return
     fi
+    node_mask_ask "$layout" "$bundle" || return
     ui_ctx_add "Схема" "$(node_layout_ru "$layout")"
+    [[ $layout == balancer ]] && ui_ctx_add "Final Mask" "$(node_mask_ru)"
 
     if wz_asked; then domain=$WZ_NODE_DOMAIN
     else
@@ -6724,6 +7098,8 @@ $err"
 # docker-compose тоже переписывается: у нод, поставленных старой версией, другие
 # монтирования сертификатов, и новый nginx.conf без них не запустится.
 node_regen_layout() {
+    local NODE_FINAL_MASK=$NODE_FINAL_MASK NODE_SUDOKU_PASSWORD=$NODE_SUDOKU_PASSWORD
+    local old_mask=$NODE_FINAL_MASK old_password=$NODE_SUDOKU_PASSWORD
     local layout old=$NODE_LAYOUT bak_n bak_c err p busy="" changed=0
     layout=$(ui_choose "Схема ноды" "Сейчас:          $(node_layout_ru "$old")
 Пересоздадутся:  nginx.conf и docker-compose.yml
@@ -6731,8 +7107,9 @@ node_regen_layout() {
         "$old" "Оставить текущую схему, только пересоздать файлы" \
         "$([[ $old == balancer ]] && echo steal || echo balancer)" \
         "Сменить на: $(node_layout_ru "$([[ $old == balancer ]] && echo steal || echo balancer)")") || return
-    [[ $layout != "$old" ]] && changed=1
-    if [[ $layout == balancer && $changed == 1 ]]; then
+    node_mask_ask "$layout" || return
+    [[ $layout != "$old" || $old_mask != "$NODE_FINAL_MASK" || $old_password != "$NODE_SUDOKU_PASSWORD" ]] && changed=1
+    if [[ $layout == balancer && $old != balancer ]]; then
         for p in "$NODE_XHTTP_PORT" "$NODE_WS_PORT" "$NODE_WS_PUBLIC"; do
             [[ -n $(port_foreign "$p") ]] && busy+="  $p: $(port_foreign "$p" | awk '{print $NF}' | head -n 1)"$'\n'
         done
@@ -6877,7 +7254,7 @@ menu_node() {
         node_installed || return
         local tab=$'\t'
         hdr="Схема:      $(node_layout_ru "$NODE_LAYOUT")
-Домен:      $NODE_DOMAIN
+Домен:      $NODE_DOMAIN$( [[ $NODE_LAYOUT == balancer ]] && printf '\nFinal Mask (шаблон): %s' "$(node_mask_ru)" )
 IP панели:  $NODE_PANEL_IP
 Порт ноды:  $NODE_PORT
 
@@ -6894,9 +7271,11 @@ UFW${tab}$(if ! command -v ufw >/dev/null 2>&1; then echo "не установл
             restart   "Перезапустить контейнеры" \
             update    "Обновить образы" \
             ""        "Настройки" \
+            domain    "Сменить домен" \
             secret    "Сменить SECRET_KEY" \
             panelip   "Сменить IP панели / порт ноды" \
             layout    "Сменить схему (шаблонная / балансир)" \
+            finalmask "Final Mask балансира" \
             site      "Сменить сайт-заглушку" \
             cert      "Сертификат: статус, проверка, перевыпуск" \
             nginx     "nginx.conf: просмотр и редактирование" \
@@ -6904,6 +7283,7 @@ UFW${tab}$(if ! command -v ufw >/dev/null 2>&1; then echo "не установл
             reinstall "Переустановить" \
             remove    "Удалить ноду") || return
         case $c in
+            domain)    component_change_domain node ;;
             panel)     node_gen_paths; node_guide "$NODE_DOMAIN" "$NODE_PORT" "$NODE_LAYOUT" ;;
             logs)      node_logs ;;
             restart)   node_restart ;;
@@ -6911,6 +7291,7 @@ UFW${tab}$(if ! command -v ufw >/dev/null 2>&1; then echo "не установл
             secret)    node_change_secret ;;
             panelip)   node_change_panel ;;
             layout)    node_regen_layout ;;
+            finalmask) node_change_final_mask ;;
             site)      node_change_site ;;
             cert)      node_cert ;;
             nginx)     node_nginx_menu ;;
@@ -7549,7 +7930,7 @@ panel_create_node() { # домен порт схема
 
     # 4. Хост под Self-steal (TCP) и его инбаунд в сквод. Не вышло - не беда:
     #    нода уже создана и работает, текст проблемы остаётся в PANEL_HOST_ERR.
-    panel_create_steal_host "$prof" "$steal" "$domain" || true
+    panel_create_steal_host "$prof" "$steal" "$domain" "$layout" || true
     return 0
 }
 
@@ -7587,18 +7968,18 @@ panel_api_get()  { panel_api_req GET "$1"; }
 # подсказке мастера. Всё нужное уже есть: профиль, его inbound, домен и 443.
 # Ошибка сюда установку не роняет: нода работает и без хоста, текст - в PANEL_HOST_ERR.
 PANEL_HOST_ERR=""
-panel_create_steal_host() { # uuid-профиля uuid-инбаунда домен
-    local prof=$1 inb=$2 domain=$3 remark body
+panel_create_steal_host() { # uuid-профиля uuid-инбаунда домен [схема]
+    local prof=$1 inb=$2 domain=$3 layout=${4:-$NODE_LAYOUT} remark body
     PANEL_HOST_ERR=""
     [[ -n $inb ]] || { PANEL_HOST_ERR="в профиле не нашёлся инбаунд $(node_tag "$domain" steal)"; return 1; }
     remark=$(node_tag "$domain" steal)
     # Поля - ровно те, что мастер просил заполнить в UI: примечание, адрес, порт,
     # SNI, отпечаток и Final mask. Остальное панель проставит по умолчанию.
     body=$(jq -cn --arg p "$prof" --arg i "$inb" --arg r "$remark" --arg d "$domain" \
-        --argjson fm "$(node_final_mask_json)" \
+        --argjson fm "$(node_final_mask_json "$layout" STEAL)" \
         '{inbound:{configProfileUuid:$p,configProfileInboundUuid:$i},remark:$r,
           address:$d,port:443,sni:$d,fingerprint:"firefox",
-          securityLayer:"DEFAULT",isDisabled:false,finalMask:$fm}') || {
+          securityLayer:"DEFAULT",isDisabled:false} + (if $fm == {} then {} else {finalMask:$fm} end)') || {
         PANEL_HOST_ERR="не удалось собрать запрос (jq)"; return 1; }
     panel_api_post "/hosts" "$body" >/dev/null || {
         PANEL_HOST_ERR="панель не приняла хост: $PANEL_API_ERR"; return 1; }
@@ -10074,6 +10455,7 @@ nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · об
             restore   "Восстановить из бэкапа" \
             cron      "$(panel_backup_cron_on && echo "Выключить автобэкап" || echo "Включить автобэкап")" \
             ""        "Настройки" \
+            domain    "Сменить домен" \
             nginxgen  "Пересоздать nginx.conf по шаблону SkipIt Tool" \
             rutpl     "Шаблон Xray JSON «$PANEL_RU_TPL»" \
             cert      "Сертификат: статус и перевыпуск" \
@@ -10082,6 +10464,7 @@ nginx${tab}$(ctr_state_ru "$(panel_nginx_ctr)")$(panel_bundled && echo " · об
             reinstall "Переустановить (файлы, база не тронется)" \
             remove    "Удалить панель") || return
         case $c in
+            domain)    component_change_domain panel ;;
             url)       panel_show_url ;;
             apikey)    panel_show_api_key ;;
             logs)      panel_logs ;;
@@ -10945,12 +11328,14 @@ nginx${tab}$(ctr_state_ru "$SUB_NGINX_CTR")
             restart   "Перезапустить" \
             update    "Обновить образ" \
             ""        "Настройки" \
+            domain    "Сменить домен" \
             token     "Сменить API-токен панели" \
             cert      "Сертификат: статус и перевыпуск" \
             ""        "Опасные действия" \
             reinstall "Переустановить" \
             remove    "Удалить страницу подписки") || return
         case $c in
+            domain)    component_change_domain sub ;;
             logs)      sub_logs ;;
             restart)   sub_restart ;;
             update)    sub_update ;;
@@ -10961,6 +11346,301 @@ nginx${tab}$(ctr_state_ru "$SUB_NGINX_CTR")
         esac
     done
 }
+
+# ---- Смена доменов установленных компонентов ----
+# Отдельная подоболочка изолирует временные значения и обработчики сигналов.
+# Состояние записывается до генерации nginx: шаблоны связки читают его с диска.
+domain_env_set() { # файл ключ значение; остальные строки, включая секреты, сохраняются
+    local f=$1 key=$2 value=$3 tmp
+    [[ -f $f && $key =~ ^[A-Z0-9_]+$ && $value != *$'\n'* ]] || return 1
+    tmp=$(mktemp) || return 1
+    if ! awk -v k="$key" -v v="$value" '
+        index($0,k "=")==1 {if (!seen++) print k "=" v; next}
+        {print} END {if (!seen) print k "=" v}' "$f" >"$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    cat "$tmp" >"$f"; local rc=$?
+    rm -f "$tmp"; return "$rc"
+}
+
+domain_state_save() { # файл ключи...
+    local f=$1 k tmp
+    shift
+    tmp=$(mktemp) || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    for k in "$@"; do printf '%s=%s\n' "$k" "${!k}"; done >"$tmp" || { rm -f "$tmp"; return 1; }
+    if ! cat "$tmp" >"$f" || ! chmod 600 "$f"; then rm -f "$tmp"; return 1; fi
+    rm -f "$tmp"
+}
+
+domain_move_url() { # адрес старый-домен новый-домен; только точный hostname
+    local value=$1 old=$2 new=$3 prefix=""
+    case $value in https://*) prefix=https://; value=${value#https://} ;;
+                     http://*) prefix=http://; value=${value#http://} ;; esac
+    case $value in "$old"|"$old"/*|"$old":*) value="$new${value#"$old"}" ;; esac
+    printf '%s%s' "$prefix" "$value"
+}
+
+# Дополняем существующий compose монтированием нового сертификата. Старые
+# монтирования остаются: общий сертификат может ещё обслуживать другой компонент.
+# Формат используемых блоков volumes задан генераторами SkipIt Tool.
+domain_cert_mount() { # compose имя-сертификата
+    local f=$1 name=$2 tmp
+    [[ -f $f && $name =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    grep -qF -- "/etc/letsencrypt/live/$name:/etc/letsencrypt/live/$name:ro" "$f" && return 0
+    # Старые compose монтируют весь live/archive: ничего дописывать не надо.
+    if grep -qF '/etc/letsencrypt/live:/etc/letsencrypt/live:ro' "$f" &&
+       grep -qF '/etc/letsencrypt/archive:/etc/letsencrypt/archive:ro' "$f"; then return 0; fi
+    tmp=$(mktemp) || return 1
+    if ! awk -v n="$name" '
+        {print}
+        /- \/etc\/letsencrypt\/archive\// && !done++ {
+            print "      - /etc/letsencrypt/live/" n ":/etc/letsencrypt/live/" n ":ro"
+            print "      - /etc/letsencrypt/archive/" n ":/etc/letsencrypt/archive/" n ":ro"
+            found=1
+        }
+        END {if (!found) exit 1}' "$f" >"$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    cat "$tmp" >"$f"; local rc=$?
+    rm -f "$tmp"; return "$rc"
+}
+
+domain_snapshot() {
+    local f i=0
+    local -A seen=()
+    DOMAIN_BACKUP=$(mktemp -d "${SKIPIT_BACKUPS}/domain-${kind}-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+    chmod 700 "$DOMAIN_BACKUP" || return 1
+    DOMAIN_FILES=(); DOMAIN_EXISTED=()
+    for f in "$NODE_STATE" "$PANEL_STATE" "$SUB_STATE" "$NODE_NGINX" "$NODE_COMPOSE" \
+             "$PANEL_NGINX" "$PANEL_COMPOSE" "$PANEL_ENV" "$SUB_ENV" "$SUB_NGINX" "$SUB_COMPOSE"; do
+        [[ ${seen[$f]:-0} == 1 ]] && continue
+        seen[$f]=1
+        # Нетронутые отсутствующие файлы тоже учитываем для отката.
+        DOMAIN_FILES+=("$f")
+        if [[ -f $f ]]; then
+            cp -p -- "$f" "$DOMAIN_BACKUP/$i" || return 1
+            DOMAIN_EXISTED+=(1)
+        else DOMAIN_EXISTED+=(0); fi
+        printf '%s\t%s\t%s\n' "$i" "${DOMAIN_EXISTED[$i]}" "$f" >>"$DOMAIN_BACKUP/manifest.tsv" || return 1
+        i=$((i + 1))
+    done
+}
+
+domain_recover_services() {
+    if (( domain_panel_restart )); then
+        panel_compose_run up -d --no-deps remnawave || return 1
+        panel_wait_healthy 90 || return 1
+    fi
+    if (( domain_sub_restart )); then
+        sub_compose_run up -d --no-deps "$SUB_CTR" || return 1
+        sub_wait_healthy 90 || return 1
+    fi
+    # force-recreate нужен для новых bind mounts сертификата; только nginx.
+    if [[ $domain_front == node ]]; then
+        node_compose_run up -d --no-deps --force-recreate "$NODE_DECOY" || return 1
+        node_nginx_ok
+    elif [[ $domain_front == panel ]]; then
+        panel_compose_run up -d --no-deps --force-recreate "$PANEL_NGINX_CTR" || return 1
+        panel_nginx_ok
+    else
+        sub_compose_run up -d --no-deps --force-recreate "$SUB_NGINX_CTR" || return 1
+        sub_nginx_ok
+    fi
+}
+
+domain_rollback() {
+    local i rc=0
+    (( domain_dirty && !domain_committed )) || return 0
+    for i in "${!DOMAIN_FILES[@]}"; do
+        if [[ ${DOMAIN_EXISTED[$i]} == 1 ]]; then
+            # Запись поверх файла сохраняет inode смонтированного nginx.conf.
+            cat "$DOMAIN_BACKUP/$i" >"${DOMAIN_FILES[$i]}" || rc=1
+            chmod --reference="$DOMAIN_BACKUP/$i" "${DOMAIN_FILES[$i]}" || rc=1
+        elif [[ -f ${DOMAIN_FILES[$i]} ]]; then rm -f -- "${DOMAIN_FILES[$i]}" || rc=1; fi
+    done
+    node_state_load >/dev/null 2>&1 || true
+    panel_state_load >/dev/null 2>&1 || true
+    sub_state_load >/dev/null 2>&1 || true
+    domain_recover_services >>"$DOMAIN_BACKUP/rollback.log" 2>&1 || rc=1
+    if (( rc )); then
+        ui_msg "Нужна проверка" "Не удалось полностью восстановить работу компонентов.
+Резервная копия: $DOMAIN_BACKUP
+Подробности: $DOMAIN_BACKUP/rollback.log"
+    else
+        ui_msg "Изменения отменены" "Прежние файлы и работа компонентов восстановлены.
+Резервная копия: $DOMAIN_BACKUP"
+    fi
+}
+
+component_change_domain() (
+    local kind=$1 old new title doms prox="" note="" old_sub_url
+    local has_panel=0 has_node=0 has_sub=0 domain_panel_restart=0 domain_sub_restart=0
+    local domain_front domain_dirty=0 domain_committed=0 DOMAIN_BACKUP=""
+    local -a DOMAIN_FILES=() DOMAIN_EXISTED=()
+    PANEL_DOMAIN=""; NODE_DOMAIN=""; SUB_DOMAIN=""
+    panel_installed && has_panel=1
+    node_installed && has_node=1
+    sub_installed && has_sub=1
+    if (( has_panel )) && panel_bundled && (( !has_node )); then
+        ui_msg "Ошибка" "Общий nginx требует установленную ноду. Сначала восстановите состояние связки."; return 1
+    fi
+    case $kind in
+        panel) (( has_panel )) || return 1; old=$PANEL_DOMAIN; title="Домен панели" ;;
+        node) (( has_node )) || return 1; old=$NODE_DOMAIN; title="Домен ноды" ;;
+        sub) (( has_sub )) || return 1; old=$SUB_DOMAIN; title="Домен страницы подписки" ;;
+        *) return 1 ;;
+    esac
+    new=$(ask_domain "$title" "Текущий домен: $old
+Сначала создайте DNS-запись нового домена на этот VPS.
+
+Новый домен:") || return
+    [[ $new != "$old" ]] || { ui_msg "$title" "Домен не изменился."; return; }
+    if [[ $new == "$PANEL_DOMAIN" || $new == "$NODE_DOMAIN" || $new == "$SUB_DOMAIN" ]]; then
+        ui_msg "Домен занят" "Этот домен уже используется другим компонентом SkipIt Tool."; return 1
+    fi
+    if [[ $kind == node ]]; then
+        node_check_dns "$new"
+        local dns_rc=$?
+        if (( dns_rc != 0 )); then
+            ui_msg "Проверьте DNS" "$DNS_MSG
+Для ноды требуется DNS-запись на этот VPS без прокси Cloudflare.
+Исправьте DNS и повторите смену домена."; return 1
+        fi
+        note="── Обновите в панели Remnawave
+
+1. Ноды → эта нода
+Укажите новый домен. Порт $NODE_PORT не меняйте.
+
+2. Профиль Xray → REALITY
+Замените старый домен в serverNames (SNI).
+
+3. Хосты этой ноды
+Замените старый домен в адресе, SNI и Host.
+
+! До этих правок нода может не работать.
+После правок обновите подписки клиентов."
+    else
+        web_check_dns_ui "$new" "$title" || return
+        (( CF_PROXIED )) && prox=$new
+        if [[ $kind == panel ]]; then
+            note="── Вход в панель
+https://$new$PANEL_PATH
+
+── Что обновить вручную
+1. Ссылки и настройки со старым доменом в панели.
+2. Адрес панели на VPS со страницей подписки,
+   если она установлена на другом сервере."
+        else
+            note="── Обновите в панели Remnawave
+Укажите новый домен страницы подписки.
+Путь страницы сохраняется.
+
+── Ссылки клиентов
+Выдайте ссылки с новым доменом.
+Для старых ссылок потребуется сохранить старый домен."
+        fi
+    fi
+    doms=$new
+    # В связке сохраняем один сертификат панели/страницы с обоими SAN.
+    if [[ $kind == panel && $has_sub == 1 && $SUB_BUNDLED == 1 ]]; then doms+=" $SUB_DOMAIN"; fi
+    if [[ $kind == sub && $SUB_BUNDLED == 1 ]]; then
+        (( has_panel )) || { ui_msg "Ошибка" "Не найдена панель связанной страницы."; return 1; }
+        doms+=" $PANEL_DOMAIN"
+    fi
+    cert_ask "$doms" "$title" "$prox" || return
+    ui_yesno "Сменить домен" "$old → $new
+
+Локально обновятся nginx, сертификаты и связанные настройки SkipIt Tool.
+Ручные правки nginx будут сохранены в резервную копию; конфиг соберётся по шаблону.
+Возможен короткий перерыв работы компонентов с общим nginx.
+Старые сертификаты не удаляются.
+
+$note
+
+Применить изменения?" no || return
+    mkdir -p "$SKIPIT_BACKUPS" || return 1
+    # Сначала выпуск: при неудаче рабочие файлы компонентов не затрагиваются.
+    cert_issue ${doms} || return 1
+    domain_snapshot || { ui_msg "Ошибка" "Не удалось создать полную резервную копию. Смена домена отменена."; return 1; }
+    trap 'domain_rollback' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    if [[ $kind == node ]] || { [[ $kind == panel || $SUB_BUNDLED == 1 ]] && panel_bundled; }; then
+        domain_front=node
+    elif [[ $kind == panel || $SUB_BUNDLED == 1 ]]; then domain_front=panel
+    else domain_front=sub; fi
+    domain_dirty=1
+    case $kind in
+        panel)
+            PANEL_DOMAIN=$new; PANEL_CERT_NAME=$CERT_NAME; PANEL_CERT_METHOD=$CERT_METHOD
+            PANEL_SUB_DOMAIN=$(domain_move_url "$PANEL_SUB_DOMAIN" "$old" "$new")
+            domain_env_set "$PANEL_ENV" PANEL_DOMAIN "$new" || return 1
+            domain_env_set "$PANEL_ENV" FRONT_END_DOMAIN "$new" || return 1
+            domain_env_set "$PANEL_ENV" SUB_PUBLIC_DOMAIN "$PANEL_SUB_DOMAIN" || return 1
+            domain_panel_restart=1
+            if (( has_sub )); then
+                if [[ $SUB_BUNDLED == 1 ]]; then
+                    PANEL_SUB_CERT=$CERT_NAME; SUB_CERT_NAME=$CERT_NAME; SUB_CERT_METHOD=$CERT_METHOD
+                fi
+                old_sub_url=$SUB_PANEL_URL
+                SUB_PANEL_URL=$(domain_move_url "$SUB_PANEL_URL" "$old" "$new")
+                if [[ $old_sub_url != "$SUB_PANEL_URL" ]]; then
+                    domain_env_set "$SUB_ENV" REMNAWAVE_PANEL_URL "$SUB_PANEL_URL" || return 1
+                    domain_sub_restart=1
+                fi
+                domain_state_save "$SUB_STATE" "${SUB_KEYS[@]}" || return 1
+            fi
+            domain_state_save "$PANEL_STATE" "${PANEL_KEYS[@]}" || return 1 ;;
+        sub)
+            SUB_DOMAIN=$new; SUB_CERT_NAME=$CERT_NAME; SUB_CERT_METHOD=$CERT_METHOD
+            if (( has_panel )); then
+                PANEL_SUB_DOMAIN=$(domain_move_url "$PANEL_SUB_DOMAIN" "$old" "$new")
+                domain_env_set "$PANEL_ENV" SUB_PUBLIC_DOMAIN "$PANEL_SUB_DOMAIN" || return 1
+                domain_panel_restart=1
+                if [[ $SUB_BUNDLED == 1 ]]; then
+                    PANEL_SUB_CERT=$CERT_NAME; PANEL_CERT_NAME=$CERT_NAME; PANEL_CERT_METHOD=$CERT_METHOD
+                fi
+                domain_state_save "$PANEL_STATE" "${PANEL_KEYS[@]}" || return 1
+            fi
+            domain_state_save "$SUB_STATE" "${SUB_KEYS[@]}" || return 1 ;;
+        node)
+            NODE_DOMAIN=$new; NODE_CERT_NAME=$CERT_NAME; NODE_CERT_METHOD=$CERT_METHOD
+            domain_state_save "$NODE_STATE" "${NODE_KEYS[@]}" || return 1 ;;
+    esac
+    if [[ $kind == node ]] || { [[ $kind == panel || $SUB_BUNDLED == 1 ]] && panel_bundled; }; then
+        domain_front=node
+        node_state_load || return 1
+        node_nginx_conf "$NODE_DOMAIN" "$NODE_CERT_NAME" "$NODE_LAYOUT" >"$NODE_NGINX" || return 1
+        domain_cert_mount "$NODE_COMPOSE" "$CERT_NAME" || return 1
+        node_compose_run config -q || return 1
+        node_compose_run run --rm --no-deps --entrypoint nginx "$NODE_DECOY" -t || return 1
+    elif [[ $kind == panel || $SUB_BUNDLED == 1 ]]; then
+        domain_front=panel
+        panel_nginx_write || return 1
+        domain_cert_mount "$PANEL_COMPOSE" "$CERT_NAME" || return 1
+        panel_compose_run config -q || return 1
+        panel_compose_run run --rm --no-deps --entrypoint nginx "$PANEL_NGINX_CTR" -t || return 1
+    else
+        domain_front=sub
+        sub_nginx_conf "$SUB_DOMAIN" "$SUB_CERT_NAME" >"$SUB_NGINX" || return 1
+        domain_cert_mount "$SUB_COMPOSE" "$CERT_NAME" || return 1
+        sub_compose_run config -q || return 1
+        sub_compose_run run --rm --no-deps --entrypoint nginx "$SUB_NGINX_CTR" -t || return 1
+    fi
+    domain_recover_services >>"$DOMAIN_BACKUP/apply.log" 2>&1 || {
+        ui_msg "Не удалось применить домен" "Подробности: $DOMAIN_BACKUP/apply.log
+Сейчас будет выполнен откат."; return 1;
+    }
+    domain_committed=1
+    log "domain changed: component=$kind old=$old new=$new backup=$DOMAIN_BACKUP"
+    ui_msg "Домен изменён" "Новый домен: $new
+
+$note
+
+── Резервная копия
+$DOMAIN_BACKUP"
+)
 
 # ==== Remnawave: компоненты и общая диагностика ====
 # Установка и управление собраны в одном подменю: пункт компонента запускает мастер,
