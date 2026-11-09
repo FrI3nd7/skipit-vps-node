@@ -9,7 +9,7 @@ trap '' TSTP
 # Установка:  bash skipit.sh install     -> команда: skipit
 # Удаление:   skipit uninstall
 
-SKIPIT_VERSION="1.2.1"
+SKIPIT_VERSION="1.2.2"
 SKIPIT_CMD="skipit"
 SKIPIT_BIN="/usr/local/bin/${SKIPIT_CMD}"
 SKIPIT_ETC="/etc/skipit"
@@ -37,6 +37,9 @@ NODE_SOCK_DIR="/skipit"                       # путь внутри конте
 NODE_SOCK="${NODE_SOCK_DIR}/decoy.sock"       # target в REALITY и listen в nginx
 NODE_SOCK_HOST="${NODE_DIR}/run/decoy.sock"   # тот же сокет, если смотреть с хоста
 NODE_IMAGE="remnawave/node:latest"
+NODE_JOLYMMILES_VERSION="v26.11.1-1424"
+NODE_JOLYMMILES_RELEASE="https://github.com/Jolymmiles/Xray-core/releases/download"
+NODE_JOLYMMILES_API="https://api.github.com/repos/Jolymmiles/Xray-core/releases"
 NODE_NGINX_IMAGE="nginx:1.30-alpine"
 NODE_DECOY="remnawave-nginx"                  # контейнер nginx (имя из документации Remnawave)
 NODE_XHTTP_PORT=2096          # XHTTP REALITY - Xray
@@ -3810,8 +3813,60 @@ node_installed() { node_state_load && [[ -f $NODE_COMPOSE ]]; }
 
 node_env_get() { sed -n "s/^$1=//p" "$NODE_ENV" 2>/dev/null | head -n 1; }
 
-node_write_env() { # SECRET_KEY
-    ( umask 077; printf 'NODE_PORT=%s\nSECRET_KEY=%s\n' "$NODE_PORT" "$1" > "$NODE_ENV" )
+node_core_label() {
+    local url tag
+    url=$(node_env_get CUSTOM_CORE_URL)
+    case $url in
+        "") printf '%s' 'Официальный Xray-core' ;;
+        "$NODE_JOLYMMILES_RELEASE"/*)
+            tag=${url#"$NODE_JOLYMMILES_RELEASE"/}
+            printf 'Jolymmiles/Xray-core %s' "${tag%%/*}"
+            ;;
+        *) printf '%s' 'Пользовательская сборка' ;;
+    esac
+}
+
+node_core_choose() { # manage — выбор для уже установленной ноды
+    local fork_label="Jolymmiles/Xray-core (экспериментальный)"
+    [[ ${1:-} == manage ]] && fork_label="Jolymmiles/Xray-core — последний стабильный релиз"
+    ui_choose "Ядро Xray" "Текущее ядро: $(node_core_label)" \
+        official "Официальный Xray-core из образа Remnawave (по умолчанию)" \
+        jolymmiles "$fork_label"
+}
+
+node_core_asset() {
+    case $(uname -m) in
+        x86_64) printf '%s' Xray-linux-64 ;;
+        aarch64|arm64) printf '%s' Xray-linux-arm64-v8a ;;
+        *) return 1 ;;
+    esac
+}
+
+node_core_url() { # ядро [тег Jolymmiles]
+    [[ $1 == jolymmiles ]] || return 0
+    local tag=${2:-} url asset
+    if [[ -z $tag ]]; then
+        url=$(node_env_get CUSTOM_CORE_URL)
+        if [[ $url == "$NODE_JOLYMMILES_RELEASE"/* ]]; then
+            tag=${url#"$NODE_JOLYMMILES_RELEASE"/}
+            tag=${tag%%/*}
+        else
+            tag=$NODE_JOLYMMILES_VERSION
+        fi
+    fi
+    [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]] || return 1
+    asset=$(node_core_asset) || return 1
+    printf '%s/%s/%s' "$NODE_JOLYMMILES_RELEASE" "$tag" "$asset"
+}
+
+node_write_env() { # SECRET_KEY [CUSTOM_CORE_URL]
+    local url
+    if (( $# > 1 )); then url=$2; else url=$(node_env_get CUSTOM_CORE_URL); fi
+    (
+        umask 077
+        printf 'NODE_PORT=%s\nSECRET_KEY=%s\n' "$NODE_PORT" "$1" || exit 1
+        if [[ -n $url ]]; then printf 'CUSTOM_CORE_URL=%s\n' "$url"; fi
+    ) > "$NODE_ENV" || return 1
     chmod 600 "$NODE_ENV"
 }
 
@@ -5815,7 +5870,7 @@ g_next() { g_flush; printf '\n  %s ' "$(ui_keys "${1:-Enter — дальше · 
 
 node_guide() { # домен порт схема [wizard]
     local domain=$1 port=$2 layout=$3 mode=${4:-} name=${1%%.*} saved_ctx=$UI_CTX rc=0
-    local total=3 hosts=(STEAL) h n=0 inb
+    local total=3 hosts=(STEAL) h n=0 inb schema_ctx ws_without_mask=0
     if [[ $layout == balancer ]]; then
         total=6; hosts=(STEAL XHTTP TPL WS)
         inb="отметьте все три: $(node_tag "$domain" steal), $(node_tag "$domain" xhttp), $(node_tag "$domain" ws)"
@@ -5824,7 +5879,8 @@ node_guide() { # домен порт схема [wizard]
     fi
     UI_CTX=""
     ui_ctx_add "Схема" "$(node_layout_ru "$layout")"
-    [[ $layout == balancer ]] && ui_ctx_add "Final Mask" "$(node_mask_ru)"
+    schema_ctx=$UI_CTX
+    [[ $layout == balancer ]] && ui_ctx_add "Final Mask балансира" "$(node_mask_ru)"
     while :; do
         ui_head "Панель · шаг 1 из $total · Профиль"
         g_steps "Откройте панель Remnawave в браузере" \
@@ -5895,6 +5951,10 @@ node_guide() { # домен порт схема [wizard]
                 g_next || { rc=1; break; }
                 continue
             fi
+            if [[ $h == WS && ( $NODE_FINAL_MASK == sudoku || $NODE_FINAL_MASK == none ) ]]; then
+                ws_without_mask=1
+                UI_CTX=$schema_ctx
+            fi
             ui_head "Панель · шаг $((n + 2)) из $total · Хост $(node_tag "$domain" "${h,,}")"
             g_steps "В меню слева выберите «Хосты» и нажмите «+» справа вверху"
             g_gap
@@ -5941,12 +6001,14 @@ node_guide() { # домен порт схема [wizard]
                     g_kv "Отпечаток" "firefox"
                     g_kv "Шаблон Xray JSON" "balancer-$name" ;;
             esac
-            if [[ $layout == balancer && ( $NODE_FINAL_MASK == none || ( $NODE_FINAL_MASK == sudoku && $h == WS ) ) ]]; then
-                g_kv "Final mask" "очистить поле — без маски"
-            else
-                g_kv "Final mask" "$( [[ $layout == balancer ]] && node_mask_ru || echo Fragment ) — вставьте JSON ниже"
-                g_gap
-                node_final_mask_json "$layout" "$h" | g_code
+            if (( ! ws_without_mask )); then
+                if [[ $layout == balancer && $NODE_FINAL_MASK == none ]]; then
+                    g_kv "Final mask" "очистить поле — без маски"
+                else
+                    g_kv "Final mask" "$( [[ $layout == balancer ]] && node_mask_ru || echo Fragment ) — вставьте JSON ниже"
+                    g_gap
+                    node_final_mask_json "$layout" "$h" | g_code
+                fi
             fi
             g_gap
             g_steps "Сохраните хост"
@@ -5954,6 +6016,10 @@ node_guide() { # домен порт схема [wizard]
                 g_gap
                 g_note "Хост балансира: сидит на nginx :$NODE_WS_PUBLIC и несёт шаблон balancer-$name."
                 g_note "Трафик идёт через $(node_tag "$domain" steal) и $(node_tag "$domain" xhttp) — PROXY выбирает по пингу."
+                case $NODE_FINAL_MASK in
+                    sudoku) g_note "Sudoku применяется к TCP и XHTTP. Поле Final mask у WS-хоста оставьте пустым." ;;
+                    none)   g_note "Поле Final mask у WS-хоста оставьте пустым." ;;
+                esac
             fi
             if [[ $mode == wizard ]]; then
                 g_gap
@@ -6266,6 +6332,13 @@ UFW:         порты схемы для всех, порт ноды тольк
 Начать?" || return
     wz_asked || ipv6_check_wizard || return
 
+    local core core_url
+    core=$(node_core_choose) || return
+    core_url=$(node_core_url "$core") || {
+        ui_msg "Ядро Xray" "Для этой архитектуры нет сборки Jolymmiles. Выберите официальный Xray-core."
+        return
+    }
+
     # Панель на этом же сервере - ставим связку: 443 забирает Xray, а панель со
     # страницей подписки уезжают за его unix-сокет, туда же, где сайт-заглушка.
     # Схема только шаблонная: балансиру нужны ещё два публичных порта.
@@ -6543,7 +6616,7 @@ $( [[ -n $ZS_ERR ]] && echo "$ZS_ERR" || cert_fail_reason || echo "Провер�
         reality_keys || { node_fail "Не удалось сгенерировать ключи REALITY (нужен openssl 1.1.1+)."; return; }
     fi
     node_compose > "$NODE_COMPOSE"
-    node_write_env "$secret"
+    node_write_env "$secret" "$core_url" || { node_fail "Не удалось записать настройки ядра."; return; }
     node_nginx_conf "$domain" "$cert_name" "$layout" > "$NODE_NGINX"
     node_state_save
     n_say "$NODE_COMPOSE, $NODE_ENV, $NODE_NGINX"
@@ -6609,6 +6682,11 @@ $( [[ -n $ZS_ERR ]] && echo "$ZS_ERR" || cert_fail_reason || echo "Провер�
         (( bundle )) && node_bundle_rollback
         node_fail "docker compose up завершился с ошибкой."; return; }
     sleep 4
+    if [[ $core == jolymmiles ]] && ! node_wait_core "$core_url" >/dev/null; then
+        (( bundle )) && node_bundle_rollback
+        node_fail "Jolymmiles не запустился. Проверьте логи remnanode или выберите официальное ядро."
+        return
+    fi
     local err
     if ! err=$(node_nginx_ok); then
         (( bundle )) && node_bundle_rollback
@@ -6920,7 +6998,19 @@ node_restart() {
 }
 
 node_update() {
-    ui_yesno "Обновление ноды" "Проверит:        Remnawave Node (Xray) и nginx
+    local core_url core_version core_note
+    core_url=$(node_env_get CUSTOM_CORE_URL)
+    case $core_url in
+        "") core_note="Официальный Xray обновляется вместе с образом Remnawave Node." ;;
+        "$NODE_JOLYMMILES_RELEASE"/*)
+            core_version=${core_url#"$NODE_JOLYMMILES_RELEASE"/}
+            core_note="Jolymmiles ${core_version%%/*} закреплён. При пересоздании ноды загрузится эта же версия.
+Версию можно обновить через «Сменить ядро Xray» → «Jolymmiles/Xray-core»."
+            ;;
+        *) core_note="Пользовательское ядро загружается по сохранённому URL при пересоздании ноды." ;;
+    esac
+    ui_yesno "Обновление ноды" "Проверит:        образы Remnawave Node и nginx
+$core_note
 Есть новая:      скачает и перезапустит ноду
 Нет новой:       ничего не изменится
 
@@ -6938,6 +7028,116 @@ node_update() {
     if [[ $before == "$after" ]]; then say "Обновлений нет — контейнеры не тронуты."
     else say "Образы обновлены, контейнеры пересозданы."; log "node update: images changed"; fi
     pause
+}
+
+node_core_version() { # 1 — версия исполняемого файла работающего процесса
+    local version
+    if (( ${1:-0} )); then
+        version=$(timeout 4 docker exec remnanode sh -c '
+            for comm in /proc/[0-9]*/comm; do
+                if grep -qx rw-core "$comm" 2>/dev/null; then
+                    exec "${comm%/comm}/exe" version
+                fi
+            done
+            exit 1
+        ' 2>/dev/null) || return 1
+    else
+        version=$(timeout 4 docker exec remnanode /usr/local/bin/rw-core version 2>/dev/null) || return 1
+    fi
+    [[ $version =~ ^Xray[[:blank:]]+([^[:space:]]+) ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+node_wait_core() { # URL ядра, нужен ли работающий процесс
+    local url=$1 require_running=${2:-0} expected="" version i
+    if [[ $url == "$NODE_JOLYMMILES_RELEASE"/* ]]; then
+        expected=${url#"$NODE_JOLYMMILES_RELEASE"/v}
+        expected=${expected%%/*}
+    fi
+    for (( i=0; i<20; i++ )); do
+        if version=$(node_core_version "$require_running") &&
+           [[ -z $expected || $version == "$expected" ]]; then
+            printf '%s\n' "$version"
+            return
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+node_latest_jolymmiles() ( # имя файла для архитектуры ноды
+    set -o pipefail
+    curl -fsSL --connect-timeout 5 --max-time 15 "${NODE_JOLYMMILES_API}?per_page=20" |
+        jq -r --arg asset "$1" --arg base "$NODE_JOLYMMILES_RELEASE" '
+            first(sort_by(.published_at) | reverse | .[]
+                | select(.draft == false and .prerelease == false)
+                | .tag_name as $tag
+                | select($tag | test("^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9]+)?$"))
+                | select(any(.assets[]; .name == $asset and .state == "uploaded"
+                    and .browser_download_url == ($base + "/" + $tag + "/" + $asset)))
+                | $tag)'
+)
+
+node_change_core() {
+    local core asset tag
+    core=$(node_core_choose manage) || return
+    if [[ $core == official ]]; then
+        node_apply_core official
+        return
+    fi
+
+    asset=$(node_core_asset) || { ui_msg "Jolymmiles" "Для этой архитектуры нет сборки Jolymmiles."; return; }
+    ensure_pkg jq jq || return
+    ui_loading "Ищу стабильный релиз Jolymmiles…"
+    tag=$(node_latest_jolymmiles "$asset") || {
+        ui_msg "Jolymmiles" "Не удалось получить список релизов с GitHub."
+        return
+    }
+    [[ -n $tag ]] || { ui_msg "Jolymmiles" "Для этой архитектуры не найден стабильный релиз."; return; }
+    node_apply_core jolymmiles "$tag"
+}
+
+node_apply_core() { # ядро [тег Jolymmiles]
+    local core=$1 tag=${2:-} url old_url backup next version target="Официальный Xray-core" was_running=0
+    url=$(node_core_url "$core" "$tag") || {
+        ui_msg "Ядро Xray" "Не удалось подобрать сборку для этой версии и архитектуры."
+        return
+    }
+    old_url=$(node_env_get CUSTOM_CORE_URL)
+    [[ $url != "$old_url" ]] || { ui_msg "Ядро Xray" "Эта сборка уже выбрана."; return; }
+    [[ $core == jolymmiles ]] && target="Jolymmiles/Xray-core $tag"
+    ui_yesno "Сменить ядро Xray" "Выбрано: $target
+Контейнер remnanode будет пересоздан. Подключения VPN прервутся.
+Продолжить?" no || return
+
+    node_core_version 1 >/dev/null && was_running=1
+    backup=$(mktemp "$NODE_DIR/.env.core-backup.XXXXXXXX") || return
+    next=$(mktemp "$NODE_DIR/.env.core-next.XXXXXXXX") || { rm -f -- "$backup"; return; }
+    if ! cp -- "$NODE_ENV" "$backup" ||
+       ! awk '!/^[[:space:]]*(export[[:space:]]+)?CUSTOM_CORE_URL[[:space:]]*=/' "$backup" > "$next" ||
+       { [[ -n $url ]] && ! printf 'CUSTOM_CORE_URL=%s\n' "$url" >> "$next"; } ||
+       ! mv -f -- "$next" "$NODE_ENV"; then
+        rm -f -- "$next" "$backup"
+        node_fail "Не удалось сохранить выбор ядра."
+        return
+    fi
+
+    if node_compose_run up -d --no-deps --force-recreate remnanode &&
+       version=$(node_wait_core "$url" "$was_running"); then
+        rm -f -- "$backup"
+        log "node core: $core $version"
+        ui_msg "Ядро Xray" "Выбрано: $(node_core_label)
+$version"
+        return
+    fi
+
+    if mv -f -- "$backup" "$NODE_ENV" &&
+       node_compose_run up -d --no-deps --force-recreate remnanode &&
+       node_wait_core "$old_url" "$was_running" >/dev/null; then
+        node_fail "Новое ядро не прошло проверку запуска. Прежние настройки восстановлены."
+    else
+        node_fail "Не удалось завершить откат. Проверьте логи remnanode и резервную копию $backup, если она сохранилась."
+    fi
 }
 
 node_change_secret() {
@@ -7257,6 +7457,8 @@ menu_node() {
 Домен:      $NODE_DOMAIN$( [[ $NODE_LAYOUT == balancer ]] && printf '\nFinal Mask (шаблон): %s' "$(node_mask_ru)" )
 IP панели:  $NODE_PANEL_IP
 Порт ноды:  $NODE_PORT
+Ядро Xray:  $(node_core_label)
+Запущена версия: $(node_core_version 1 || printf '%s' 'не определена')
 
 Компонент${tab}Состояние
 remnanode${tab}$(ctr_state_ru remnanode)
@@ -7270,6 +7472,7 @@ UFW${tab}$(if ! command -v ufw >/dev/null 2>&1; then echo "не установл
             logs      "Логи" \
             restart   "Перезапустить контейнеры" \
             update    "Обновить образы" \
+            core      "Сменить ядро Xray" \
             ""        "Настройки" \
             domain    "Сменить домен" \
             secret    "Сменить SECRET_KEY" \
@@ -7288,6 +7491,7 @@ UFW${tab}$(if ! command -v ufw >/dev/null 2>&1; then echo "не установл
             logs)      node_logs ;;
             restart)   node_restart ;;
             update)    node_update ;;
+            core)      node_change_core ;;
             secret)    node_change_secret ;;
             panelip)   node_change_panel ;;
             layout)    node_regen_layout ;;
